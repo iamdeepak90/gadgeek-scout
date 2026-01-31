@@ -8,6 +8,7 @@ import json
 import warnings
 from urllib.parse import urlparse
 from difflib import SequenceMatcher
+from bs4 import BeautifulSoup # Required for cleaning RSS HTML
 
 # --- SILENCE WARNINGS ---
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -20,7 +21,6 @@ GEMINI_KEY = "AIzaSyARZL9PW073U_T6jxVIPVcFnHhXedZjgO4"
 SLACK_BOT_TOKEN = "xoxb-10413021355318-10399647335735-VVr0Giv2PAn0pstMuP5cuDtO"
 SLACK_CHANNEL = "C0AC72SJYJW" 
 
-# --- EXPANDED FEED LIST ---
 RSS_FEEDS = [
     "https://feeds.feedburner.com/TechCrunch/",
     "https://www.theverge.com/rss/index.xml",
@@ -30,8 +30,6 @@ RSS_FEEDS = [
     "https://arstechnica.com/feed/",
     "https://9to5mac.com/feed/",
     "https://www.androidauthority.com/feed/",
-    "https://mashable.com/feeds/rss/tech",
-    "https://gizmodo.com/rss",
     "https://readwrite.com/feed/",
     "https://venturebeat.com/feed/"
 ]
@@ -39,9 +37,40 @@ RSS_FEEDS = [
 # --- SETUP ---
 genai.configure(api_key=GEMINI_KEY)
 
-# UPGRADE: Using 'gemini-1.5-pro' for maximum humanization quality
-model = genai.GenerativeModel('gemini-1.5-pro', generation_config={"response_mime_type": "application/json"})
+# Using 'gemini-1.5-pro' for maximum reasoning capability
+model = genai.GenerativeModel('gemini-3-pro-preview', generation_config={"response_mime_type": "application/json"})
 slack = WebClient(token=SLACK_BOT_TOKEN)
+
+# --- HELPER: ROBUST CONTENT EXTRACTION ---
+def clean_html(html_text):
+    """Removes <div> <p> and other HTML noise from RSS feeds"""
+    try:
+        if not html_text: return ""
+        soup = BeautifulSoup(html_text, "lxml")
+        return soup.get_text(separator=" ").strip()
+    except:
+        return html_text
+
+def get_best_content(entry):
+    """
+    Hunts for the best description text across all possible RSS fields.
+    """
+    # 1. Try 'content' (often contains full article)
+    if hasattr(entry, 'content'):
+        return clean_html(entry.content[0].value)
+    
+    # 2. Try 'summary_detail' or 'summary'
+    if hasattr(entry, 'summary_detail'):
+        return clean_html(entry.summary_detail.value)
+    if hasattr(entry, 'summary'):
+        return clean_html(entry.summary)
+        
+    # 3. Try 'description'
+    if hasattr(entry, 'description'):
+        return clean_html(entry.description)
+        
+    # 4. Fallback: If absolutely nothing, return Title so AI has *something* to work with
+    return entry.title
 
 def get_domain_name(url):
     try:
@@ -51,7 +80,6 @@ def get_domain_name(url):
         return "News Source"
 
 def check_duplicate(link):
-    """Checks if specific URL exists"""
     headers = {"Authorization": f"Bearer {DIRECTUS_TOKEN}"}
     url = f"{DIRECTUS_URL}/items/news_leads?filter[source_url][_eq]={link}"
     try:
@@ -63,21 +91,17 @@ def check_duplicate(link):
     return False
 
 def check_semantic_duplicate(title):
-    """
-    Advanced: Checks if we have a similar title already (e.g. 'iPhone 17 Leaks' vs 'Apple iPhone 17 Rumors')
-    This prevents spamming the same story from different sources.
-    """
     headers = {"Authorization": f"Bearer {DIRECTUS_TOKEN}"}
-    # Search for leads created in last 24 hours (simplified logic: just check last 50 items)
+    # Check last 50 items to see if we already covered this topic
     url = f"{DIRECTUS_URL}/items/news_leads?sort=-date_created&limit=50"
     try:
         r = requests.get(url, headers=headers)
         if r.status_code == 200:
             existing_titles = [item['title'] for item in r.json()['data']]
             for existing in existing_titles:
-                # Similarity ratio > 0.6 means it's likely the same story
-                if SequenceMatcher(None, title.lower(), existing.lower()).ratio() > 0.6:
-                    print(f"🚫 Skipping Semantic Duplicate: '{title}' is too similar to '{existing}'", flush=True)
+                # If titles match > 65%, assume it's the same news
+                if SequenceMatcher(None, title.lower(), existing.lower()).ratio() > 0.65:
+                    print(f"🚫 Duplicate Topic: '{title}' matches '{existing}'", flush=True)
                     return True
     except:
         pass
@@ -99,19 +123,28 @@ def create_lead_in_directus(title, link, summary):
         print(f"❌ DB Save Error: {e}", flush=True)
     return None
 
-def process_with_ai(original_title, original_summary_from_rss):
+def process_with_ai(original_title, raw_context):
     """
-    Uses Gemini 1.5 Pro to completely rewrite the angle.
+    The 'Agent' Prompt.
     """
-    prompt = f"""
-    You are a senior tech editor known for witty, insider takes.
+    # Truncate context to 1000 chars to save tokens/speed, usually the lead is enough
+    short_context = raw_context[:1000]
     
-    Original Headline: "{original_title}"
-    Context/Snippet: "{original_summary_from_rss}"
+    prompt = f"""
+    You are an elite Tech News Editor with 20+ years of experience in this field.
+    
+    INPUT DATA:
+    Headline: "{original_title}"
+    Snippet: "{short_context}"
 
-    Your Task:
-    1. WRITE A NEW TITLE: Create a new, click-worthy title (under 65 chars). Do NOT use the exact words from the original. Make it sound like a unique scoop.
-    2. WRITE A SUMMARY: Write a 2-sentence summary (200 chars max) that explains WHY this matters. Use an active, human voice. Avoid "The article discusses..." or "This news is about...". Just tell the story.
+    YOUR GOAL:
+    Turn this into a compelling, human-written news lead.
+    
+    STRICT RULES:
+    1. TITLE: Must be punchy, under 65 chars. NO "Company announces..." boring syntax. Use active verbs.
+    2. SUMMARY: 200-230 chars max. Focus on the "So What?". Why does this matter?
+    3. TONE: Insider, smart, slightly casual. NOT robotic.
+    4. SAFETY: If the input is just a generic update or an ad, make the title descriptive based on the Headline.
 
     Output JSON: {{ "title": "...", "summary": "..." }}
     """
@@ -119,8 +152,8 @@ def process_with_ai(original_title, original_summary_from_rss):
         response = model.generate_content(prompt)
         return json.loads(response.text)
     except Exception as e:
-        print(f"⚠️ AI Error: {e}", flush=True)
-        return {"title": original_title[:65], "summary": "News update."}
+        print(f"⚠️ AI Generation Error: {e}", flush=True)
+        return {"title": original_title[:65], "summary": "Automated news update found."}
 
 def post_to_slack(ai_data, original_link, lead_id):
     source_name = get_domain_name(original_link)
@@ -164,50 +197,45 @@ def post_to_slack(ai_data, original_link, lead_id):
     
     try:
         slack.chat_postMessage(channel=SLACK_CHANNEL, blocks=blocks, text=f"New Lead: {ai_data['title']}")
-        print(f"✅ Sent to Slack: {ai_data['title']}", flush=True)
+        print(f"✅ Slack Sent: {ai_data['title']}", flush=True)
     except SlackApiError as e:
         print(f"❌ Slack Error: {e.response['error']}", flush=True)
 
 def run_scout():
-    print("📡 Scanning extended feed list...", flush=True)
+    print("📡 Scanning feeds...", flush=True)
     for feed in RSS_FEEDS:
         try:
             d = feedparser.parse(feed)
-            # Check top 2 items from each feed to avoid flood
-            for entry in d.entries[:2]:
+            for entry in d.entries[:2]: # Top 2 per feed
                 
-                # Check 1: Exact URL Duplicate
-                if check_duplicate(entry.link):
-                    continue
+                # Check Duplicates
+                if check_duplicate(entry.link): continue
+                if check_semantic_duplicate(entry.title): continue
 
-                # Check 2: Semantic Title Duplicate (Avoids "iPhone 17" from 5 different sites)
-                if check_semantic_duplicate(entry.title):
-                    continue
-
-                print(f"🆕 Processing: {entry.title}", flush=True)
+                print(f"🆕 Found: {entry.title}", flush=True)
                 
-                # Get RSS Summary if available, else empty
-                rss_summary = getattr(entry, 'summary', '')
+                # EXTRACT ROBUST CONTEXT
+                context = get_best_content(entry)
                 
-                # AI Rewrite
-                ai_data = process_with_ai(entry.title, rss_summary)
+                # AI PROCESSING
+                ai_data = process_with_ai(entry.title, context)
                 
-                # Save & Notify
+                # SAVE & NOTIFY
                 lead_id = create_lead_in_directus(ai_data['title'], entry.link, ai_data['summary'])
                 if lead_id:
                     post_to_slack(ai_data, entry.link, lead_id)
-                    # Small sleep to be nice to Gemini API
-                    time.sleep(2)
+                    time.sleep(2) # Rate limit politeness
+                    
         except Exception as e:
             print(f"⚠️ Feed Error ({feed}): {e}", flush=True)
 
 if __name__ == "__main__":
-    print("🚀 Scout Pro is starting...", flush=True)
+    print("🚀 Scout (Agent) is starting...", flush=True)
     while True:
         try:
             run_scout()
         except Exception as e:
-            print(f"❌ Critical Error in Main Loop: {e}", flush=True)
+            print(f"❌ Critical Error: {e}", flush=True)
         
         print("💤 Sleeping for 30 minutes...", flush=True)
         time.sleep(1800)

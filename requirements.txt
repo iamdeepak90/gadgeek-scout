@@ -4,3 +4,5 @@ feedparser
 google-generativeai
 slack_sdk
 gunicorn
+beautifulsoup4
+lxml

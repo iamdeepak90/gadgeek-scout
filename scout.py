@@ -5,10 +5,11 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 import time
 import json
+import re
 import warnings
 from urllib.parse import urlparse
 from difflib import SequenceMatcher
-from bs4 import BeautifulSoup # Required for cleaning RSS HTML
+from bs4 import BeautifulSoup 
 
 # --- SILENCE WARNINGS ---
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -36,41 +37,49 @@ RSS_FEEDS = [
 
 # --- SETUP ---
 genai.configure(api_key=GEMINI_KEY)
-
-# Using 'gemini-1.5-pro' for maximum reasoning capability
 model = genai.GenerativeModel('gemini-3-pro-preview', generation_config={"response_mime_type": "application/json"})
 slack = WebClient(token=SLACK_BOT_TOKEN)
 
 # --- HELPER: ROBUST CONTENT EXTRACTION ---
 def clean_html(html_text):
-    """Removes <div> <p> and other HTML noise from RSS feeds"""
+    """Removes HTML tags to give AI clean text"""
     try:
         if not html_text: return ""
         soup = BeautifulSoup(html_text, "lxml")
         return soup.get_text(separator=" ").strip()
     except:
-        return html_text
+        return str(html_text)
 
 def get_best_content(entry):
     """
-    Hunts for the best description text across all possible RSS fields.
+    Robustly extracts text from ANY RSS format.
     """
-    # 1. Try 'content' (often contains full article)
-    if hasattr(entry, 'content'):
-        return clean_html(entry.content[0].value)
+    content_text = ""
+
+    # 1. Try 'content' (Atom/RSS 2.0 often puts full text here as a list)
+    if hasattr(entry, 'content') and isinstance(entry.content, list):
+        for item in entry.content:
+            if item.get('value'):
+                content_text += item.get('value') + " "
     
-    # 2. Try 'summary_detail' or 'summary'
-    if hasattr(entry, 'summary_detail'):
-        return clean_html(entry.summary_detail.value)
-    if hasattr(entry, 'summary'):
-        return clean_html(entry.summary)
-        
-    # 3. Try 'description'
-    if hasattr(entry, 'description'):
-        return clean_html(entry.description)
-        
-    # 4. Fallback: If absolutely nothing, return Title so AI has *something* to work with
-    return entry.title
+    # 2. If empty, try 'summary_detail' or 'summary'
+    if not content_text.strip():
+        if hasattr(entry, 'summary_detail') and hasattr(entry.summary_detail, 'value'):
+            content_text = entry.summary_detail.value
+        elif hasattr(entry, 'summary'):
+            content_text = entry.summary
+        elif hasattr(entry, 'description'):
+            content_text = entry.description
+
+    # 3. Clean the HTML
+    clean_text = clean_html(content_text)
+
+    # 4. FINAL FALLBACK: If text is too short (< 50 chars), USE TITLE + SUMMARY
+    # This prevents the "Automated update" error by forcing context.
+    if len(clean_text) < 50:
+        return f"{entry.title}. {clean_text}"
+    
+    return clean_text
 
 def get_domain_name(url):
     try:
@@ -92,16 +101,14 @@ def check_duplicate(link):
 
 def check_semantic_duplicate(title):
     headers = {"Authorization": f"Bearer {DIRECTUS_TOKEN}"}
-    # Check last 50 items to see if we already covered this topic
     url = f"{DIRECTUS_URL}/items/news_leads?sort=-date_created&limit=50"
     try:
         r = requests.get(url, headers=headers)
         if r.status_code == 200:
             existing_titles = [item['title'] for item in r.json()['data']]
             for existing in existing_titles:
-                # If titles match > 65%, assume it's the same news
                 if SequenceMatcher(None, title.lower(), existing.lower()).ratio() > 0.65:
-                    print(f"🚫 Duplicate Topic: '{title}' matches '{existing}'", flush=True)
+                    print(f"🚫 Duplicate Topic: '{title}'", flush=True)
                     return True
     except:
         pass
@@ -125,17 +132,16 @@ def create_lead_in_directus(title, link, summary):
 
 def process_with_ai(original_title, raw_context):
     """
-    The 'Agent' Prompt.
+    Strict Agent Prompt to ensure unique, non-generic summaries.
     """
-    # Truncate context to 1000 chars to save tokens/speed, usually the lead is enough
-    short_context = raw_context[:1000]
+    # Combine Title + Context to ensure AI never sees "empty" input
+    full_input = f"HEADLINE: {original_title}\nCONTENT: {raw_context[:1500]}"
     
     prompt = f"""
-    You are an elite Tech News Editor with 20+ years of experience in this field.
+    You are an elite Tech News Editor with 20+ years of experience.
     
     INPUT DATA:
-    Headline: "{original_title}"
-    Snippet: "{short_context}"
+    {full_input}
 
     YOUR GOAL:
     Turn this into a compelling, human-written news lead.
@@ -144,16 +150,23 @@ def process_with_ai(original_title, raw_context):
     1. TITLE: Must be punchy, under 65 chars. NO "Company announces..." boring syntax. Use active verbs.
     2. SUMMARY: 200-230 chars max. Focus on the "So What?". Why does this matter?
     3. TONE: Insider, smart, slightly casual. NOT robotic.
-    4. SAFETY: If the input is just a generic update or an ad, make the title descriptive based on the Headline.
+    4. CRITICAL: If the input content is short, INFER the importance based on the headline. NEVER output "Automated news update".
 
     Output JSON: {{ "title": "...", "summary": "..." }}
     """
     try:
         response = model.generate_content(prompt)
-        return json.loads(response.text)
+        text = response.text.strip()
+        
+        # Clean potential markdown wrapping
+        if text.startswith("```json"):
+            text = text.replace("```json", "").replace("```", "")
+        
+        return json.loads(text)
     except Exception as e:
         print(f"⚠️ AI Generation Error: {e}", flush=True)
-        return {"title": original_title[:65], "summary": "Automated news update found."}
+        # Better Fallback: Use the original title instead of generic text
+        return {"title": original_title[:65], "summary": f"{original_title} - Read full story for details."}
 
 def post_to_slack(ai_data, original_link, lead_id):
     source_name = get_domain_name(original_link)
@@ -208,7 +221,6 @@ def run_scout():
             d = feedparser.parse(feed)
             for entry in d.entries[:2]: # Top 2 per feed
                 
-                # Check Duplicates
                 if check_duplicate(entry.link): continue
                 if check_semantic_duplicate(entry.title): continue
 
@@ -224,7 +236,7 @@ def run_scout():
                 lead_id = create_lead_in_directus(ai_data['title'], entry.link, ai_data['summary'])
                 if lead_id:
                     post_to_slack(ai_data, entry.link, lead_id)
-                    time.sleep(2) # Rate limit politeness
+                    time.sleep(2) 
                     
         except Exception as e:
             print(f"⚠️ Feed Error ({feed}): {e}", flush=True)

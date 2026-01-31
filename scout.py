@@ -1,6 +1,7 @@
 import feedparser
 import requests
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 import time
@@ -10,7 +11,6 @@ import warnings
 from urllib.parse import urlparse
 from difflib import SequenceMatcher
 from bs4 import BeautifulSoup
-from newspaper import Article
 import hashlib
 from datetime import datetime
 
@@ -38,49 +38,85 @@ RSS_FEEDS = [
     "https://venturebeat.com/feed/"
 ]
 
-# --- ADVANCED AI SETUP ---
-genai.configure(api_key=GEMINI_KEY)
-
-# Create two models: one for analysis, one for generation
-analysis_model = genai.GenerativeModel(
-    'gemini-1.5-pro',
-    generation_config={
-        "response_mime_type": "application/json",
-        "temperature": 0.3  # Lower temperature for factual analysis
-    }
-)
-
-creative_model = genai.GenerativeModel(
-    'gemini-1.5-pro',
-    generation_config={
-        "response_mime_type": "application/json",
-        "temperature": 0.7  # Higher temperature for creative headlines
-    }
-)
+# --- ADVANCED AI SETUP (NEW GOOGLE GENAI) ---
+client = genai.Client(api_key=GEMINI_KEY)
 
 slack = WebClient(token=SLACK_BOT_TOKEN)
 
-# --- ADVANCED CONTENT EXTRACTION ---
+# --- ADVANCED CONTENT EXTRACTION (WITHOUT NEWSPAPER3K) ---
 def scrape_full_article(url):
     """
-    Uses newspaper3k to extract the full article content from the URL.
-    This is the game-changer for getting complete context.
+    Uses requests + BeautifulSoup to extract article content.
+    More reliable than newspaper3k and no dependency issues.
     """
     try:
         print(f"🌐 Fetching full article from: {url[:50]}...", flush=True)
         
-        article = Article(url)
-        article.download()
-        article.parse()
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'lxml')
+        
+        # Extract title
+        title = ''
+        if soup.find('h1'):
+            title = soup.find('h1').get_text().strip()
+        elif soup.find('title'):
+            title = soup.find('title').get_text().strip()
+        
+        # Extract main content - try multiple strategies
+        content_text = ''
+        
+        # Strategy 1: Look for article tags
+        article = soup.find('article')
+        if article:
+            # Remove script, style, nav, header, footer
+            for tag in article.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside']):
+                tag.decompose()
+            content_text = article.get_text(separator=' ', strip=True)
+        
+        # Strategy 2: Look for common content divs
+        if not content_text or len(content_text) < 200:
+            for selector in ['div.content', 'div.article-body', 'div.post-content', 
+                           'div.entry-content', 'div.article-content', 'main']:
+                content_div = soup.find(selector.split('.')[0], class_=selector.split('.')[1] if '.' in selector else None)
+                if not content_div and '.' not in selector:
+                    content_div = soup.find(selector)
+                if content_div:
+                    for tag in content_div.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside']):
+                        tag.decompose()
+                    content_text = content_div.get_text(separator=' ', strip=True)
+                    if len(content_text) > 200:
+                        break
+        
+        # Strategy 3: Find all paragraphs
+        if not content_text or len(content_text) < 200:
+            paragraphs = soup.find_all('p')
+            content_text = ' '.join([p.get_text().strip() for p in paragraphs if len(p.get_text().strip()) > 20])
+        
+        # Extract metadata
+        meta_desc = ''
+        meta_tag = soup.find('meta', attrs={'name': 'description'}) or soup.find('meta', attrs={'property': 'og:description'})
+        if meta_tag:
+            meta_desc = meta_tag.get('content', '')
+        
+        # Extract author
+        authors = []
+        author_meta = soup.find('meta', attrs={'name': 'author'})
+        if author_meta:
+            authors.append(author_meta.get('content', ''))
         
         content_data = {
-            'title': article.title or '',
-            'text': article.text or '',
-            'authors': article.authors or [],
-            'publish_date': str(article.publish_date) if article.publish_date else '',
-            'top_image': article.top_image or '',
-            'meta_description': article.meta_description or '',
-            'meta_keywords': article.meta_keywords or []
+            'title': title,
+            'text': content_text,
+            'authors': authors,
+            'publish_date': '',
+            'meta_description': meta_desc,
+            'meta_keywords': []
         }
         
         # Calculate content quality score
@@ -122,7 +158,6 @@ def extract_rss_content(entry):
         'text': clean_text,
         'authors': [],
         'publish_date': entry.get('published', ''),
-        'top_image': '',
         'meta_description': '',
         'meta_keywords': []
     }
@@ -148,7 +183,7 @@ def get_comprehensive_content(entry):
     return scraped_data, quality_score
 
 
-# --- MULTI-STAGE AI PROCESSING ---
+# --- MULTI-STAGE AI PROCESSING (NEW GOOGLE GENAI API) ---
 def analyze_content_deeply(content_data):
     """
     STAGE 1: Deep content analysis using AI
@@ -167,7 +202,7 @@ YOUR TASK - ANALYZE THIS STORY:
 1. Identify the main newsworthy element (what actually happened)
 2. Determine the significance (why does this matter to tech consumers/industry)
 3. Identify any key players (companies, products, people)
-4. Assess the story type (product launch, industry news, controversy, breakthrough, etc.)
+4. Assess the story type (product_launch, industry_news, controversy, breakthrough, etc.)
 5. Rate the urgency (1-10, where 10 is breaking news that needs immediate coverage)
 
 OUTPUT AS JSON:
@@ -183,7 +218,15 @@ OUTPUT AS JSON:
 """
     
     try:
-        response = analysis_model.generate_content(analysis_prompt)
+        response = client.models.generate_content(
+            model='gemini-2.0-flash-exp',
+            contents=analysis_prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.3,
+                response_mime_type="application/json"
+            )
+        )
+        
         analysis = extract_json(response.text)
         
         if analysis and all(k in analysis for k in ['main_event', 'significance']):
@@ -259,7 +302,15 @@ VALIDATION: Before outputting, count your characters. If title > 65 chars, REWRI
 """
     
     try:
-        response = creative_model.generate_content(generation_prompt)
+        response = client.models.generate_content(
+            model='gemini-2.0-flash-exp',
+            contents=generation_prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.7,
+                response_mime_type="application/json"
+            )
+        )
+        
         generated = extract_json(response.text)
         
         if not generated or 'title' not in generated or 'summary' not in generated:
@@ -590,27 +641,18 @@ def run_scout():
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":
     print("="*60)
-    print("🤖 AI NEWS SCOUT AGENT v2.0")
+    print("🤖 AI NEWS SCOUT AGENT v2.1 (FIXED)")
     print("="*60)
     print("Features:")
-    print("  ✓ Full article scraping with newspaper3k")
-    print("  ✓ Multi-stage AI analysis (Gemini 1.5 Pro)")
+    print("  ✓ BeautifulSoup-based article scraping (no newspaper3k)")
+    print("  ✓ New Google GenAI SDK (no deprecation warnings)")
+    print("  ✓ Multi-stage AI analysis (Gemini 2.0 Flash)")
     print("  ✓ Humanized content generation")
     print("  ✓ Advanced duplicate detection")
     print("  ✓ Automated Slack notifications")
     print("  ✓ Robust error handling")
     print("="*60)
     print()
-    
-    # Install newspaper3k if not available
-    try:
-        from newspaper import Article
-    except ImportError:
-        print("⚠️ Installing newspaper3k for article scraping...")
-        import subprocess
-        subprocess.check_call(['pip', 'install', 'newspaper3k', '--break-system-packages'])
-        print("✅ Installation complete")
-        from newspaper import Article
     
     # Main loop
     while True:

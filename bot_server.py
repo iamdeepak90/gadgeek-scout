@@ -30,7 +30,7 @@ def slack_interactions():
     
     headers = {"Authorization": f"Bearer {DIRECTUS_TOKEN}"}
     requests.patch(
-        f"{DIRECTUS_URL}/items/News_Leads/{lead_id}", 
+        f"{DIRECTUS_URL}/items/news_leads/{lead_id}", 
         json={"status": new_status}, 
         headers=headers
     )

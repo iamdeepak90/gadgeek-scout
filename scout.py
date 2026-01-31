@@ -1,6 +1,6 @@
 import feedparser
 import requests
-import google.generativeai as genai
+import google.generativeai as genai_l
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 import time
@@ -26,7 +26,7 @@ slack = WebClient(token=SLACK_BOT_TOKEN)
 
 def check_duplicate(link):
     headers = {"Authorization": f"Bearer {DIRECTUS_TOKEN}"}
-    r = requests.get(f"{DIRECTUS_URL}/items/News_Leads?filter[source_url][_eq]={link}", headers=headers)
+    r = requests.get(f"{DIRECTUS_URL}/items/news_leads?filter[source_url][_eq]={link}", headers=headers)
     return len(r.json()['data']) > 0
 
 def create_lead_in_directus(title, link, summary):
@@ -37,7 +37,7 @@ def create_lead_in_directus(title, link, summary):
         "ai_summary": summary,
         "status": "pending"
     }
-    r = requests.post(f"{DIRECTUS_URL}/items/News_Leads", json=payload, headers=headers)
+    r = requests.post(f"{DIRECTUS_URL}/items/news_leads", json=payload, headers=headers)
     return r.json()['data']['id']
 
 def post_to_slack(title, summary, lead_id):

@@ -1,6 +1,6 @@
 import feedparser
 import requests
-import google.generativeai as genai_l
+import google.generativeai as genai
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 import time

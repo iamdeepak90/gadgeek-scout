@@ -16,33 +16,34 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # --- CONFIGURATION ---
-DIRECTUS_URL = "https://admin.gadgeek.in"
+DIRECTUS_URL = "[https://cms.gadgeek.in](https://cms.gadgeek.in)"
+# PASTE KEYS HERE
 DIRECTUS_TOKEN = "Cmq-X3we8iSjBHbxziDrwas55FP3d6gz"
 GEMINI_KEY = "AIzaSyARZL9PW073U_T6jxVIPVcFnHhXedZjgO4"
 SLACK_BOT_TOKEN = "xoxb-10413021355318-10399647335735-VVr0Giv2PAn0pstMuP5cuDtO"
-SLACK_CHANNEL = "C0AC72SJYJW" 
+SLACK_CHANNEL = "C0AC72SJYJW"  
 
 RSS_FEEDS = [
-    "https://feeds.feedburner.com/TechCrunch/",
-    "https://www.theverge.com/rss/index.xml",
-    "https://www.gsmarena.com/rss-news-reviews.php3",
-    "https://www.engadget.com/rss.xml",
-    "https://www.wired.com/feed/category/gear/latest/rss",
-    "https://arstechnica.com/feed/",
-    "https://9to5mac.com/feed/",
-    "https://www.androidauthority.com/feed/",
-    "https://readwrite.com/feed/",
-    "https://venturebeat.com/feed/"
+    "[https://feeds.feedburner.com/TechCrunch/](https://feeds.feedburner.com/TechCrunch/)",
+    "[https://www.theverge.com/rss/index.xml](https://www.theverge.com/rss/index.xml)",
+    "[https://www.gsmarena.com/rss-news-reviews.php3](https://www.gsmarena.com/rss-news-reviews.php3)",
+    "[https://www.engadget.com/rss.xml](https://www.engadget.com/rss.xml)",
+    "[https://www.wired.com/feed/category/gear/latest/rss](https://www.wired.com/feed/category/gear/latest/rss)",
+    "[https://arstechnica.com/feed/](https://arstechnica.com/feed/)",
+    "[https://9to5mac.com/feed/](https://9to5mac.com/feed/)",
+    "[https://www.androidauthority.com/feed/](https://www.androidauthority.com/feed/)",
+    "[https://readwrite.com/feed/](https://readwrite.com/feed/)",
+    "[https://venturebeat.com/feed/](https://venturebeat.com/feed/)"
 ]
 
 # --- SETUP ---
 genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel('gemini-3-pro-preview', generation_config={"response_mime_type": "application/json"})
+model = genai.GenerativeModel('gemini-1.5-pro', generation_config={"response_mime_type": "application/json"})
 slack = WebClient(token=SLACK_BOT_TOKEN)
 
-# --- HELPER: ROBUST CONTENT EXTRACTION ---
+# --- HELPER: TEXT CLEANING ---
 def clean_html(html_text):
-    """Removes HTML tags to give AI clean text"""
+    """Removes HTML tags and cleans up whitespace."""
     try:
         if not html_text: return ""
         soup = BeautifulSoup(html_text, "lxml")
@@ -50,36 +51,52 @@ def clean_html(html_text):
     except:
         return str(html_text)
 
+def extract_json(text):
+    """
+    Robustly extracts JSON object from AI response, ignoring Markdown or preamble text.
+    """
+    try:
+        # 1. Try direct parsing
+        return json.loads(text)
+    except:
+        # 2. Use Regex to find the first { ... } block
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except:
+                pass
+    return None
+
 def get_best_content(entry):
     """
-    Robustly extracts text from ANY RSS format.
+    Aggregates all possible text fields to give AI the maximum context.
     """
-    content_text = ""
+    text_parts = []
+    
+    # Title is always useful context
+    text_parts.append(f"Title: {entry.title}")
 
-    # 1. Try 'content' (Atom/RSS 2.0 often puts full text here as a list)
+    # Check 'content' (Atom/RSS 2.0)
     if hasattr(entry, 'content') and isinstance(entry.content, list):
         for item in entry.content:
-            if item.get('value'):
-                content_text += item.get('value') + " "
+            text_parts.append(item.get('value', ''))
     
-    # 2. If empty, try 'summary_detail' or 'summary'
-    if not content_text.strip():
-        if hasattr(entry, 'summary_detail') and hasattr(entry.summary_detail, 'value'):
-            content_text = entry.summary_detail.value
-        elif hasattr(entry, 'summary'):
-            content_text = entry.summary
-        elif hasattr(entry, 'description'):
-            content_text = entry.description
+    # Check 'summary' or 'description'
+    if hasattr(entry, 'summary'):
+        text_parts.append(entry.summary)
+    if hasattr(entry, 'description'):
+        text_parts.append(entry.description)
 
-    # 3. Clean the HTML
-    clean_text = clean_html(content_text)
-
-    # 4. FINAL FALLBACK: If text is too short (< 50 chars), USE TITLE + SUMMARY
-    # This prevents the "Automated update" error by forcing context.
+    # Join and clean
+    full_text = " ".join(text_parts)
+    clean_text = clean_html(full_text)
+    
+    # If text is suspiciously short, return strictly the title with a flag
     if len(clean_text) < 50:
-        return f"{entry.title}. {clean_text}"
+        return f"Headline: {entry.title}"
     
-    return clean_text
+    return clean_text[:2000] # Cap at 2000 chars to save tokens
 
 def get_domain_name(url):
     try:
@@ -130,43 +147,44 @@ def create_lead_in_directus(title, link, summary):
         print(f"❌ DB Save Error: {e}", flush=True)
     return None
 
-def process_with_ai(original_title, raw_context):
+def process_with_ai(raw_text):
     """
-    Strict Agent Prompt to ensure unique, non-generic summaries.
+    High-Level Agent Logic
     """
-    # Combine Title + Context to ensure AI never sees "empty" input
-    full_input = f"HEADLINE: {original_title}\nCONTENT: {raw_context[:1500]}"
-    
     prompt = f"""
-    You are an elite Tech News Editor with 20+ years of experience.
+    You are an expert Senior Tech Editor. 
     
-    INPUT DATA:
-    {full_input}
+    INPUT CONTENT:
+    {raw_text}
 
-    YOUR GOAL:
-    Turn this into a compelling, human-written news lead.
+    YOUR TASK:
+    Analyze the input above. If the input is short, use your internal knowledge about the topic to fill in the context.
     
-    STRICT RULES:
-    1. TITLE: Must be punchy, under 65 chars. NO "Company announces..." boring syntax. Use active verbs.
-    2. SUMMARY: 200-230 chars max. Focus on the "So What?". Why does this matter?
-    3. TONE: Insider, smart, slightly casual. NOT robotic.
-    4. CRITICAL: If the input content is short, INFER the importance based on the headline. NEVER output "Automated news update".
-
-    Output JSON: {{ "title": "...", "summary": "..." }}
+    OUTPUT REQUIREMENTS (JSON ONLY):
+    1. "title": Write a CLICK-WORTHY, engaging headline under 65 characters. Do not use the original title. Make it punchy.
+    2. "summary": Write a 2-sentence summary (max 220 chars). Do not say "The article says". Just state the news and why it matters. 
+    
+    Example Output:
+    {{ "title": "iPhone 16 Leaks: No Buttons?", "summary": "Apple's next phone might ditch physical buttons entirely. This shift could redefine smartphone durability standards." }}
     """
+    
     try:
         response = model.generate_content(prompt)
-        text = response.text.strip()
+        extracted_data = extract_json(response.text)
         
-        # Clean potential markdown wrapping
-        if text.startswith("```json"):
-            text = text.replace("```json", "").replace("```", "")
-        
-        return json.loads(text)
+        if extracted_data and 'title' in extracted_data and 'summary' in extracted_data:
+            return extracted_data
+        else:
+            raise ValueError("Invalid JSON found in AI response")
+
     except Exception as e:
-        print(f"⚠️ AI Generation Error: {e}", flush=True)
-        # Better Fallback: Use the original title instead of generic text
-        return {"title": original_title[:65], "summary": f"{original_title} - Read full story for details."}
+        print(f"⚠️ AI Gen Error: {e}. Raw Text: {raw_text[:50]}...", flush=True)
+        # Fallback: simple cleanup
+        fallback_title = raw_text.split(':')[1].strip() if "Title:" in raw_text else "New Tech Update"
+        return {
+            "title": fallback_title[:60], 
+            "summary": "Check the source link for the full details on this story."
+        }
 
 def post_to_slack(ai_data, original_link, lead_id):
     source_name = get_domain_name(original_link)
@@ -219,30 +237,30 @@ def run_scout():
     for feed in RSS_FEEDS:
         try:
             d = feedparser.parse(feed)
-            for entry in d.entries[:2]: # Top 2 per feed
+            for entry in d.entries[:2]:
                 
                 if check_duplicate(entry.link): continue
                 if check_semantic_duplicate(entry.title): continue
 
                 print(f"🆕 Found: {entry.title}", flush=True)
                 
-                # EXTRACT ROBUST CONTEXT
-                context = get_best_content(entry)
+                # GET FULL CONTENT
+                full_context = get_best_content(entry)
                 
-                # AI PROCESSING
-                ai_data = process_with_ai(entry.title, context)
+                # AGENT REWRITE
+                ai_data = process_with_ai(full_context)
                 
                 # SAVE & NOTIFY
                 lead_id = create_lead_in_directus(ai_data['title'], entry.link, ai_data['summary'])
                 if lead_id:
                     post_to_slack(ai_data, entry.link, lead_id)
-                    time.sleep(2) 
+                    time.sleep(2)
                     
         except Exception as e:
             print(f"⚠️ Feed Error ({feed}): {e}", flush=True)
 
 if __name__ == "__main__":
-    print("🚀 Scout (Agent) is starting...", flush=True)
+    print("🚀 Scout (Agent V2) is starting...", flush=True)
     while True:
         try:
             run_scout()

@@ -3,6 +3,8 @@ import requests
 import google.generativeai as genai
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+import time
+import sys
 
 # --- CONFIGURATION ---
 DIRECTUS_URL = "https://admin.gadgeek.in"
@@ -104,4 +106,15 @@ def run_scout():
                 post_to_slack(entry.title, summary, lead_id)
 
 if __name__ == "__main__":
-    run_scout()
+    print("🚀 Scout is starting...", flush=True)
+    
+    while True:
+        try:
+            run_scout()
+        except Exception as e:
+            # If it crashes, print error but don't kill the container
+            print(f"❌ Error: {e}", flush=True)
+        
+        # Calculate next run (e.g., run every 30 mins)
+        print("💤 Sleeping for 30 minutes...", flush=True)
+        time.sleep(1800)

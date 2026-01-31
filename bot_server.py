@@ -8,7 +8,7 @@ app = Flask(__name__)
 # --- CONFIG ---
 DIRECTUS_URL = "https://admin.gadgeek.in"
 DIRECTUS_TOKEN = "Cmq-X3we8iSjBHbxziDrwas55FP3d6gz"
-SLACK_SIGNING_SECRET = "4f28dc0a3781d55f764267910c7bcc77" # From Step 1
+SLACK_SIGNING_SECRET = "4f28dc0a3781d55f764267910c7bcc77"
 
 @app.route("/slack/interactions", methods=["POST"])
 def slack_interactions():

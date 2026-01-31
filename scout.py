@@ -7,10 +7,9 @@ import time
 import json
 import warnings
 from urllib.parse import urlparse
-import os
+from difflib import SequenceMatcher
 
 # --- SILENCE WARNINGS ---
-# Suppresses the "google.genai" deprecation warning to keep logs clean
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -19,18 +18,29 @@ DIRECTUS_URL = "https://admin.gadgeek.in"
 DIRECTUS_TOKEN = "Cmq-X3we8iSjBHbxziDrwas55FP3d6gz"
 GEMINI_KEY = "AIzaSyARZL9PW073U_T6jxVIPVcFnHhXedZjgO4"
 SLACK_BOT_TOKEN = "xoxb-10413021355318-10399647335735-VVr0Giv2PAn0pstMuP5cuDtO"
-SLACK_CHANNEL = "C0AC72SJYJW"
+SLACK_CHANNEL = "C0AC72SJYJW" 
 
+# --- EXPANDED FEED LIST ---
 RSS_FEEDS = [
     "https://feeds.feedburner.com/TechCrunch/",
     "https://www.theverge.com/rss/index.xml",
-    "https://www.gsmarena.com/rss-news-reviews.php3"
+    "https://www.gsmarena.com/rss-news-reviews.php3",
+    "https://www.engadget.com/rss.xml",
+    "https://www.wired.com/feed/category/gear/latest/rss",
+    "https://arstechnica.com/feed/",
+    "https://9to5mac.com/feed/",
+    "https://www.androidauthority.com/feed/",
+    "https://mashable.com/feeds/rss/tech",
+    "https://gizmodo.com/rss",
+    "https://readwrite.com/feed/",
+    "https://venturebeat.com/feed/"
 ]
 
 # --- SETUP ---
 genai.configure(api_key=GEMINI_KEY)
-# Using 'gemini-1.5-flash' for speed and cost efficiency
-model = genai.GenerativeModel('gemini-1.5-flash', generation_config={"response_mime_type": "application/json"})
+
+# UPGRADE: Using 'gemini-1.5-pro' for maximum humanization quality
+model = genai.GenerativeModel('gemini-1.5-pro', generation_config={"response_mime_type": "application/json"})
 slack = WebClient(token=SLACK_BOT_TOKEN)
 
 def get_domain_name(url):
@@ -41,16 +51,36 @@ def get_domain_name(url):
         return "News Source"
 
 def check_duplicate(link):
+    """Checks if specific URL exists"""
     headers = {"Authorization": f"Bearer {DIRECTUS_TOKEN}"}
-    # Using lowercase 'news_leads' as verified
     url = f"{DIRECTUS_URL}/items/news_leads?filter[source_url][_eq]={link}"
     try:
         r = requests.get(url, headers=headers)
         if r.status_code == 200:
             return len(r.json()['data']) > 0
-    except Exception as e:
-        print(f"⚠️ Network check failed: {e}", flush=True)
+    except:
         return False
+    return False
+
+def check_semantic_duplicate(title):
+    """
+    Advanced: Checks if we have a similar title already (e.g. 'iPhone 17 Leaks' vs 'Apple iPhone 17 Rumors')
+    This prevents spamming the same story from different sources.
+    """
+    headers = {"Authorization": f"Bearer {DIRECTUS_TOKEN}"}
+    # Search for leads created in last 24 hours (simplified logic: just check last 50 items)
+    url = f"{DIRECTUS_URL}/items/news_leads?sort=-date_created&limit=50"
+    try:
+        r = requests.get(url, headers=headers)
+        if r.status_code == 200:
+            existing_titles = [item['title'] for item in r.json()['data']]
+            for existing in existing_titles:
+                # Similarity ratio > 0.6 means it's likely the same story
+                if SequenceMatcher(None, title.lower(), existing.lower()).ratio() > 0.6:
+                    print(f"🚫 Skipping Semantic Duplicate: '{title}' is too similar to '{existing}'", flush=True)
+                    return True
+    except:
+        pass
     return False
 
 def create_lead_in_directus(title, link, summary):
@@ -65,38 +95,36 @@ def create_lead_in_directus(title, link, summary):
         r = requests.post(f"{DIRECTUS_URL}/items/news_leads", json=payload, headers=headers)
         if r.status_code == 200:
             return r.json()['data']['id']
-        else:
-            print(f"❌ DB Save Error: {r.text}", flush=True)
-            return None
     except Exception as e:
-        print(f"❌ DB Connection Error: {e}", flush=True)
-        return None
+        print(f"❌ DB Save Error: {e}", flush=True)
+    return None
 
-def process_with_ai(original_title):
+def process_with_ai(original_title, original_summary_from_rss):
     """
-    Asks Gemini to rewrite the title and write a summary in one go.
+    Uses Gemini 1.5 Pro to completely rewrite the angle.
     """
     prompt = f"""
-    Analyze this news headline: "{original_title}"
+    You are a senior tech editor known for witty, insider takes.
+    
+    Original Headline: "{original_title}"
+    Context/Snippet: "{original_summary_from_rss}"
 
-    Task:
-    1. Write a catchy 'title' under 65 characters.
-    2. Write a 'summary' between 200-220 characters.
+    Your Task:
+    1. WRITE A NEW TITLE: Create a new, click-worthy title (under 65 chars). Do NOT use the exact words from the original. Make it sound like a unique scoop.
+    2. WRITE A SUMMARY: Write a 2-sentence summary (200 chars max) that explains WHY this matters. Use an active, human voice. Avoid "The article discusses..." or "This news is about...". Just tell the story.
 
-    Output strictly valid JSON: {{ "title": "...", "summary": "..." }}
+    Output JSON: {{ "title": "...", "summary": "..." }}
     """
     try:
         response = model.generate_content(prompt)
         return json.loads(response.text)
     except Exception as e:
         print(f"⚠️ AI Error: {e}", flush=True)
-        # Fallback if AI fails
-        return {"title": original_title[:65], "summary": original_title}
+        return {"title": original_title[:65], "summary": "News update."}
 
 def post_to_slack(ai_data, original_link, lead_id):
     source_name = get_domain_name(original_link)
     
-    # Slack Block Kit Layout for better formatting
     blocks = [
         {
             "type": "section",
@@ -141,26 +169,40 @@ def post_to_slack(ai_data, original_link, lead_id):
         print(f"❌ Slack Error: {e.response['error']}", flush=True)
 
 def run_scout():
-    print("📡 Scanning feeds...", flush=True)
+    print("📡 Scanning extended feed list...", flush=True)
     for feed in RSS_FEEDS:
-        d = feedparser.parse(feed)
-        # Check top 3 items
-        for entry in d.entries[:3]:
-            if not check_duplicate(entry.link):
-                print(f"🆕 Found: {entry.title}", flush=True)
+        try:
+            d = feedparser.parse(feed)
+            # Check top 2 items from each feed to avoid flood
+            for entry in d.entries[:2]:
                 
-                # 1. AI Processing (Title & Summary)
-                ai_data = process_with_ai(entry.title)
+                # Check 1: Exact URL Duplicate
+                if check_duplicate(entry.link):
+                    continue
+
+                # Check 2: Semantic Title Duplicate (Avoids "iPhone 17" from 5 different sites)
+                if check_semantic_duplicate(entry.title):
+                    continue
+
+                print(f"🆕 Processing: {entry.title}", flush=True)
                 
-                # 2. Save to Directus
+                # Get RSS Summary if available, else empty
+                rss_summary = getattr(entry, 'summary', '')
+                
+                # AI Rewrite
+                ai_data = process_with_ai(entry.title, rss_summary)
+                
+                # Save & Notify
                 lead_id = create_lead_in_directus(ai_data['title'], entry.link, ai_data['summary'])
-                
-                # 3. Notify Slack (Only if DB save succeeded)
                 if lead_id:
                     post_to_slack(ai_data, entry.link, lead_id)
+                    # Small sleep to be nice to Gemini API
+                    time.sleep(2)
+        except Exception as e:
+            print(f"⚠️ Feed Error ({feed}): {e}", flush=True)
 
 if __name__ == "__main__":
-    print("🚀 Scout is starting...", flush=True)
+    print("🚀 Scout Pro is starting...", flush=True)
     while True:
         try:
             run_scout()

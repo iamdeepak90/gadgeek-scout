@@ -11,7 +11,7 @@ DIRECTUS_URL = "https://admin.gadgeek.in"
 DIRECTUS_TOKEN = "Cmq-X3we8iSjBHbxziDrwas55FP3d6gz"
 GEMINI_KEY = "AIzaSyARZL9PW073U_T6jxVIPVcFnHhXedZjgO4"
 SLACK_BOT_TOKEN = "xoxb-10413021355318-10399647335735-VVr0Giv2PAn0pstMuP5cuDtO"
-SLACK_CHANNEL = "#news-desk" 
+SLACK_CHANNEL = "C0AC72SJYJW" 
 
 RSS_FEEDS = [
     "https://feeds.feedburner.com/TechCrunch/",

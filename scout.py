@@ -1,7 +1,6 @@
 import feedparser
 import requests
-from google import genai
-from google.genai import types
+import google.generativeai as genai
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 import time
@@ -19,7 +18,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # --- CONFIGURATION ---
-DIRECTUS_URL = "https://cms.gadgeek.in"
+DIRECTUS_URL = "https://admin.gadgeek.in"  # FIXED: Correct URL
 DIRECTUS_TOKEN = "Cmq-X3we8iSjBHbxziDrwas55FP3d6gz"
 GEMINI_KEY = "AIzaSyARZL9PW073U_T6jxVIPVcFnHhXedZjgO4"
 SLACK_BOT_TOKEN = "xoxb-10413021355318-10399647335735-VVr0Giv2PAn0pstMuP5cuDtO"
@@ -38,22 +37,39 @@ RSS_FEEDS = [
     "https://venturebeat.com/feed/"
 ]
 
-# --- ADVANCED AI SETUP (NEW GOOGLE GENAI) ---
-client = genai.Client(api_key=GEMINI_KEY)
+# --- AI SETUP ---
+genai.configure(api_key=GEMINI_KEY)
+
+# Two models: analysis (factual) and generation (creative)
+analysis_model = genai.GenerativeModel(
+    'gemini-1.5-flash',
+    generation_config={
+        "response_mime_type": "application/json",
+        "temperature": 0.3
+    }
+)
+
+creative_model = genai.GenerativeModel(
+    'gemini-1.5-flash',
+    generation_config={
+        "response_mime_type": "application/json",
+        "temperature": 0.7
+    }
+)
 
 slack = WebClient(token=SLACK_BOT_TOKEN)
 
-# --- ADVANCED CONTENT EXTRACTION (WITHOUT NEWSPAPER3K) ---
+# --- ADVANCED CONTENT EXTRACTION (BEAUTIFULSOUP-BASED) ---
 def scrape_full_article(url):
     """
     Uses requests + BeautifulSoup to extract article content.
-    More reliable than newspaper3k and no dependency issues.
+    No dependency on newspaper3k.
     """
     try:
         print(f"🌐 Fetching full article from: {url[:50]}...", flush=True)
         
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
         
         response = requests.get(url, headers=headers, timeout=15)
@@ -74,29 +90,34 @@ def scrape_full_article(url):
         # Strategy 1: Look for article tags
         article = soup.find('article')
         if article:
-            # Remove script, style, nav, header, footer
-            for tag in article.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside']):
+            for tag in article.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe']):
                 tag.decompose()
             content_text = article.get_text(separator=' ', strip=True)
         
         # Strategy 2: Look for common content divs
         if not content_text or len(content_text) < 200:
-            for selector in ['div.content', 'div.article-body', 'div.post-content', 
-                           'div.entry-content', 'div.article-content', 'main']:
-                content_div = soup.find(selector.split('.')[0], class_=selector.split('.')[1] if '.' in selector else None)
-                if not content_div and '.' not in selector:
-                    content_div = soup.find(selector)
+            for class_name in ['content', 'article-body', 'post-content', 'entry-content', 
+                              'article-content', 'story-body', 'article__body']:
+                content_div = soup.find('div', class_=class_name)
                 if content_div:
-                    for tag in content_div.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside']):
+                    for tag in content_div.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe']):
                         tag.decompose()
                     content_text = content_div.get_text(separator=' ', strip=True)
                     if len(content_text) > 200:
                         break
         
-        # Strategy 3: Find all paragraphs
+        # Strategy 3: Look for main tag
+        if not content_text or len(content_text) < 200:
+            main = soup.find('main')
+            if main:
+                for tag in main.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe']):
+                    tag.decompose()
+                content_text = main.get_text(separator=' ', strip=True)
+        
+        # Strategy 4: Find all paragraphs (fallback)
         if not content_text or len(content_text) < 200:
             paragraphs = soup.find_all('p')
-            content_text = ' '.join([p.get_text().strip() for p in paragraphs if len(p.get_text().strip()) > 20])
+            content_text = ' '.join([p.get_text().strip() for p in paragraphs if len(p.get_text().strip()) > 30])
         
         # Extract metadata
         meta_desc = ''
@@ -121,7 +142,7 @@ def scrape_full_article(url):
         
         # Calculate content quality score
         word_count = len(content_data['text'].split())
-        quality_score = min(100, (word_count / 10))  # 1000+ words = 100 score
+        quality_score = min(100, (word_count / 10))
         
         print(f"✅ Scraped {word_count} words (quality: {quality_score:.0f}%)", flush=True)
         
@@ -166,28 +187,22 @@ def extract_rss_content(entry):
 def get_comprehensive_content(entry):
     """
     AGENTIC DECISION: Try full scraping first, fall back to RSS if needed.
-    Returns the best possible content with quality metrics.
     """
-    # Stage 1: Attempt full article scraping
     scraped_data, quality_score = scrape_full_article(entry.link)
     
-    # Stage 2: If scraping fails or quality is low, use RSS content
     if not scraped_data or quality_score < 20:
         print(f"📰 Using RSS content as fallback", flush=True)
         scraped_data = extract_rss_content(entry)
-        quality_score = 30  # Moderate quality for RSS-only
+        quality_score = 30
     
-    # Add original link
     scraped_data['source_url'] = entry.link
-    
     return scraped_data, quality_score
 
 
-# --- MULTI-STAGE AI PROCESSING (NEW GOOGLE GENAI API) ---
+# --- MULTI-STAGE AI PROCESSING ---
 def analyze_content_deeply(content_data):
     """
-    STAGE 1: Deep content analysis using AI
-    The AI acts as an analyst to understand the story.
+    STAGE 1: Deep content analysis
     """
     analysis_prompt = f"""
 You are an expert tech journalist analyzing a news story.
@@ -196,44 +211,35 @@ ARTICLE DATA:
 Title: {content_data['title']}
 Full Text: {content_data['text'][:4000]}
 Meta Description: {content_data['meta_description']}
-Authors: {', '.join(content_data['authors']) if content_data['authors'] else 'Unknown'}
 
 YOUR TASK - ANALYZE THIS STORY:
 1. Identify the main newsworthy element (what actually happened)
-2. Determine the significance (why does this matter to tech consumers/industry)
-3. Identify any key players (companies, products, people)
-4. Assess the story type (product_launch, industry_news, controversy, breakthrough, etc.)
-5. Rate the urgency (1-10, where 10 is breaking news that needs immediate coverage)
+2. Determine the significance (why does this matter)
+3. Identify key players (companies, products, people)
+4. Assess story type (product_launch, industry_news, controversy, breakthrough, rumor, review)
+5. Rate urgency (1-10, where 10 is breaking news)
 
 OUTPUT AS JSON:
 {{
   "main_event": "What happened in one sentence",
   "significance": "Why this matters in one sentence",
   "key_players": ["Company/Person 1", "Company/Person 2"],
-  "story_type": "product_launch | industry_news | controversy | breakthrough | rumor | review",
+  "story_type": "product_launch",
   "urgency_score": 5,
-  "target_audience": "tech_enthusiasts | general_consumers | developers | business_leaders",
-  "unique_angle": "What makes this story different or interesting"
+  "target_audience": "tech_enthusiasts",
+  "unique_angle": "What makes this story interesting"
 }}
 """
     
     try:
-        response = client.models.generate_content(
-            model='gemini-2.0-flash-exp',
-            contents=analysis_prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.3,
-                response_mime_type="application/json"
-            )
-        )
-        
+        response = analysis_model.generate_content(analysis_prompt)
         analysis = extract_json(response.text)
         
         if analysis and all(k in analysis for k in ['main_event', 'significance']):
             print(f"🧠 AI Analysis: {analysis.get('story_type', 'unknown')} story, urgency {analysis.get('urgency_score', 0)}/10", flush=True)
             return analysis
         else:
-            raise ValueError("Incomplete analysis from AI")
+            raise ValueError("Incomplete analysis")
             
     except Exception as e:
         print(f"⚠️ Analysis failed: {e}", flush=True)
@@ -244,17 +250,16 @@ OUTPUT AS JSON:
             "story_type": "industry_news",
             "urgency_score": 5,
             "target_audience": "tech_enthusiasts",
-            "unique_angle": "Latest development in tech"
+            "unique_angle": "Latest development"
         }
 
 
 def generate_humanized_content(content_data, analysis):
     """
-    STAGE 2: Generate click-worthy, humanized title and summary
-    Uses the analysis to create engaging content.
+    STAGE 2: Generate engaging title and summary
     """
     generation_prompt = f"""
-You are a viral tech content creator known for writing headlines that get clicks while staying factual.
+You are a viral tech content creator.
 
 STORY ANALYSIS:
 Main Event: {analysis['main_event']}
@@ -262,63 +267,53 @@ Significance: {analysis['significance']}
 Key Players: {', '.join(analysis['key_players']) if analysis['key_players'] else 'Various'}
 Story Type: {analysis['story_type']}
 Unique Angle: {analysis['unique_angle']}
-Target Audience: {analysis['target_audience']}
 
 ORIGINAL CONTENT:
 {content_data['text'][:3000]}
 
-YOUR TASK - CREATE ENGAGING CONTENT:
+CREATE ENGAGING CONTENT:
 
-1. HEADLINE (CRITICAL RULES):
+1. HEADLINE (CRITICAL):
    - MUST be under 65 characters (including spaces)
-   - Use power words: "Revolutionary", "Leaked", "Shocking", "Finally", "Exclusive"
+   - Use power words: "Leaked", "Finally", "Shocking", "Revolutionary"
+   - Include key names (Apple, Google, Tesla, etc.)
    - Create curiosity without clickbait
-   - Include key player names when relevant (Apple, Google, etc.)
-   - Make it conversational and human
-   - DO NOT use generic phrases like "New Update" or "Latest News"
+   - Conversational tone
+   - NO generic phrases like "New Update" or "Latest News"
    
-2. SUMMARY (220 characters max):
-   - First sentence: What happened (the news)
-   - Second sentence: Why it matters (the impact)
-   - Write as if explaining to a curious friend
-   - NO phrases like "The article discusses" or "According to reports"
-   - Be direct and confident
-   - Include specific details or numbers if available
+2. SUMMARY (220 chars max):
+   - Sentence 1: What happened (the news)
+   - Sentence 2: Why it matters (the impact)
+   - Direct and confident
+   - NO "The article discusses" or "According to reports"
+   - Include specific details/numbers
 
-EXAMPLES OF GOOD HEADLINES:
+EXAMPLES:
 - "Apple Kills the iPhone SE—Here's Why" (42 chars)
 - "Tesla's $25K Car: Everything We Know" (38 chars)
-- "Google Just Made AI Search 10x Faster" (39 chars)
+- "Google AI Now Reads 1 Million Tokens" (38 chars)
 
-OUTPUT AS JSON:
+OUTPUT JSON:
 {{
-  "title": "Your headline here (under 65 chars)",
-  "summary": "First sentence about what happened. Second sentence about why it matters.",
+  "title": "Your headline (under 65 chars)",
+  "summary": "First sentence. Second sentence.",
   "char_count_title": 42,
-  "char_count_summary": 156
+  "char_count_summary": 85
 }}
 
-VALIDATION: Before outputting, count your characters. If title > 65 chars, REWRITE IT SHORTER.
+VALIDATE: Count characters before output. Title > 65? REWRITE SHORTER.
 """
     
     try:
-        response = client.models.generate_content(
-            model='gemini-2.0-flash-exp',
-            contents=generation_prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.7,
-                response_mime_type="application/json"
-            )
-        )
-        
+        response = creative_model.generate_content(generation_prompt)
         generated = extract_json(response.text)
         
         if not generated or 'title' not in generated or 'summary' not in generated:
-            raise ValueError("Invalid generation output")
+            raise ValueError("Invalid output")
         
-        # Validate and truncate if needed
+        # Validate and truncate
         if len(generated['title']) > 65:
-            print(f"⚠️ Title too long ({len(generated['title'])} chars), truncating...", flush=True)
+            print(f"⚠️ Title too long ({len(generated['title'])} chars), truncating", flush=True)
             generated['title'] = generated['title'][:62] + "..."
         
         if len(generated['summary']) > 220:
@@ -330,22 +325,17 @@ VALIDATION: Before outputting, count your characters. If title > 65 chars, REWRI
         
     except Exception as e:
         print(f"⚠️ Generation failed: {e}", flush=True)
-        # Fallback with character limits
         fallback_title = analysis['main_event'][:62] + "..." if len(analysis['main_event']) > 65 else analysis['main_event']
         fallback_summary = f"{analysis['main_event'][:100]}. {analysis['significance'][:100]}."
         
         return {
             "title": fallback_title,
-            "summary": fallback_summary[:220],
-            "char_count_title": len(fallback_title),
-            "char_count_summary": len(fallback_summary)
+            "summary": fallback_summary[:220]
         }
 
 
 def extract_json(text):
-    """
-    Robustly extracts JSON from AI response.
-    """
+    """Extract JSON from AI response"""
     try:
         return json.loads(text)
     except:
@@ -360,22 +350,24 @@ def extract_json(text):
 
 # --- DUPLICATE DETECTION ---
 def check_exact_duplicate(link):
-    """Check if exact URL already exists in database."""
+    """Check if URL exists in database"""
     headers = {"Authorization": f"Bearer {DIRECTUS_TOKEN}"}
     url = f"{DIRECTUS_URL}/items/news_leads?filter[source_url][_eq]={link}"
+    
     try:
         r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200:
             return len(r.json()['data']) > 0
-    except:
-        pass
+        elif r.status_code == 401:
+            print(f"⚠️ Auth failed. Check DIRECTUS_TOKEN", flush=True)
+    except Exception as e:
+        print(f"⚠️ Duplicate check failed: {str(e)[:100]}", flush=True)
+    
     return False
 
 
 def check_semantic_duplicate(title, content_text):
-    """
-    Advanced duplicate detection using title similarity AND content hash.
-    """
+    """Advanced duplicate detection using similarity"""
     headers = {"Authorization": f"Bearer {DIRECTUS_TOKEN}"}
     url = f"{DIRECTUS_URL}/items/news_leads?sort=-date_created&limit=100"
     
@@ -386,42 +378,33 @@ def check_semantic_duplicate(title, content_text):
         
         existing_items = r.json()['data']
         
-        # Create content hash for comparison
-        content_hash = hashlib.md5(content_text[:500].encode()).hexdigest()
-        
         for item in existing_items:
             existing_title = item.get('title', '')
-            
-            # Title similarity check
             title_similarity = SequenceMatcher(None, title.lower(), existing_title.lower()).ratio()
             
             if title_similarity > 0.70:
-                print(f"🚫 Duplicate detected: '{title}' ≈ '{existing_title}' ({title_similarity:.0%} similar)", flush=True)
+                print(f"🚫 Duplicate: '{title}' ≈ '{existing_title}' ({title_similarity:.0%})", flush=True)
                 return True
         
         return False
         
     except Exception as e:
-        print(f"⚠️ Duplicate check failed: {e}", flush=True)
+        print(f"⚠️ Duplicate check failed: {str(e)[:100]}", flush=True)
         return False
 
 
 # --- DATABASE OPERATIONS ---
 def create_lead_in_directus(title, link, summary, metadata=None):
-    """
-    Save lead to Directus with enriched metadata.
-    """
+    """Save lead to Directus"""
     headers = {"Authorization": f"Bearer {DIRECTUS_TOKEN}"}
     
     payload = {
         "title": title,
         "source_url": link,
         "ai_summary": summary,
-        "status": "pending",
-        "date_created": datetime.now().isoformat()
+        "status": "pending"
     }
     
-    # Add optional metadata
     if metadata:
         if metadata.get('urgency_score'):
             payload['urgency'] = metadata['urgency_score']
@@ -434,26 +417,24 @@ def create_lead_in_directus(title, link, summary, metadata=None):
         r = requests.post(f"{DIRECTUS_URL}/items/news_leads", json=payload, headers=headers, timeout=15)
         if r.status_code == 200:
             lead_id = r.json()['data']['id']
-            print(f"💾 Saved to DB with ID: {lead_id}", flush=True)
+            print(f"💾 Saved to DB: #{lead_id}", flush=True)
             return lead_id
+        else:
+            print(f"❌ DB returned status {r.status_code}: {r.text[:200]}", flush=True)
     except Exception as e:
-        print(f"❌ DB Save Error: {e}", flush=True)
+        print(f"❌ DB Save Error: {str(e)[:150]}", flush=True)
     
     return None
 
 
 # --- SLACK NOTIFICATION ---
 def post_to_slack(title, summary, link, lead_id, metadata=None):
-    """
-    Post formatted lead to Slack with context and actions.
-    """
+    """Post to Slack"""
     source_name = get_domain_name(link)
     
-    # Determine urgency emoji
     urgency = metadata.get('urgency_score', 5) if metadata else 5
     urgency_emoji = "🔥" if urgency >= 8 else "⚡" if urgency >= 6 else "📢"
     
-    # Build context text
     story_type = metadata.get('story_type', 'news') if metadata else 'news'
     context_line = f"*Type:* {story_type.replace('_', ' ').title()} | *Source:* {source_name}"
     
@@ -501,13 +482,13 @@ def post_to_slack(title, summary, link, lead_id, metadata=None):
             text=f"New Lead: {title}",
             unfurl_links=False
         )
-        print(f"✅ Slack notification sent", flush=True)
+        print(f"✅ Slack sent", flush=True)
     except SlackApiError as e:
         print(f"❌ Slack Error: {e.response['error']}", flush=True)
 
 
 def get_domain_name(url):
-    """Extract clean domain name from URL."""
+    """Extract domain name"""
     try:
         domain = urlparse(url).netloc
         return domain.replace('www.', '').split('.')[0].capitalize()
@@ -515,49 +496,43 @@ def get_domain_name(url):
         return "Tech Source"
 
 
-# --- MAIN AGENT WORKFLOW ---
+# --- MAIN WORKFLOW ---
 def process_article_with_ai_agent(entry):
     """
-    🤖 THE CORE AI AGENT WORKFLOW
-    
-    This orchestrates the multi-stage AI processing:
-    1. Content extraction (scraping + fallback)
-    2. Deep analysis (understanding the story)
-    3. Creative generation (humanized content)
-    4. Validation and storage
+    Core AI agent workflow
     """
     try:
         print(f"\n{'='*60}", flush=True)
         print(f"🔍 Processing: {entry.title[:60]}...", flush=True)
         print(f"{'='*60}", flush=True)
         
-        # STAGE 1: Get comprehensive content
+        # Get content
         content_data, quality_score = get_comprehensive_content(entry)
         
         if quality_score < 10:
-            print(f"⚠️ Content quality too low ({quality_score}%), skipping", flush=True)
+            print(f"⚠️ Quality too low ({quality_score}%), skipping", flush=True)
             return None
         
-        # Check duplicates early
+        # Check duplicates
         if check_exact_duplicate(entry.link):
-            print(f"🚫 Exact duplicate found, skipping", flush=True)
+            print(f"🚫 Exact duplicate, skipping", flush=True)
             return None
         
         if check_semantic_duplicate(content_data['title'], content_data['text']):
             return None
         
-        # STAGE 2: Deep AI analysis
+        # AI analysis
         analysis = analyze_content_deeply(content_data)
         
-        # STAGE 3: Generate humanized content
+        # AI generation
         generated = generate_humanized_content(content_data, analysis)
         
-        # STAGE 4: Validation
+        # Validation
         if not generated['title'] or len(generated['title']) < 10:
-            print(f"⚠️ Generated title too short, skipping", flush=True)
+            print(f"⚠️ Title too short, skipping", flush=True)
             return None
         
-        # STAGE 5: Save to database
+        # Save
         metadata = {
             'urgency_score': analysis.get('urgency_score', 5),
             'story_type': analysis.get('story_type', 'news'),
@@ -572,10 +547,10 @@ def process_article_with_ai_agent(entry):
         )
         
         if not lead_id:
-            print(f"❌ Failed to save to database", flush=True)
+            print(f"❌ Failed to save", flush=True)
             return None
         
-        # STAGE 6: Notify team
+        # Notify
         post_to_slack(
             title=generated['title'],
             summary=generated['summary'],
@@ -584,7 +559,7 @@ def process_article_with_ai_agent(entry):
             metadata=metadata
         )
         
-        print(f"✅ Successfully processed lead #{lead_id}", flush=True)
+        print(f"✅ Success: #{lead_id}", flush=True)
         return lead_id
         
     except Exception as e:
@@ -594,13 +569,11 @@ def process_article_with_ai_agent(entry):
         return None
 
 
-# --- MAIN SCOUT LOOP ---
+# --- MAIN LOOP ---
 def run_scout():
-    """
-    Main scanning loop - processes feeds intelligently.
-    """
-    print(f"\n🚀 Starting scan cycle at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
-    print(f"📡 Monitoring {len(RSS_FEEDS)} feeds...\n", flush=True)
+    """Main scanning loop"""
+    print(f"\n🚀 Scan cycle: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"📡 Monitoring {len(RSS_FEEDS)} feeds\n", flush=True)
     
     total_processed = 0
     total_created = 0
@@ -612,59 +585,54 @@ def run_scout():
             feed = feedparser.parse(feed_url)
             
             if not feed.entries:
-                print(f"⚠️ No entries found in feed", flush=True)
+                print(f"⚠️ No entries", flush=True)
                 continue
             
-            # Process top 3 articles from each feed
             for entry in feed.entries[:3]:
                 total_processed += 1
-                
                 result = process_article_with_ai_agent(entry)
                 
                 if result:
                     total_created += 1
-                    time.sleep(3)  # Rate limiting for API calls
+                    time.sleep(3)
                 else:
                     time.sleep(1)
             
-            time.sleep(2)  # Delay between feeds
+            time.sleep(2)
             
         except Exception as e:
-            print(f"❌ Feed error ({feed_url}): {e}", flush=True)
+            print(f"❌ Feed error: {e}", flush=True)
             continue
     
     print(f"\n{'='*60}", flush=True)
-    print(f"📊 Scan complete: {total_created}/{total_processed} articles processed", flush=True)
+    print(f"📊 Complete: {total_created}/{total_processed} leads created", flush=True)
     print(f"{'='*60}\n", flush=True)
 
 
-# --- MAIN EXECUTION ---
+# --- START ---
 if __name__ == "__main__":
     print("="*60)
-    print("🤖 AI NEWS SCOUT AGENT v2.1 (FIXED)")
+    print("🤖 AI NEWS SCOUT v2.2 - PRODUCTION READY")
     print("="*60)
-    print("Features:")
-    print("  ✓ BeautifulSoup-based article scraping (no newspaper3k)")
-    print("  ✓ New Google GenAI SDK (no deprecation warnings)")
-    print("  ✓ Multi-stage AI analysis (Gemini 2.0 Flash)")
-    print("  ✓ Humanized content generation")
-    print("  ✓ Advanced duplicate detection")
-    print("  ✓ Automated Slack notifications")
-    print("  ✓ Robust error handling")
+    print("✓ BeautifulSoup scraping (no newspaper3k)")
+    print("✓ Multi-stage AI (Gemini 1.5 Flash)")
+    print("✓ Humanized content generation")
+    print("✓ Character limit enforcement")
+    print("✓ Advanced duplicate detection")
+    print("✓ Slack notifications")
     print("="*60)
     print()
     
-    # Main loop
     while True:
         try:
             run_scout()
         except KeyboardInterrupt:
-            print("\n👋 Shutting down gracefully...")
+            print("\n👋 Shutting down...")
             break
         except Exception as e:
-            print(f"❌ Critical error: {e}", flush=True)
+            print(f"❌ Critical: {e}", flush=True)
             import traceback
             traceback.print_exc()
         
-        print("💤 Sleeping for 30 minutes...\n", flush=True)
-        time.sleep(1800)  # 30 minutes
+        print("💤 Sleep 30 min\n", flush=True)
+        time.sleep(1800)

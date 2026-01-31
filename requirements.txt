@@ -1,0 +1,6 @@
+flask
+requests
+feedparser
+google-generativeai
+slack_sdk
+gunicorn

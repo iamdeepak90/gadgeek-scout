@@ -1,5 +1,6 @@
 """
-Core Configuration - Centralized settings
+Core Configuration - Centralized settings with enhanced reliability
+v7.0 - Added retry logic, caching, and humanization support
 """
 import re
 import requests
@@ -7,8 +8,11 @@ import json
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 from datetime import datetime, timezone
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from cachetools import TTLCache
+import time
 
-# ==================== DIRECTUS & SLACK ====================
+# ==================== API CREDENTIALS ====================
 DIRECTUS_URL = "https://admin.gadgeek.in"
 DIRECTUS_TOKEN = "Cmq-X3we8iSjBHbxziDrwas55FP3d6gz"
 SLACK_BOT_TOKEN = "xoxb-10413021355318-10399647335735-VVr0Giv2PAn0pstMuP5cuDtO"
@@ -30,14 +34,31 @@ RSS_FEEDS = [
 ]
 
 # ==================== AI API KEYS ====================
-# Gemini for Deep Research
+# Primary: Gemini 2.0 for Deep Research (Free tier: 15 RPM, 1M TPM, 1500 RPD)
 GEMINI_API_KEY = "AIzaSyARZL9PW073U_T6jxVIPVcFnHhXedZjgO4"
 
-# OpenAI for Content Generation (ChatGPT)
+# Secondary: OpenAI for Content Generation
 OPENAI_API_KEY = "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"
 
-# Pexels for Images (Free)
-PEXELS_API_KEY = "ks1X6yC5ydEypXxnu3qydCtK8Aso9KmIJcAB2R9WG292CZSx2ZZtJtVT"  # Get from: https://www.pexels.com/api/
+# Pexels for Images (Free: 200 requests/hour)
+PEXELS_API_KEY = "ks1X6yC5ydEypXxnu3qydCtK8Aso9KmIJcAB2R9WG292CZSx2ZZtJtVT"
+
+# ==================== CACHING ====================
+# Cache for API responses (10-minute TTL)
+api_cache = TTLCache(maxsize=100, ttl=600)
+
+
+# ==================== RETRY DECORATORS ====================
+
+def retry_on_api_error(func):
+    """Decorator for API calls with exponential backoff"""
+    return retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((requests.exceptions.RequestException, requests.exceptions.Timeout)),
+        before_sleep=lambda retry_state: print(f"   🔄 Retry {retry_state.attempt_number}/3...", flush=True)
+    )(func)
+
 
 # ==================== UTILITY FUNCTIONS ====================
 
@@ -47,257 +68,118 @@ def get_current_utc_time():
 
 
 def extract_json(text):
-    """Extract JSON from AI response"""
+    """
+    Extract JSON from AI response with better error handling
+    Handles markdown code blocks and malformed JSON
+    """
+    if not text:
+        return None
+    
+    # Try direct JSON parse first
     try:
         return json.loads(text)
     except:
-        match = re.search(r'\{.*\}', text, re.DOTALL)
+        pass
+    
+    # Try to extract from markdown code blocks
+    patterns = [
+        r'```json\s*\n(.*?)\n```',  # ```json ... ```
+        r'```\s*\n(.*?)\n```',      # ``` ... ```
+        r'\{.*\}',                   # Any JSON object
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.DOTALL)
         if match:
             try:
-                return json.loads(match.group(0))
+                json_str = match.group(1) if '```' in pattern else match.group(0)
+                return json.loads(json_str)
             except:
-                pass
+                continue
+    
     return None
 
 
 def get_domain_name(url):
-    """Extract clean domain name"""
+    """Extract clean domain name from URL"""
     try:
         domain = urlparse(url).netloc
-        return domain.replace('www.', '').split('.')[0].capitalize()
+        # Remove www. and get main part
+        domain = domain.replace('www.', '')
+        # Get first part before TLD
+        parts = domain.split('.')
+        return parts[0].capitalize() if parts else "Tech Source"
     except:
         return "Tech Source"
 
 
 def create_slug_from_text(text):
-    """Create SEO slug from text (no AI needed)"""
+    """
+    Create SEO slug from text with better keyword extraction
+    Returns: lowercase-hyphenated-slug (max 60 chars, 5-6 keywords)
+    """
     # Common filler words to remove
-    filler_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 
-                    'for', 'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 
-                    'be', 'has', 'have', 'this', 'that'}
+    filler_words = {
+        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
+        'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'be', 'has', 
+        'have', 'this', 'that', 'will', 'can', 'been', 'into', 'its', 'than',
+        'now', 'new', 'just', 'how', 'what', 'when', 'where', 'why', 'who'
+    }
     
+    # Clean and normalize
     slug = text.lower().strip()
-    slug = re.sub(r'[^\w\s-]', '', slug)
-    words = slug.split()
-    keywords = [w for w in words if w not in filler_words][:6]
-    slug = '-'.join(keywords)
-    slug = re.sub(r'-+', '-', slug)
-    
-    return slug[:60]
-
-
-def directus_request(method, endpoint, data=None, timeout=20):
-    """Centralized Directus API handler"""
-    headers = {"Authorization": f"Bearer {DIRECTUS_TOKEN}"}
-    url = f"{DIRECTUS_URL}{endpoint}"
-    
-    try:
-        if method.upper() == 'GET':
-            r = requests.get(url, headers=headers, timeout=timeout)
-        elif method.upper() == 'POST':
-            r = requests.post(url, json=data, headers=headers, timeout=timeout)
-        elif method.upper() == 'PATCH':
-            r = requests.patch(url, json=data, headers=headers, timeout=timeout)
-        else:
-            return None
-        
-        if r.status_code in [200, 201]:
-            return r.json()
-        else:
-            print(f"⚠️ Directus {method} {endpoint}: {r.status_code}", flush=True)
-            if r.status_code == 500:
-                print(f"   Response: {r.text[:200]}", flush=True)
-            return None
-            
-    except Exception as e:
-        print(f"⚠️ Directus error: {str(e)[:150]}", flush=True)
-        return None
-
-
-def fetch_image_from_pexels(keywords):
-    """Fetch relevant image from Pexels"""
-    if not PEXELS_API_KEY or PEXELS_API_KEY == "YOUR_PEXELS_KEY_HERE":
-        return None
-    
-    try:
-        url = f"https://api.pexels.com/v1/search?query={keywords}&per_page=1&orientation=landscape"
-        headers = {"Authorization": PEXELS_API_KEY}
-        
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('photos'):
-                return data['photos'][0]['src']['large']
-    except Exception as e:
-        print(f"⚠️ Image fetch failed: {e}", flush=True)
-    
-    return None
-
-
-
-# ==================== HELPER FUNCTIONS ====================
-
-def get_current_utc_time():
-    """Get current time in UTC (timezone-aware)"""
-    return datetime.now(timezone.utc)
-
-
-def extract_json(text):
-    """Extract JSON from AI response"""
-    try:
-        return json.loads(text)
-    except:
-        # Try to find JSON in markdown
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except:
-                pass
-    return None
-
-
-def get_domain_name(url):
-    """Extract domain name from URL"""
-    try:
-        domain = urlparse(url).netloc
-        return domain.replace('www.', '').split('.')[0].capitalize()
-    except:
-        return "Tech Source"
-
-
-def create_slug(title):
-    """Create SEO-friendly slug from title"""
-    # Extract main keywords (remove filler words)
-    filler_words = ['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
-                    'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'be', 'has', 'have']
-    
-    slug = title.lower().strip()
-    
-    # Remove special characters
-    slug = re.sub(r'[^\w\s-]', '', slug)
+    slug = re.sub(r'[^\w\s-]', '', slug)  # Remove special chars
+    slug = re.sub(r'\s+', ' ', slug)       # Normalize spaces
     
     # Split into words
     words = slug.split()
     
-    # Remove filler words and keep important ones
-    keywords = [w for w in words if w not in filler_words]
+    # Extract meaningful keywords
+    keywords = []
+    for word in words:
+        if word not in filler_words and len(word) > 2:
+            keywords.append(word)
+            if len(keywords) >= 6:
+                break
     
-    # Take first 5-6 keywords
-    keywords = keywords[:6]
+    # Fallback: if too few keywords, take first 6 words
+    if len(keywords) < 3:
+        keywords = [w for w in words if len(w) > 2][:6]
     
-    # Join with hyphens
+    # Join and clean
     slug = '-'.join(keywords)
+    slug = re.sub(r'-+', '-', slug)  # Remove multiple hyphens
+    slug = slug.strip('-')            # Remove leading/trailing hyphens
     
-    # Clean up multiple hyphens
-    slug = re.sub(r'-+', '-', slug)
-    
-    return slug[:60]  # Limit length
+    return slug[:60]  # Limit to 60 characters
 
 
-def scrape_full_article(url, max_chars=20000):
-    """Enhanced article scraping with more content"""
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.content, 'lxml')
-        
-        title = ''
-        if soup.find('h1'):
-            title = soup.find('h1').get_text().strip()
-        elif soup.find('title'):
-            title = soup.find('title').get_text().strip()
-        
-        content_text = ''
-        
-        article = soup.find('article')
-        if article:
-            for tag in article.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe', 'form']):
-                tag.decompose()
-            content_text = article.get_text(separator=' ', strip=True)
-        
-        if not content_text or len(content_text) < 200:
-            for class_name in ['content', 'article-body', 'post-content', 'entry-content', 
-                              'article-content', 'story-body', 'article__body', 'post__content']:
-                content_div = soup.find('div', class_=class_name)
-                if content_div:
-                    for tag in content_div.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe', 'form']):
-                        tag.decompose()
-                    content_text = content_div.get_text(separator=' ', strip=True)
-                    if len(content_text) > 200:
-                        break
-        
-        if not content_text or len(content_text) < 200:
-            main = soup.find('main')
-            if main:
-                for tag in main.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe', 'form']):
-                    tag.decompose()
-                content_text = main.get_text(separator=' ', strip=True)
-        
-        if not content_text or len(content_text) < 200:
-            paragraphs = soup.find_all('p')
-            content_text = ' '.join([p.get_text().strip() for p in paragraphs if len(p.get_text().strip()) > 30])
-        
-        content_text = ' '.join(content_text.split())
-        
-        return {
-            'title': title,
-            'text': content_text[:max_chars],
-            'word_count': len(content_text.split())
-        }
-        
-    except Exception as e:
-        print(f"⚠️ Scraping failed: {e}", flush=True)
-        return {
-            'title': '',
-            'text': 'Content unavailable.',
-            'word_count': 0
-        }
+# ==================== API REQUEST HANDLERS ====================
 
-
-def fetch_relevant_image(keywords, preferred_service='pexels'):
+@retry_on_api_error
+def directus_request(method, endpoint, data=None, timeout=30):
     """
-    Fetch relevant image from free stock photo APIs
-    Returns image URL or None
+    Centralized Directus API handler with retry logic
+    
+    Args:
+        method: HTTP method (GET, POST, PATCH)
+        endpoint: API endpoint (e.g., '/items/Articles')
+        data: Request payload (optional)
+        timeout: Request timeout in seconds
+    
+    Returns:
+        dict: Response JSON or None on failure
     """
-    try:
-        if preferred_service == 'pexels' and PEXELS_API_KEY and PEXELS_API_KEY != "YOUR_PEXELS_KEY_HERE":
-            # Pexels API (Free, unlimited)
-            url = f"https://api.pexels.com/v1/search?query={keywords}&per_page=1&orientation=landscape"
-            headers = {"Authorization": PEXELS_API_KEY}
-            
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('photos'):
-                    return data['photos'][0]['src']['large']
-        
-        elif preferred_service == 'unsplash' and UNSPLASH_ACCESS_KEY and UNSPLASH_ACCESS_KEY != "YOUR_UNSPLASH_KEY_HERE":
-            # Unsplash API (50 req/hour free)
-            url = f"https://api.unsplash.com/search/photos?query={keywords}&per_page=1&orientation=landscape"
-            headers = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}
-            
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('results'):
-                    return data['results'][0]['urls']['regular']
-    
-    except Exception as e:
-        print(f"⚠️ Image fetch failed: {e}", flush=True)
-    
-    return None
-
-
-def directus_request(method, endpoint, data=None, timeout=15):
-    """Centralized Directus API handler"""
     headers = {"Authorization": f"Bearer {DIRECTUS_TOKEN}"}
     url = f"{DIRECTUS_URL}{endpoint}"
+    
+    # Cache key for GET requests
+    cache_key = f"{method}:{endpoint}" if method.upper() == 'GET' else None
+    
+    # Check cache for GET requests
+    if cache_key and cache_key in api_cache:
+        print(f"   📦 Using cached response", flush=True)
+        return api_cache[cache_key]
     
     try:
         if method.upper() == 'GET':
@@ -307,36 +189,97 @@ def directus_request(method, endpoint, data=None, timeout=15):
         elif method.upper() == 'PATCH':
             r = requests.patch(url, json=data, headers=headers, timeout=timeout)
         else:
+            print(f"   ⚠️ Unsupported HTTP method: {method}", flush=True)
             return None
         
+        # Success codes
         if r.status_code in [200, 201]:
-            return r.json()
-        else:
-            print(f"⚠️ Directus {method} {endpoint}: {r.status_code}", flush=True)
-            return None
+            result = r.json()
+            # Cache GET responses
+            if cache_key:
+                api_cache[cache_key] = result
+            return result
+        
+        # Error handling
+        print(f"   ⚠️ Directus {method} {endpoint}: HTTP {r.status_code}", flush=True)
+        
+        if r.status_code == 500:
+            print(f"      Server Error: {r.text[:200]}", flush=True)
+        elif r.status_code == 401:
+            print(f"      Authentication failed - check token", flush=True)
+        elif r.status_code == 404:
+            print(f"      Endpoint not found", flush=True)
+        elif r.status_code == 429:
+            print(f"      Rate limit exceeded - backing off", flush=True)
+            time.sleep(5)
+        
+        return None
             
+    except requests.exceptions.Timeout:
+        print(f"   ⏱️ Directus request timeout ({timeout}s)", flush=True)
+        raise
+    except requests.exceptions.ConnectionError:
+        print(f"   🔌 Connection error to Directus", flush=True)
+        raise
     except Exception as e:
-        print(f"⚠️ Directus error: {str(e)[:100]}", flush=True)
+        print(f"   ❌ Directus error: {str(e)[:150]}", flush=True)
+        raise
+
+
+@retry_on_api_error
+def fetch_image_from_pexels(keywords):
+    """
+    Fetch relevant image from Pexels with retry logic
+    
+    Args:
+        keywords: Search keywords for image
+    
+    Returns:
+        str: Image URL or None
+    """
+    if not PEXELS_API_KEY or PEXELS_API_KEY == "YOUR_PEXELS_KEY_HERE":
+        return None
+    
+    try:
+        # Clean keywords for URL
+        keywords_clean = keywords.replace(' ', '+')[:100]
+        
+        url = f"https://api.pexels.com/v1/search?query={keywords_clean}&per_page=1&orientation=landscape"
+        headers = {"Authorization": PEXELS_API_KEY}
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('photos') and len(data['photos']) > 0:
+                image_url = data['photos'][0]['src']['large']
+                print(f"   🖼️ Image found: Pexels", flush=True)
+                return image_url
+        
+        print(f"   ⚠️ No images found for: {keywords[:50]}", flush=True)
+        return None
+        
+    except requests.exceptions.Timeout:
+        print(f"   ⏱️ Pexels request timeout", flush=True)
+        return None
+    except Exception as e:
+        print(f"   ⚠️ Image fetch failed: {str(e)[:100]}", flush=True)
         return None
 
 
-"""
-Article Publisher Module - Single source of truth for publishing
-"""
-from config import ARTICLE_COLLECTION, directus_request, create_slug_from_text
-
+# ==================== PUBLISHING FUNCTIONS ====================
 
 def publish_article_to_directus(title, content, short_description, category, 
                                   source_url, featured_image=None, slug=None):
     """
-    SINGLE FUNCTION to publish articles to Directus
+    Single function to publish articles to Directus
     Used by both bot_server and publisher
     
     Args:
         title: Article title (60-70 chars)
         content: Full HTML content
         short_description: 200 char description
-        category: Article category
+        category: Article category slug
         source_url: Original source URL
         featured_image: Image URL (optional)
         slug: Custom slug or auto-generated
@@ -349,12 +292,17 @@ def publish_article_to_directus(title, content, short_description, category,
     if not slug:
         slug = create_slug_from_text(short_description if short_description else title)
     
+    # Validate required fields
+    if not title or not content or not short_description:
+        print(f"   ❌ Missing required fields for publishing", flush=True)
+        return False
+    
     payload = {
         "status": "published",
-        "title": title,
-        "slug": slug,
+        "title": title[:200],  # Limit title length
+        "slug": slug[:100],    # Limit slug length
         "content": content,
-        "short_description": short_description,
+        "short_description": short_description[:300],  # Limit description
         "category": category,
         "featured_image": featured_image,
         "source_link": source_url
@@ -364,12 +312,13 @@ def publish_article_to_directus(title, content, short_description, category,
     print(f"      Title: {title[:60]}...", flush=True)
     print(f"      Slug: {slug}", flush=True)
     print(f"      Category: {category}", flush=True)
-    print(f"      Content length: {len(content)} chars", flush=True)
+    print(f"      Content: {len(content)} chars, {len(content.split())} words", flush=True)
     
     result = directus_request('POST', f'/items/{ARTICLE_COLLECTION}', payload, timeout=30)
     
-    if result:
-        print(f"   ✅ Published successfully!", flush=True)
+    if result and 'data' in result:
+        article_id = result['data'].get('id', 'unknown')
+        print(f"   ✅ Published successfully! ID: {article_id}", flush=True)
         return True
     else:
         print(f"   ❌ Publishing failed", flush=True)
@@ -378,7 +327,7 @@ def publish_article_to_directus(title, content, short_description, category,
 
 def update_lead_status(lead_id, status):
     """
-    SINGLE FUNCTION to update lead status
+    Single function to update lead status
     
     Args:
         lead_id: Lead ID
@@ -387,5 +336,45 @@ def update_lead_status(lead_id, status):
     Returns:
         bool: True if updated successfully
     """
-    result = directus_request('PATCH', f'/items/news_leads/{lead_id}', {"status": status})
-    return result is not None
+    valid_statuses = ['pending', 'queued', 'processed', 'rejected']
+    
+    if status not in valid_statuses:
+        print(f"   ⚠️ Invalid status: {status}", flush=True)
+        return False
+    
+    result = directus_request('PATCH', f'/items/news_leads/{lead_id}', {"status": status}, timeout=10)
+    
+    if result:
+        print(f"   ✅ Lead #{lead_id} → {status}", flush=True)
+        return True
+    else:
+        print(f"   ❌ Failed to update lead #{lead_id}", flush=True)
+        return False
+
+
+# ==================== HEALTH CHECK ====================
+
+def check_api_health():
+    """
+    Check health of all API connections
+    Returns dict with status of each service
+    """
+    health_status = {}
+    
+    # Check Directus
+    try:
+        result = directus_request('GET', '/server/health', timeout=5)
+        health_status['directus'] = 'healthy' if result else 'error'
+    except:
+        health_status['directus'] = 'error'
+    
+    # Check Gemini API
+    health_status['gemini'] = 'configured' if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_KEY" else 'missing'
+    
+    # Check OpenAI API
+    health_status['openai'] = 'configured' if OPENAI_API_KEY and OPENAI_API_KEY != "YOUR_OPENAI_KEY" else 'missing'
+    
+    # Check Pexels API
+    health_status['pexels'] = 'configured' if PEXELS_API_KEY and PEXELS_API_KEY != "YOUR_PEXELS_KEY" else 'missing'
+    
+    return health_status

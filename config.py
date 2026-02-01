@@ -35,7 +35,7 @@ genai.configure(api_key=GEMINI_KEY)
 
 # Factual analysis model (low temperature)
 analysis_model = genai.GenerativeModel(
-    'gemini-1.5-flash',
+    'gemini-3-pro-preview',
     generation_config={
         "response_mime_type": "application/json",
         "temperature": 0.3
@@ -44,7 +44,7 @@ analysis_model = genai.GenerativeModel(
 
 # Creative generation model (higher temperature)
 creative_model = genai.GenerativeModel(
-    'gemini-1.5-flash',
+    'gemini-3-pro-preview',
     generation_config={
         "response_mime_type": "application/json",
         "temperature": 0.7
@@ -53,7 +53,7 @@ creative_model = genai.GenerativeModel(
 
 # Article writing model (balanced, HTML output)
 article_model = genai.GenerativeModel(
-    'gemini-1.5-flash',
+    'gemini-3-pro-preview',
     generation_config={
         "temperature": 0.6
     }

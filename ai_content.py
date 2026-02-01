@@ -1,25 +1,20 @@
 """
 Multi-AI Content Generation - Maximum Humanization
-Uses 3 different AI models for collaborative refinement
+Uses Groq (primary) + OpenRouter (refinement) for best results
 """
 import json
 import requests
 import time
 import re
-
-from config import (
-    GROQ_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY,
-    PRIMARY_AI, SECONDARY_AI, FALLBACK_AI, extract_json
-)
+from config import GROQ_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, extract_json
 
 # ==================== AI CLIENTS ====================
 
 class GroqClient:
-    """Groq - Very fast and generous free tier"""
+    """Groq - Very fast, generous free tier"""
     def __init__(self, api_key):
         self.api_key = api_key
         self.base_url = "https://api.groq.com/openai/v1/chat/completions"
-        # Best models: llama-3.3-70b-versatile, llama-3.1-70b-versatile
         self.model = "llama-3.3-70b-versatile"
     
     def generate(self, prompt, temperature=0.7, json_mode=False):
@@ -48,19 +43,18 @@ class GroqClient:
 
 
 class OpenRouterClient:
-    """OpenRouter - Multiple free models"""
+    """OpenRouter - Free models for refinement"""
     def __init__(self, api_key):
         self.api_key = api_key
         self.base_url = "https://openrouter.ai/api/v1/chat/completions"
-        # Free models: google/gemini-flash-1.5-8b, meta-llama/llama-3.2-3b-instruct:free
-        self.model = "google/gemini-flash-1.5-8b"  # Fast and free
+        # Use confirmed working free model
+        self.model = "nousresearch/hermes-3-llama-3.1-405b:free"
     
     def generate(self, prompt, temperature=0.7, json_mode=False):
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://gadgeek.in",
-            "X-Title": "Gadgeek News System"
+            "HTTP-Referer": "https://gadgeek.in"
         }
         
         payload = {
@@ -83,11 +77,11 @@ class OpenRouterClient:
 
 
 class GeminiClient:
-    """Gemini - Use Flash-8B for higher rate limits"""
+    """Gemini Flash-8B - Fallback"""
     def __init__(self, api_key):
         self.api_key = api_key
         self.base_url = "https://generativelanguage.googleapis.com/v1beta/models"
-        self.model = "gemini-1.5-flash-8b"  # Higher limits than Pro
+        self.model = "gemini-1.5-flash-8b"
     
     def generate(self, prompt, temperature=0.7, json_mode=False):
         url = f"{self.base_url}/{self.model}:generateContent?key={self.api_key}"
@@ -117,68 +111,66 @@ groq = GroqClient(GROQ_API_KEY) if GROQ_API_KEY and GROQ_API_KEY != "YOUR_GROQ_A
 openrouter = OpenRouterClient(OPENROUTER_API_KEY) if OPENROUTER_API_KEY and OPENROUTER_API_KEY != "YOUR_OPENROUTER_API_KEY_HERE" else None
 gemini = GeminiClient(GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-
-# ==================== AI ROUTER ====================
+# ==================== AI ROUTING ====================
 
 def get_ai_client(priority="primary"):
-    """Get available AI client based on priority"""
+    """Get available AI client"""
     if priority == "primary":
-        if PRIMARY_AI == "groq" and groq:
+        if groq:
             return groq, "Groq"
-        elif PRIMARY_AI == "openrouter" and openrouter:
-            return openrouter, "OpenRouter"
-        elif PRIMARY_AI == "gemini" and gemini:
+        if gemini:
             return gemini, "Gemini"
+        if openrouter:
+            return openrouter, "OpenRouter"
     
     elif priority == "secondary":
-        if SECONDARY_AI == "openrouter" and openrouter:
+        if openrouter:
             return openrouter, "OpenRouter"
-        elif SECONDARY_AI == "groq" and groq:
-            return groq, "Groq"
-        elif SECONDARY_AI == "gemini" and gemini:
+        if gemini:
             return gemini, "Gemini"
+        if groq:
+            return groq, "Groq"
     
-    # Fallback chain
+    # Fallback
     if groq:
         return groq, "Groq"
-    if openrouter:
-        return openrouter, "OpenRouter"
     if gemini:
         return gemini, "Gemini"
+    if openrouter:
+        return openrouter, "OpenRouter"
     
     return None, None
 
 
-# ==================== STAGE 1: ANALYSIS ====================
+# ==================== ANALYSIS ====================
 
 def analyze_news_story(content_data):
-    """Deep analysis using primary AI"""
+    """Deep analysis using AI"""
     client, name = get_ai_client("primary")
     
     if not client:
-        print("❌ No AI client available for analysis", flush=True)
         return create_fallback_analysis(content_data)
     
-    prompt = f"""You are a veteran tech journalist analyzing a news story.
+    prompt = f"""Analyze this tech news story. Output ONLY valid JSON.
 
-ARTICLE CONTENT:
+ARTICLE:
 Title: {content_data['title']}
 Text: {content_data['text'][:5000]}
 
-Analyze this story deeply. Output ONLY valid JSON with this exact structure:
+OUTPUT JSON:
 {{
-  "main_event": "What actually happened in one clear sentence",
-  "significance": "Why readers should care",
+  "main_event": "What happened in one sentence",
+  "significance": "Why readers care",
   "key_players": ["Company1", "Person1"],
   "story_type": "breaking_news|product_launch|industry_analysis|controversy|rumor|review",
   "urgency_score": 7,
   "target_audience": "tech_enthusiasts|general_consumers|developers",
   "unique_angle": "Most interesting perspective",
-  "context": "Bigger picture or trend",
-  "reader_questions": ["What does this mean for me?"]
+  "context": "Bigger picture",
+  "reader_questions": ["What does this mean?"]
 }}
 
-Be specific. No corporate PR language. Return only JSON."""
+Be specific. No PR language. Return only JSON."""
 
     print(f"   🧠 Analyzing with {name}...", flush=True)
     
@@ -188,17 +180,16 @@ Be specific. No corporate PR language. Return only JSON."""
             analysis = extract_json(response)
             if analysis and 'main_event' in analysis:
                 return analysis
-    except Exception as e:
-        print(f"   ⚠️ Analysis failed: {e}", flush=True)
+    except:
+        pass
     
     return create_fallback_analysis(content_data)
 
 
 def create_fallback_analysis(content_data):
-    """Fallback analysis if AI fails"""
     return {
         "main_event": content_data['title'],
-        "significance": "Important tech industry development",
+        "significance": "Tech industry development",
         "key_players": [],
         "story_type": "industry_analysis",
         "urgency_score": 5,
@@ -209,50 +200,38 @@ def create_fallback_analysis(content_data):
     }
 
 
-# ==================== STAGE 2: HEADLINE GENERATION ====================
+# ==================== HEADLINE GENERATION ====================
 
 def generate_humanized_headline_and_summary(content_data, analysis):
-    """
-    Two-step generation:
-    1. Primary AI creates initial version
-    2. Secondary AI humanizes and refines
-    """
+    """Two-step: Draft with primary AI, humanize with secondary"""
     
-    # Step 1: Initial generation with primary AI
     client1, name1 = get_ai_client("primary")
     
     if not client1:
         return create_fallback_content(analysis)
     
-    prompt1 = f"""You're a master headline writer. No AI language allowed.
+    prompt1 = f"""Create headline and summary. Output as JSON.
 
 CONTEXT:
 Event: {analysis['main_event']}
-Why it matters: {analysis['significance']}
-Angle: {analysis['unique_angle']}
-Players: {', '.join(analysis['key_players'][:2]) if analysis['key_players'] else 'Tech companies'}
+Impact: {analysis['significance']}
+Players: {', '.join(analysis['key_players'][:2]) if analysis['key_players'] else 'Tech firms'}
 
-SOURCE (for facts):
+SOURCE:
 {content_data['text'][:2000]}
 
-CREATE (output as JSON):
-1. HEADLINE - under 65 characters, punchy, specific
-2. SUMMARY - exactly 2 sentences, under 220 characters total
+CREATE (JSON):
+1. HEADLINE - under 65 characters
+2. SUMMARY - 2 sentences, under 220 chars
 
-BANNED PHRASES (never use):
-- "The article discusses"
-- "According to reports"
-- "It's worth noting"
-- "Interestingly"
-- "Breaking"
-- "Latest"
+BANNED: "The article", "According to", "It's worth noting", "Interestingly", "Breaking", "Latest"
 
-GOOD EXAMPLES:
+EXAMPLES:
 {{"title": "iPhone 16 Leaks: No Physical Buttons?", "summary": "Apple's next flagship might ditch physical buttons for haptic sensors. The change could make it the most water-resistant iPhone yet."}}
 
-{{"title": "Tesla Cuts Model 3 Price to $35,000", "summary": "Tesla slashed prices after weak Q1 sales. The move puts it in direct competition with Chevy's Bolt."}}
+{{"title": "Tesla Cuts Model 3 Price to $35,000", "summary": "Tesla slashed prices after weak Q1 sales. This puts it in direct competition with Chevy's Bolt."}}
 
-Return ONLY JSON with "title" and "summary". Be direct, specific, human."""
+Return ONLY JSON with "title" and "summary"."""
 
     print(f"   ✍️  Generating with {name1}...", flush=True)
     
@@ -265,28 +244,26 @@ Return ONLY JSON with "title" and "summary". Be direct, specific, human."""
         if not draft or 'title' not in draft:
             return create_fallback_content(analysis)
         
-        # Step 2: Humanize with secondary AI
+        # Try humanization with secondary AI
         client2, name2 = get_ai_client("secondary")
         
-        if client2 and name2 != name1:  # Only if different AI available
+        if client2 and name2 != name1:
             print(f"   🎨 Humanizing with {name2}...", flush=True)
             
-            prompt2 = f"""Refine this headline and summary to sound more human and natural.
+            prompt2 = f"""Make this sound more human. Output as JSON.
 
 CURRENT:
 Title: {draft['title']}
 Summary: {draft['summary']}
 
 RULES:
-1. Keep title under 65 chars
-2. Keep summary under 220 chars
-3. Make it sound like a human wrote it
-4. Remove any corporate or AI language
-5. Use contractions when natural (it's, that's, won't)
-6. Vary sentence length
-7. Be specific and direct
+- Keep title under 65 chars
+- Keep summary under 220 chars
+- Sound like a human wrote it
+- Use contractions (it's, that's)
+- Be specific and direct
 
-Output as JSON: {{"title": "...", "summary": "..."}}"""
+Output JSON: {{"title": "...", "summary": "..."}}"""
             
             response2 = client2.generate(prompt2, temperature=0.6, json_mode=True)
             if response2:
@@ -294,96 +271,69 @@ Output as JSON: {{"title": "...", "summary": "..."}}"""
                 if refined and 'title' in refined:
                     draft = refined
         
-        # Validate and truncate
         title = draft.get('title', '')[:65]
         summary = draft.get('summary', '')[:220]
         
-        # Remove any AI-isms that slipped through
-        ai_phrases = [
-            "the article discusses", "according to reports", "it appears that",
-            "seems to suggest", "it's worth noting", "interestingly,", "notably,"
-        ]
-        
-        summary_lower = summary.lower()
-        for phrase in ai_phrases:
-            if phrase in summary_lower:
-                print(f"   ⚠️ AI phrase detected, using fallback", flush=True)
-                return create_fallback_content(analysis)
+        # Check for AI-isms
+        ai_phrases = ["the article discusses", "according to reports", "it's worth noting"]
+        if any(phrase in summary.lower() for phrase in ai_phrases):
+            return create_fallback_content(analysis)
         
         return {'title': title, 'summary': summary}
         
-    except Exception as e:
-        print(f"   ⚠️ Generation failed: {e}", flush=True)
+    except:
         return create_fallback_content(analysis)
 
 
 def create_fallback_content(analysis):
-    """Fallback content if generation fails"""
     title = analysis['main_event'][:62]
     summary = f"{analysis['main_event'][:110]}. {analysis['significance'][:100]}."
-    return {
-        'title': title,
-        'summary': summary[:220]
-    }
+    return {'title': title, 'summary': summary[:220]}
 
 
-# ==================== STAGE 3: ARTICLE WRITING ====================
+# ==================== ARTICLE WRITING ====================
 
 def write_full_article(title, source_text, analysis):
-    """
-    Three-stage article writing:
-    1. Primary AI writes draft
-    2. Secondary AI removes AI-isms
-    3. Final validation
-    """
+    """Three-stage: Draft, humanize, validate"""
     
-    # Stage 1: Draft with primary AI
     client1, name1 = get_ai_client("primary")
     
     if not client1:
         return create_fallback_article(title, analysis)
     
-    prompt1 = f"""You're a tech journalist. Write a news article that sounds completely human.
+    prompt1 = f"""Write a tech news article in HTML. Sound completely human.
 
 ASSIGNMENT:
 Title: {title}
-Type: {analysis.get('story_type', 'tech news')}
-Context: {analysis.get('context', 'Tech update')}
+Type: {analysis.get('story_type', 'news')}
 
 SOURCE:
 {source_text[:8000]}
 
-WRITE a 400-600 word article in HTML format.
+WRITE 400-600 words in HTML.
 
 STRUCTURE:
-<p>Strong opening sentence with the news.</p>
+<p>Strong opening with the news.</p>
 <p>Context in 2-3 sentences.</p>
-<h2>What's Actually Changing</h2>
-<p>Details with specifics and numbers.</p>
+<h2>What's Changing</h2>
+<p>Details with numbers.</p>
 <h2>Why This Matters</h2>
-<p>Real-world impact.</p>
-<p>Brief conclusion.</p>
+<p>Real impact.</p>
 
-ABSOLUTELY FORBIDDEN PHRASES:
+FORBIDDEN:
 ❌ "It's worth noting"
 ❌ "Interestingly,"
-❌ "Notably,"
 ❌ "In conclusion,"
 ❌ "Furthermore,"
 ❌ "Moreover,"
-❌ "Additionally,"
-❌ "This development underscores"
-❌ "The significance cannot be overstated"
 
-WRITE LIKE THIS:
-✓ "Apple cut prices to $35,000 after weak sales."
-✓ "That's not a typo—it's the largest fine ever."
-✓ "The company has five months to comply."
-✓ Use contractions: "it's", "that's", "won't"
+WRITE LIKE:
+✓ "Apple cut prices after weak sales."
+✓ "That's the largest fine ever."
+✓ Use contractions
 ✓ Vary sentence length
-✓ Be direct and specific
 
-NO markdown, NO code blocks. Just HTML. Return ONLY the HTML."""
+NO markdown. Just HTML."""
 
     print(f"   📝 Writing with {name1}...", flush=True)
     
@@ -392,28 +342,26 @@ NO markdown, NO code blocks. Just HTML. Return ONLY the HTML."""
         if not response1:
             return create_fallback_article(title, analysis)
         
-        # Clean markdown artifacts
         article = response1.replace("```html", "").replace("```", "").strip()
         
-        # Stage 2: Humanize with secondary AI if available
+        # Humanize if possible
         client2, name2 = get_ai_client("secondary")
         
         if client2 and name2 != name1 and len(article) > 200:
             print(f"   🎨 Humanizing with {name2}...", flush=True)
             
-            prompt2 = f"""Remove ALL AI-sounding phrases from this article. Make it sound like a human journalist wrote it.
+            prompt2 = f"""Remove AI phrases. Make it sound human.
 
 ARTICLE:
 {article[:6000]}
 
 FIX:
-1. Remove: "It's worth noting", "Interestingly", "Notably", etc.
-2. Use contractions naturally
-3. Vary sentence structure
-4. Keep it conversational but professional
-5. Be direct and specific
+- Remove: "It's worth noting", "Interestingly", etc.
+- Use contractions
+- Vary sentences
+- Be direct
 
-Return ONLY the improved HTML. No explanation."""
+Return ONLY improved HTML."""
             
             response2 = client2.generate(prompt2, temperature=0.5)
             if response2:
@@ -421,17 +369,15 @@ Return ONLY the improved HTML. No explanation."""
                 if len(refined) > 200:
                     article = refined
         
-        # Final validation: remove any remaining AI-isms
-        ai_patterns = [
+        # Final cleanup
+        patterns = [
             r"It'?s worth noting that\s*",
             r"Interestingly,?\s*",
             r"Notably,?\s*",
-            r"In conclusion,?\s*",
-            r"Furthermore,?\s*",
-            r"Moreover,?\s*",
+            r"In conclusion,?\s*"
         ]
         
-        for pattern in ai_patterns:
+        for pattern in patterns:
             article = re.sub(pattern, "", article, flags=re.IGNORECASE)
         
         if len(article) < 200:
@@ -445,9 +391,8 @@ Return ONLY the improved HTML. No explanation."""
 
 
 def create_fallback_article(title, analysis):
-    """Fallback article if generation fails"""
     return f"""<p><strong>{title}</strong></p>
-<p>This story is developing. {analysis.get('significance', 'Important tech industry update.')}</p>
+<p>This story is developing. {analysis.get('significance', 'Important update.')}</p>
 <h2>Background</h2>
-<p>{analysis.get('context', 'This is part of ongoing developments in the tech industry.')}</p>
-<p>Check the source link for full details and updates as this story develops.</p>"""
+<p>{analysis.get('context', 'Part of ongoing tech industry developments.')}</p>
+<p>Check the source for full details.</p>"""

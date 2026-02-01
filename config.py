@@ -1,14 +1,14 @@
 """
-Multi-AI Configuration - Using Free Tier APIs
-Combines multiple AI models for maximum humanization
+Shared configuration and utility functions
+Multi-AI setup with free tier APIs
 """
-import os
 import re
 import requests
-from urllib.parse import urlparse
+import json
 from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 
-# ==================== DIRECTUS & SLACK ====================
+# ==================== CONFIGURATION ====================
 DIRECTUS_URL = "https://admin.gadgeek.in"
 DIRECTUS_TOKEN = "Cmq-X3we8iSjBHbxziDrwas55FP3d6gz"
 SLACK_BOT_TOKEN = "xoxb-10413021355318-10399647335735-VVr0Giv2PAn0pstMuP5cuDtO"
@@ -30,41 +30,19 @@ RSS_FEEDS = [
 ]
 
 # ==================== AI API KEYS ====================
+# Get your Groq key: https://console.groq.com
+GROQ_API_KEY = "YOUR_GROQ_API_KEY_HERE"
 
-# Option 1: Groq (RECOMMENDED - Very generous free tier)
-# Sign up: https://console.groq.com
-# Free tier: 30 requests/minute, 14,400/day
-GROQ_API_KEY = "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"  # ← Add your Groq key
+# Get your OpenRouter key: https://openrouter.ai  
+OPENROUTER_API_KEY = "YOUR_OPENROUTER_API_KEY_HERE"
 
-# Option 2: OpenRouter (Multiple free models available)
-# Sign up: https://openrouter.ai
-# Free models: Google Gemini Flash, Meta Llama, Mistral, etc.
-OPENROUTER_API_KEY = "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"  # ← Add your OpenRouter key
-
-# Option 3: Gemini (Keep as backup, but use Flash-8B for higher limits)
-# Free tier: 15 RPM, 1500 RPD
+# Gemini (fallback)
 GEMINI_API_KEY = "AIzaSyARZL9PW073U_T6jxVIPVcFnHhXedZjgO4"
-
-# Option 4: Hugging Face (Free inference API)
-# Sign up: https://huggingface.co/settings/tokens
-HUGGINGFACE_API_KEY = "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"  # ← Optional
-
-# ==================== AI ROUTING STRATEGY ====================
-
-# Primary: Groq (Fast analysis & drafting)
-PRIMARY_AI = "groq"  # Options: "groq", "openrouter", "gemini"
-
-# Secondary: OpenRouter (Humanization & refinement)
-SECONDARY_AI = "openrouter"  # Options: "openrouter", "groq", "gemini"
-
-# Fallback: Gemini Flash-8B (Final validation)
-FALLBACK_AI = "gemini"
 
 # ==================== HELPER FUNCTIONS ====================
 
 def extract_json(text):
     """Extract JSON from AI response"""
-    import json
     try:
         return json.loads(text)
     except:
@@ -106,24 +84,20 @@ def scrape_full_article(url, max_chars=15000):
         
         soup = BeautifulSoup(response.content, 'lxml')
         
-        # Extract title
         title = ''
         if soup.find('h1'):
             title = soup.find('h1').get_text().strip()
         elif soup.find('title'):
             title = soup.find('title').get_text().strip()
         
-        # Extract content
         content_text = ''
         
-        # Try article tag
         article = soup.find('article')
         if article:
             for tag in article.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe', 'form']):
                 tag.decompose()
             content_text = article.get_text(separator=' ', strip=True)
         
-        # Try common classes
         if not content_text or len(content_text) < 200:
             for class_name in ['content', 'article-body', 'post-content', 'entry-content', 
                               'article-content', 'story-body', 'article__body', 'post__content']:
@@ -135,7 +109,6 @@ def scrape_full_article(url, max_chars=15000):
                     if len(content_text) > 200:
                         break
         
-        # Try main tag
         if not content_text or len(content_text) < 200:
             main = soup.find('main')
             if main:
@@ -143,7 +116,6 @@ def scrape_full_article(url, max_chars=15000):
                     tag.decompose()
                 content_text = main.get_text(separator=' ', strip=True)
         
-        # Fallback to paragraphs
         if not content_text or len(content_text) < 200:
             paragraphs = soup.find_all('p')
             content_text = ' '.join([p.get_text().strip() for p in paragraphs if len(p.get_text().strip()) > 30])

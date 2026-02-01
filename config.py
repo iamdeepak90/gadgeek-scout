@@ -318,3 +318,74 @@ def directus_request(method, endpoint, data=None, timeout=15):
     except Exception as e:
         print(f"⚠️ Directus error: {str(e)[:100]}", flush=True)
         return None
+
+
+"""
+Article Publisher Module - Single source of truth for publishing
+"""
+from config import ARTICLE_COLLECTION, directus_request, create_slug_from_text
+
+
+def publish_article_to_directus(title, content, short_description, category, 
+                                  source_url, featured_image=None, slug=None):
+    """
+    SINGLE FUNCTION to publish articles to Directus
+    Used by both bot_server and publisher
+    
+    Args:
+        title: Article title (60-70 chars)
+        content: Full HTML content
+        short_description: 200 char description
+        category: Article category
+        source_url: Original source URL
+        featured_image: Image URL (optional)
+        slug: Custom slug or auto-generated
+    
+    Returns:
+        bool: True if published successfully
+    """
+    
+    # Auto-generate slug if not provided
+    if not slug:
+        slug = create_slug_from_text(short_description if short_description else title)
+    
+    payload = {
+        "status": "published",
+        "title": title,
+        "slug": slug,
+        "content": content,
+        "short_description": short_description,
+        "category": category,
+        "featured_image": featured_image,
+        "source_link": source_url
+    }
+    
+    print(f"   📤 Publishing to Directus...", flush=True)
+    print(f"      Title: {title[:60]}...", flush=True)
+    print(f"      Slug: {slug}", flush=True)
+    print(f"      Category: {category}", flush=True)
+    print(f"      Content length: {len(content)} chars", flush=True)
+    
+    result = directus_request('POST', f'/items/{ARTICLE_COLLECTION}', payload, timeout=30)
+    
+    if result:
+        print(f"   ✅ Published successfully!", flush=True)
+        return True
+    else:
+        print(f"   ❌ Publishing failed", flush=True)
+        return False
+
+
+def update_lead_status(lead_id, status):
+    """
+    SINGLE FUNCTION to update lead status
+    
+    Args:
+        lead_id: Lead ID
+        status: New status (pending, queued, processed, rejected)
+    
+    Returns:
+        bool: True if updated successfully
+    """
+    result = directus_request('PATCH', f'/items/news_leads/{lead_id}', {"status": status})
+    return result is not None

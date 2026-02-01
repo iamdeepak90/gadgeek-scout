@@ -336,7 +336,7 @@ def publish_article_to_directus(title, content, short_description, category,
     print(f"      Category: {category}", flush=True)
     print(f"      Content: {len(content)} chars, {len(content.split())} words", flush=True)
     
-    result = directus_request('POST', f'/items/{ARTICLE_COLLECTION}', payload, timeout=30)
+    result = directus_request('POST', '/items/{ARTICLE_COLLECTION}', payload)
     
     if result and 'data' in result:
         article_id = result['data'].get('id', 'unknown')

@@ -320,11 +320,10 @@ def publish_article_to_directus(title, content, short_description, category,
     
     payload = {
         "status": "published",
-        "title": title[:200],  # Limit title length
-        "slug": slug[:100],    # Limit slug length
+        "title": title[:200],
+        "slug": slug[:100],
         "content": content,
-        "short_description": short_description[:300],  # Limit description
-        """ "category": category, """
+        "short_description": short_description[:300],
     }
     
     # Only add featured_image if it exists

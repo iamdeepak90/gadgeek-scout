@@ -1,17 +1,16 @@
 """
-Shared configuration and utility functions
-Used across scout.py, bot_server.py, and publisher.py
+Multi-AI Configuration - Using Free Tier APIs
+Combines multiple AI models for maximum humanization
 """
+import os
 import re
 import requests
-import google.generativeai as genai
-from bs4 import BeautifulSoup
 from urllib.parse import urlparse
+from bs4 import BeautifulSoup
 
-# ==================== CONFIGURATION ====================
+# ==================== DIRECTUS & SLACK ====================
 DIRECTUS_URL = "https://admin.gadgeek.in"
 DIRECTUS_TOKEN = "Cmq-X3we8iSjBHbxziDrwas55FP3d6gz"
-GEMINI_KEY = "AIzaSyARZL9PW073U_T6jxVIPVcFnHhXedZjgO4"
 SLACK_BOT_TOKEN = "xoxb-10413021355318-10399647335735-VVr0Giv2PAn0pstMuP5cuDtO"
 SLACK_CHANNEL = "C0AC72SJYJW"
 SLACK_SIGNING_SECRET = "4f28dc0a3781d55f764267910c7bcc77"
@@ -30,44 +29,45 @@ RSS_FEEDS = [
     "https://venturebeat.com/feed/"
 ]
 
-# ==================== AI MODELS ====================
-genai.configure(api_key=GEMINI_KEY)
+# ==================== AI API KEYS ====================
 
-# Factual analysis model (low temperature)
-analysis_model = genai.GenerativeModel(
-    'gemini-3-pro-preview',
-    generation_config={
-        "response_mime_type": "application/json",
-        "temperature": 0.3
-    }
-)
+# Option 1: Groq (RECOMMENDED - Very generous free tier)
+# Sign up: https://console.groq.com
+# Free tier: 30 requests/minute, 14,400/day
+GROQ_API_KEY = "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"  # ← Add your Groq key
 
-# Creative generation model (higher temperature)
-creative_model = genai.GenerativeModel(
-    'gemini-3-pro-preview',
-    generation_config={
-        "response_mime_type": "application/json",
-        "temperature": 0.7
-    }
-)
+# Option 2: OpenRouter (Multiple free models available)
+# Sign up: https://openrouter.ai
+# Free models: Google Gemini Flash, Meta Llama, Mistral, etc.
+OPENROUTER_API_KEY = "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"  # ← Add your OpenRouter key
 
-# Article writing model (balanced, HTML output)
-article_model = genai.GenerativeModel(
-    'gemini-3-pro-preview',
-    generation_config={
-        "temperature": 0.6
-    }
-)
+# Option 3: Gemini (Keep as backup, but use Flash-8B for higher limits)
+# Free tier: 15 RPM, 1500 RPD
+GEMINI_API_KEY = "AIzaSyARZL9PW073U_T6jxVIPVcFnHhXedZjgO4"
+
+# Option 4: Hugging Face (Free inference API)
+# Sign up: https://huggingface.co/settings/tokens
+HUGGINGFACE_API_KEY = "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"  # ← Optional
+
+# ==================== AI ROUTING STRATEGY ====================
+
+# Primary: Groq (Fast analysis & drafting)
+PRIMARY_AI = "groq"  # Options: "groq", "openrouter", "gemini"
+
+# Secondary: OpenRouter (Humanization & refinement)
+SECONDARY_AI = "openrouter"  # Options: "openrouter", "groq", "gemini"
+
+# Fallback: Gemini Flash-8B (Final validation)
+FALLBACK_AI = "gemini"
 
 # ==================== HELPER FUNCTIONS ====================
 
 def extract_json(text):
-    """Extract JSON from AI response, handling markdown blocks"""
+    """Extract JSON from AI response"""
     import json
     try:
         return json.loads(text)
     except:
-        # Try to find JSON in markdown blocks
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
             try:
@@ -78,7 +78,7 @@ def extract_json(text):
 
 
 def get_domain_name(url):
-    """Extract clean domain name from URL"""
+    """Extract domain name from URL"""
     try:
         domain = urlparse(url).netloc
         return domain.replace('www.', '').split('.')[0].capitalize()
@@ -87,21 +87,18 @@ def get_domain_name(url):
 
 
 def create_slug(title):
-    """Create URL-friendly slug from title"""
+    """Create URL slug from title"""
     slug = title.lower().strip()
     slug = re.sub(r'[^a-z0-9\s-]', '', slug)
     slug = re.sub(r'[\s-]+', '-', slug)
-    return slug[:100]  # Limit length
+    return slug[:100]
 
 
 def scrape_full_article(url, max_chars=15000):
-    """
-    Advanced article scraping with multiple strategies.
-    Returns clean text content.
-    """
+    """Scrape full article content"""
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         
         response = requests.get(url, headers=headers, timeout=15)
@@ -116,17 +113,17 @@ def scrape_full_article(url, max_chars=15000):
         elif soup.find('title'):
             title = soup.find('title').get_text().strip()
         
-        # Extract content - multiple strategies
+        # Extract content
         content_text = ''
         
-        # Strategy 1: article tag
+        # Try article tag
         article = soup.find('article')
         if article:
             for tag in article.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe', 'form']):
                 tag.decompose()
             content_text = article.get_text(separator=' ', strip=True)
         
-        # Strategy 2: common content classes
+        # Try common classes
         if not content_text or len(content_text) < 200:
             for class_name in ['content', 'article-body', 'post-content', 'entry-content', 
                               'article-content', 'story-body', 'article__body', 'post__content']:
@@ -138,7 +135,7 @@ def scrape_full_article(url, max_chars=15000):
                     if len(content_text) > 200:
                         break
         
-        # Strategy 3: main tag
+        # Try main tag
         if not content_text or len(content_text) < 200:
             main = soup.find('main')
             if main:
@@ -146,13 +143,12 @@ def scrape_full_article(url, max_chars=15000):
                     tag.decompose()
                 content_text = main.get_text(separator=' ', strip=True)
         
-        # Strategy 4: all paragraphs
+        # Fallback to paragraphs
         if not content_text or len(content_text) < 200:
             paragraphs = soup.find_all('p')
             content_text = ' '.join([p.get_text().strip() for p in paragraphs if len(p.get_text().strip()) > 30])
         
-        # Clean and limit
-        content_text = ' '.join(content_text.split())  # Normalize whitespace
+        content_text = ' '.join(content_text.split())
         
         return {
             'title': title,
@@ -170,9 +166,7 @@ def scrape_full_article(url, max_chars=15000):
 
 
 def directus_request(method, endpoint, data=None, timeout=15):
-    """
-    Centralized Directus API request handler with error handling
-    """
+    """Centralized Directus API handler"""
     headers = {"Authorization": f"Bearer {DIRECTUS_TOKEN}"}
     url = f"{DIRECTUS_URL}{endpoint}"
     
@@ -189,9 +183,9 @@ def directus_request(method, endpoint, data=None, timeout=15):
         if r.status_code in [200, 201]:
             return r.json()
         else:
-            print(f"⚠️ Directus {method} {endpoint}: status {r.status_code}", flush=True)
+            print(f"⚠️ Directus {method} {endpoint}: {r.status_code}", flush=True)
             return None
             
     except Exception as e:
-        print(f"⚠️ Directus {method} failed: {str(e)[:100]}", flush=True)
+        print(f"⚠️ Directus error: {str(e)[:100]}", flush=True)
         return None

@@ -64,8 +64,8 @@ def publish_article(title, html_content, source_url, meta_description, category,
     """Publish article to Directus with full metadata"""
     payload = {
         "status": "published",
-        "title": title,  # Full title, no truncation
-        "slug": create_slug(title),  # SEO-friendly short slug
+        "title": title,
+        "slug": create_slug(title),
         "content": html_content,
         "short_description": meta_description,
         "category": category,

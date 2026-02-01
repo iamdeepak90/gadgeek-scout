@@ -24,13 +24,11 @@ slack_client = WebClient(token=SLACK_BOT_TOKEN)
 def publish_article_to_directus(title, html_content, source_url, meta_description, category, image_url=None, status="published"):
     """Publish article with full metadata"""
     payload = {
-        "status": status,
-        "title": title,  # Full title
-        "slug": create_slug(title),  # Short SEO slug
+        "status": "published",
+        "title": title,
+        "slug": create_slug(title),
         "content": html_content,
-        "seo_title": title[:60],
-        "meta_description": meta_description[:160],
-        "source_link": source_url,
+        "short_description": meta_description,
         "category": category,
         "featured_image": image_url if image_url else None
     }

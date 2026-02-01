@@ -204,7 +204,13 @@ def directus_request(method, endpoint, data=None, timeout=30):
         print(f"   ⚠️ Directus {method} {endpoint}: HTTP {r.status_code}", flush=True)
         
         if r.status_code == 500:
-            print(f"      Server Error: {r.text[:200]}", flush=True)
+            # Log the full error for debugging
+            try:
+                error_detail = r.json()
+                print(f"      Server Error Details:", flush=True)
+                print(f"      {json.dumps(error_detail, indent=2)[:500]}", flush=True)
+            except:
+                print(f"      Server Error: {r.text[:500]}", flush=True)
         elif r.status_code == 401:
             print(f"      Authentication failed - check token", flush=True)
         elif r.status_code == 404:
@@ -212,6 +218,14 @@ def directus_request(method, endpoint, data=None, timeout=30):
         elif r.status_code == 429:
             print(f"      Rate limit exceeded - backing off", flush=True)
             time.sleep(5)
+        elif r.status_code == 400:
+            # Bad request - show validation errors
+            try:
+                error_detail = r.json()
+                print(f"      Validation Error:", flush=True)
+                print(f"      {json.dumps(error_detail, indent=2)[:500]}", flush=True)
+            except:
+                print(f"      Bad Request: {r.text[:500]}", flush=True)
         
         return None
             
@@ -297,16 +311,25 @@ def publish_article_to_directus(title, content, short_description, category,
         print(f"   ❌ Missing required fields for publishing", flush=True)
         return False
     
+    # Validate minimum content length
+    word_count = len(content.split())
+    if word_count < 500:
+        print(f"   ❌ Article too short ({word_count} words, minimum 500)", flush=True)
+        print(f"   ℹ️ This article will not be published to maintain quality standards", flush=True)
+        return False
+    
     payload = {
         "status": "published",
         "title": title[:200],  # Limit title length
         "slug": slug[:100],    # Limit slug length
         "content": content,
         "short_description": short_description[:300],  # Limit description
-        "category": category,
-        "featured_image": featured_image,
-        "source_link": source_url
+        """ "category": category, """
     }
+    
+    # Only add featured_image if it exists
+    if featured_image:
+        payload["featured_image"] = featured_image
     
     print(f"   📤 Publishing to Directus...", flush=True)
     print(f"      Title: {title[:60]}...", flush=True)

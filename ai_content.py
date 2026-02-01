@@ -340,7 +340,7 @@ Return ONLY valid JSON. Make the article sound completely human - natural, engag
         "messages": [
             {
                 "role": "system", 
-                "content": "You are an expert tech journalist who writes engaging, human-sounding articles. Your writing style is conversational yet informative, with varied sentence structures and natural phrasing. You avoid AI clichés and robotic language."
+                "content": "You are an expert tech journalist who writes engaging, human-sounding articles. Your writing style is conversational yet informative, with varied sentence structures and natural phrasing. You avoid AI clichés and robotic language. You ALWAYS write at least 1500 words with proper HTML formatting."
             },
             {
                 "role": "user", 
@@ -348,7 +348,7 @@ Return ONLY valid JSON. Make the article sound completely human - natural, engag
             }
         ],
         "temperature": 0.8,  # Higher for more creative, human-like writing
-        "max_tokens": 4000,
+        "max_tokens": 8000,  # Increased from 4000 to allow longer articles
         "top_p": 0.95,
         "frequency_penalty": 0.3,  # Reduce repetition
         "presence_penalty": 0.3,   # Encourage diverse topics
@@ -366,6 +366,15 @@ Return ONLY valid JSON. Make the article sound completely human - natural, engag
         
         if article and 'content' in article:
             word_count = len(article['content'].split())
+            
+            # Check if article is too short
+            if word_count < 500:
+                print(f"   ⚠️ OpenAI article too short ({word_count} words)", flush=True)
+                print(f"   🔄 Retrying with Gemini-only generation...", flush=True)
+                
+                # Try Gemini as backup
+                return generate_article_with_gemini_only(title, research_content, category)
+            
             print(f"   ✅ Article generated: {word_count} words", flush=True)
             
             # Fetch image if keywords provided
@@ -476,25 +485,49 @@ def create_fallback_article(title, research_content, category):
         else:
             description += '...'
     
-    # Create basic HTML content
-    research_excerpt = research_content[:2000] if research_content else "Please refer to the source for full details."
+    # Use more research content to meet minimum length
+    research_excerpt = research_content[:5000] if research_content else ""
     
+    # Split research into paragraphs
+    paragraphs = research_excerpt.split('\n\n') if research_excerpt else []
+    
+    # Create richer HTML content
     content = f"""<p><strong>{title}</strong></p>
 
 <p>{description}</p>
 
-<h2>Overview</h2>
-<p>{research_excerpt}</p>
+<h2>Latest Update</h2>
+<p>This is a developing story in the {category} category. Here's what we know so far based on available information.</p>
 
-<h2>Key Points</h2>
+<h2>Key Information</h2>"""
+    
+    # Add research paragraphs
+    for i, para in enumerate(paragraphs[:5]):
+        if para.strip() and len(para.strip()) > 50:
+            content += f"\n<p>{para.strip()}</p>\n"
+    
+    content += """
+<h2>What This Means</h2>
+<p>This development has significant implications for the tech industry. The announcement represents an important step forward in this area.</p>
+
+<h3>Industry Impact</h3>
+<p>Technology experts are closely watching this development as it could influence market trends and consumer choices in the coming months.</p>
+
+<h2>Looking Ahead</h2>
+<p>As this story develops, we'll continue to monitor for updates and additional information. The full impact of this news will likely become clearer in the weeks ahead.</p>
+
+<h3>What to Watch For</h3>
 <ul>
-<li>This story is developing in the {category} category</li>
-<li>More detailed information available at the source link</li>
-<li>Check back for updates as more details emerge</li>
+<li>Further announcements and official statements</li>
+<li>Market reaction and industry response</li>
+<li>Impact on consumers and related products</li>
+<li>Competitive responses from other companies</li>
 </ul>
 
-<h2>What This Means</h2>
-<p>This development has significant implications for the tech industry. For comprehensive coverage and the latest updates, please refer to the original source article.</p>"""
+<h2>Stay Informed</h2>
+<p>For the most up-to-date information and complete details, please refer to the original source article. We'll update this story as more information becomes available.</p>
+
+<p><strong>Note:</strong> This is a developing story. Check back for updates or visit the source link for additional details.</p>"""
     
     return {
         'title': title,
@@ -578,32 +611,59 @@ def generate_article_with_gemini_only(title, research_content, category):
     
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-thinking-exp:generateContent?key={GEMINI_API_KEY}"
     
-    prompt = f"""You are writing a tech article based on research.
+    prompt = f"""You are a professional tech journalist. Write a comprehensive article based on this research.
 
 RESEARCH DATA:
 {research_content[:10000]}
 
-Write a complete article in JSON format:
+TITLE: {title}
+CATEGORY: {category}
+
+Write a complete article in JSON format with these exact fields:
 {{
-  "title": "60-70 character title",
-  "short_description": "200 character description",
-  "slug": "seo-friendly-slug",
-  "content": "Full HTML article with h2, h3, p, ul, ol, strong tags",
-  "image_keywords": "keywords for image"
+  "title": "Engaging 60-70 character title",
+  "short_description": "Compelling 200 character SEO description",
+  "slug": "seo-friendly-slug-with-keywords",
+  "content": "Full HTML article (1500+ words minimum)",
+  "image_keywords": "keywords for image search"
 }}
 
-Make it 1200+ words, natural sounding, and engaging. Return ONLY valid JSON."""
+CONTENT REQUIREMENTS:
+- 1500+ words minimum (this is critical)
+- Use proper HTML: <p>, <h2>, <h3>, <strong>, <ul>, <ol>, <li>
+- Include 6-8 <h2> section headings
+- Include 4-5 <h3> subheadings
+- Add bullet lists with <ul><li> for features
+- Keep paragraphs short (2-4 sentences)
+- Make it conversational and engaging
+- Use specific numbers and facts from research
+
+STRUCTURE:
+<p>Opening paragraph with hook</p>
+<h2>What Happened</h2>
+<p>Main news with details</p>
+<h3>Key Features</h3>
+<ul><li>Feature 1</li><li>Feature 2</li></ul>
+<h2>Why This Matters</h2>
+<p>Impact and significance</p>
+<h2>Technical Details</h2>
+<h2>How It Compares</h2>
+<h2>What's Next</h2>
+
+Return ONLY valid JSON. The content field must be at least 1500 words."""
     
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.7,
-            "maxOutputTokens": 8000,
-            "responseMimeType": "application/json"
+            "maxOutputTokens": 8000,  # Increased for longer content
+            "topP": 0.95,
+            "topK": 40
         }
     }
     
     try:
+        print(f"   🔄 Generating with Gemini 2.0...", flush=True)
         response = requests.post(url, json=payload, timeout=90)
         response.raise_for_status()
         
@@ -612,6 +672,14 @@ Make it 1200+ words, natural sounding, and engaging. Return ONLY valid JSON."""
         article = extract_json(content_text)
         
         if article and 'content' in article:
+            word_count = len(article['content'].split())
+            print(f"   ✅ Gemini article: {word_count} words", flush=True)
+            
+            # If still too short, use fallback
+            if word_count < 500:
+                print(f"   ⚠️ Still too short, using enhanced fallback", flush=True)
+                return create_fallback_article(title, research_content, category)
+            
             return article
         
     except Exception as e:

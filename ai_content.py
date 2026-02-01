@@ -7,7 +7,7 @@ import requests
 import time
 import re
 
-from config_multi_ai import (
+from config import (
     GROQ_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY,
     PRIMARY_AI, SECONDARY_AI, FALLBACK_AI, extract_json
 )

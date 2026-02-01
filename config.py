@@ -1,12 +1,13 @@
 """
-Shared configuration and utility functions
-Multi-AI setup with free tier APIs
+Enhanced Multi-AI Configuration
+Uses multiple free APIs for maximum humanization
 """
 import re
 import requests
 import json
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
+from datetime import datetime, timezone
 
 # ==================== CONFIGURATION ====================
 DIRECTUS_URL = "https://admin.gadgeek.in"
@@ -29,23 +30,41 @@ RSS_FEEDS = [
     "https://venturebeat.com/feed/"
 ]
 
-# ==================== AI API KEYS ====================
-# Get your Groq key: https://console.groq.com
-GROQ_API_KEY = "YOUR_GROQ_API_KEY_HERE"
+# ==================== FREE AI API KEYS ====================
+# Groq - BEST for analysis & initial drafts (14,400/day)
+GROQ_API_KEY = "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"
 
-# Get your OpenRouter key: https://openrouter.ai  
-OPENROUTER_API_KEY = "YOUR_OPENROUTER_API_KEY_HERE"
+# OpenRouter - Multiple free models
+OPENROUTER_API_KEY = "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"
 
-# Gemini (fallback)
+# Together AI - Alternative free API (1M tokens/day free tier)
+TOGETHER_API_KEY = "YOUR_TOGETHER_API_KEY_HERE"
+
+# Hugging Face - Fallback
+HUGGINGFACE_API_KEY = "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"
+
+# Gemini - Last resort fallback
 GEMINI_API_KEY = "AIzaSyARZL9PW073U_T6jxVIPVcFnHhXedZjgO4"
 
+# Unsplash for images (Free tier: 50 requests/hour)
+UNSPLASH_ACCESS_KEY = "Zf7mQjN04Ec-6LWBdngVEL6sKLnnXbqZTsMov5_F7CI"
+
+# Pexels for images (Free, unlimited)
+PEXELS_API_KEY = "ks1X6yC5ydEypXxnu3qydCtK8Aso9KmIJcAB2R9WG292CZSx2ZZtJtVT"
+
 # ==================== HELPER FUNCTIONS ====================
+
+def get_current_utc_time():
+    """Get current time in UTC (timezone-aware)"""
+    return datetime.now(timezone.utc)
+
 
 def extract_json(text):
     """Extract JSON from AI response"""
     try:
         return json.loads(text)
     except:
+        # Try to find JSON in markdown
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
             try:
@@ -65,15 +84,36 @@ def get_domain_name(url):
 
 
 def create_slug(title):
-    """Create URL slug from title"""
+    """Create SEO-friendly slug from title"""
+    # Extract main keywords (remove filler words)
+    filler_words = ['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
+                    'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'be', 'has', 'have']
+    
     slug = title.lower().strip()
-    slug = re.sub(r'[^a-z0-9\s-]', '', slug)
-    slug = re.sub(r'[\s-]+', '-', slug)
-    return slug[:100]
+    
+    # Remove special characters
+    slug = re.sub(r'[^\w\s-]', '', slug)
+    
+    # Split into words
+    words = slug.split()
+    
+    # Remove filler words and keep important ones
+    keywords = [w for w in words if w not in filler_words]
+    
+    # Take first 5-6 keywords
+    keywords = keywords[:6]
+    
+    # Join with hyphens
+    slug = '-'.join(keywords)
+    
+    # Clean up multiple hyphens
+    slug = re.sub(r'-+', '-', slug)
+    
+    return slug[:60]  # Limit length
 
 
-def scrape_full_article(url, max_chars=15000):
-    """Scrape full article content"""
+def scrape_full_article(url, max_chars=20000):
+    """Enhanced article scraping with more content"""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -135,6 +175,40 @@ def scrape_full_article(url, max_chars=15000):
             'text': 'Content unavailable.',
             'word_count': 0
         }
+
+
+def fetch_relevant_image(keywords, preferred_service='pexels'):
+    """
+    Fetch relevant image from free stock photo APIs
+    Returns image URL or None
+    """
+    try:
+        if preferred_service == 'pexels' and PEXELS_API_KEY and PEXELS_API_KEY != "YOUR_PEXELS_KEY_HERE":
+            # Pexels API (Free, unlimited)
+            url = f"https://api.pexels.com/v1/search?query={keywords}&per_page=1&orientation=landscape"
+            headers = {"Authorization": PEXELS_API_KEY}
+            
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('photos'):
+                    return data['photos'][0]['src']['large']
+        
+        elif preferred_service == 'unsplash' and UNSPLASH_ACCESS_KEY and UNSPLASH_ACCESS_KEY != "YOUR_UNSPLASH_KEY_HERE":
+            # Unsplash API (50 req/hour free)
+            url = f"https://api.unsplash.com/search/photos?query={keywords}&per_page=1&orientation=landscape"
+            headers = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}
+            
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('results'):
+                    return data['results'][0]['urls']['regular']
+    
+    except Exception as e:
+        print(f"⚠️ Image fetch failed: {e}", flush=True)
+    
+    return None
 
 
 def directus_request(method, endpoint, data=None, timeout=15):

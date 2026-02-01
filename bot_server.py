@@ -1,7 +1,6 @@
 """
 Slack Bot Server - Handles button interactions
-Urgent posts: Instant publishing
-Approve posts: Queue for scheduled publishing
+Enhanced with rich article generation
 """
 import json
 import threading
@@ -22,17 +21,18 @@ slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
 # ==================== ARTICLE PUBLISHING ====================
 
-def publish_article_to_directus(title, html_content, source_url, status="published"):
-    """
-    Publish article to Directus CMS
-    """
+def publish_article_to_directus(title, html_content, source_url, meta_description, category, image_url=None, status="published"):
+    """Publish article with full metadata"""
     payload = {
         "status": status,
-        "title": title,
-        "slug": create_slug(title),
+        "title": title,  # Full title
+        "slug": create_slug(title),  # Short SEO slug
         "content": html_content,
         "seo_title": title[:60],
-        "source_link": source_url
+        "meta_description": meta_description[:160],
+        "source_link": source_url,
+        "category": category,
+        "featured_image": image_url if image_url else None
     }
     
     result = directus_request('POST', f'/items/{ARTICLE_COLLECTION}', payload)
@@ -40,7 +40,7 @@ def publish_article_to_directus(title, html_content, source_url, status="publish
 
 
 def update_lead_status(lead_id, status):
-    """Update news lead status in Directus"""
+    """Update news lead status"""
     result = directus_request('PATCH', f'/items/news_leads/{lead_id}', {"status": status})
     return result is not None
 
@@ -48,46 +48,42 @@ def update_lead_status(lead_id, status):
 # ==================== URGENT PROCESSING ====================
 
 def process_urgent_in_background(lead_id, title, url, channel_id, thread_ts):
-    """
-    Background worker for urgent posts
-    Runs asynchronously so Slack doesn't timeout
-    """
+    """Background worker for urgent posts"""
     try:
         print(f"\n🔥 URGENT: Processing #{lead_id}", flush=True)
         
-        # Step 1: Scrape full content
-        print(f"   Scraping...", flush=True)
-        scraped = scrape_full_article(url, max_chars=10000)
+        print(f"   📥 Scraping...", flush=True)
+        scraped = scrape_full_article(url, max_chars=20000)
         
-        # Step 2: Analyze for context
-        print(f"   Analyzing...", flush=True)
+        print(f"   🧠 Deep analysis ({scraped['word_count']} words)...", flush=True)
         analysis = analyze_news_story(scraped)
         
-        # Step 3: Write humanized article
-        print(f"   Writing article...", flush=True)
+        print(f"   ✍️  Writing 1000+ word article...", flush=True)
         article_html = write_full_article(title, scraped['text'], analysis)
         
-        if not article_html or len(article_html) < 200:
+        if not article_html or len(article_html) < 500:
             raise ValueError("Article generation failed")
         
-        # Step 4: Publish immediately
-        print(f"   Publishing...", flush=True)
+        meta_description = analysis.get('meta_description', title[:150])
+        category = analysis.get('category', 'technology')
+        
+        print(f"   📤 Publishing...", flush=True)
         success = publish_article_to_directus(
             title=title,
             html_content=article_html,
             source_url=url,
+            meta_description=meta_description,
+            category=category,
             status="published"
         )
         
         if success:
-            # Step 5: Update lead status
             update_lead_status(lead_id, "processed")
-            
-            # Step 6: Notify Slack
-            message = f"🚀 *PUBLISHED:* Article is live on the site!\n\n✅ Title: {title}\n📊 Length: {len(article_html)} chars"
-            print(f"   ✅ Published successfully", flush=True)
+            word_count = len(article_html.split())
+            message = f"🚀 *PUBLISHED LIVE!*\n\n✅ Title: {title}\n📊 Length: {word_count} words\n📁 Category: {category}"
+            print(f"   ✅ Published ({word_count} words)", flush=True)
         else:
-            message = f"❌ *ERROR:* Failed to publish article.\n\nPlease check Directus logs."
+            message = f"❌ *ERROR:* Failed to publish.\n\nCheck Directus logs for details."
             print(f"   ❌ Publishing failed", flush=True)
         
         slack_client.chat_postMessage(
@@ -109,23 +105,14 @@ def process_urgent_in_background(lead_id, title, url, channel_id, thread_ts):
 # ==================== SLACK INTERACTIONS ====================
 
 def extract_metadata_from_slack_message(blocks):
-    """
-    Extract URL and title from Slack message blocks
-    Format: *<URL|Title>*
-    """
+    """Extract URL and title from Slack message"""
     try:
         text_section = blocks[0]['text']['text']
-        
-        # Extract URL
         url_match = re.search(r'<([^|>]+)\|', text_section)
         url = url_match.group(1) if url_match else ""
-        
-        # Extract title
         title_match = re.search(r'\|([^>]+)>', text_section)
         title = title_match.group(1) if title_match else "News Update"
-        
         return url, title
-        
     except Exception as e:
         print(f"⚠️ Metadata extraction failed: {e}", flush=True)
         return "", "News Update"
@@ -133,29 +120,21 @@ def extract_metadata_from_slack_message(blocks):
 
 @app.route('/slack/interactions', methods=['POST'])
 def slack_interactions():
-    """
-    Handle Slack button clicks
-    Routes: Approve → Queue, Urgent → Instant Publish, Reject → Archive
-    """
-    # Verify Slack signature
+    """Handle Slack button clicks"""
     if not verifier.is_valid_request(request.get_data(), request.headers):
         return jsonify({"error": "invalid_request"}), 403
     
-    # Parse payload
     data = request.form.to_dict()
     payload = json.loads(data['payload'])
     
     user_name = payload['user']['username']
-    action_value = payload['actions'][0]['value']  # "approve_123", "urgent_123", etc.
+    action_value = payload['actions'][0]['value']
     action_type, lead_id = action_value.split('_')
     
-    # Extract article metadata
     original_blocks = payload['message']['blocks']
     url, title = extract_metadata_from_slack_message(original_blocks)
     
-    # Handle different actions
     if action_type == "urgent":
-        # Launch background thread for instant publishing
         thread = threading.Thread(
             target=process_urgent_in_background,
             args=(lead_id, title, url, payload['channel']['id'], payload['message']['ts'])
@@ -163,22 +142,19 @@ def slack_interactions():
         thread.daemon = True
         thread.start()
         
-        feedback = f"🔥 *URGENT* by @{user_name}\n\nArticle is being generated and published now. Check thread for updates."
+        feedback = f"🔥 *URGENT* by @{user_name}\n\n⚡ Generating 1000+ word article with rich formatting...\nCheck thread for updates."
         
     elif action_type == "approve":
-        # Add to queue for scheduled publishing
         update_lead_status(lead_id, "queued")
-        feedback = f"✅ *QUEUED* by @{user_name}\n\nArticle will publish in turn (every 20 minutes)."
+        feedback = f"✅ *QUEUED* by @{user_name}\n\nArticle will publish in turn (every 20 min)."
         
     elif action_type == "reject":
-        # Mark as rejected
         update_lead_status(lead_id, "rejected")
         feedback = f"❌ *REJECTED* by @{user_name}"
     
     else:
-        feedback = f"⚠️ Unknown action: {action_type}"
+        feedback = f"⚠️ Unknown action"
     
-    # Update Slack message
     new_blocks = [
         original_blocks[0],
         {
@@ -196,7 +172,7 @@ def slack_interactions():
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint for Coolify"""
+    """Health check for Coolify"""
     return jsonify({"status": "healthy", "service": "bot_server"}), 200
 
 
@@ -204,12 +180,12 @@ def health_check():
 
 if __name__ == "__main__":
     print("="*60)
-    print("🤖 SLACK BOT SERVER v3.0")
+    print("🤖 SLACK BOT SERVER v4.0 - ENHANCED")
     print("="*60)
-    print("✓ Handles Slack button interactions")
-    print("✓ Urgent: Instant AI article generation")
-    print("✓ Approve: Queue for scheduled publishing")
-    print("✓ Humanized content (no AI fingerprints)")
+    print("✓ 1000+ word articles")
+    print("✓ Rich formatting & zero AI detection")
+    print("✓ Full titles & SEO slugs")
+    print("✓ Category & metadata support")
     print("="*60)
     print("\n🚀 Server starting on port 3000...\n")
     

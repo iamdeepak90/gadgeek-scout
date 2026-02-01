@@ -1,21 +1,19 @@
 """
-Publisher Service - Queue Manager
-Publishes queued articles every 20 minutes
+Publisher Service - Uses Deep Research + OpenAI
 """
 import time
 from datetime import datetime, timezone
 
-from config import (
-    DIRECTUS_URL, ARTICLE_COLLECTION,
-    create_slug, scrape_full_article, directus_request, get_current_utc_time
-)
-from ai_content import analyze_news_story, write_full_article
+from config import get_current_utc_time, directus_request, publish_article_to_directus, update_lead_status
+from ai_content import create_complete_article
 
 
 # ==================== QUEUE MANAGEMENT ====================
 
 def get_last_published_time():
-    """Get timestamp of most recently published article"""
+    """Get timestamp of last published article"""
+    from config import ARTICLE_COLLECTION
+    
     result = directus_request(
         'GET',
         f'/items/{ARTICLE_COLLECTION}?sort=-date_created&limit=1'
@@ -32,7 +30,7 @@ def get_last_published_time():
 
 
 def get_oldest_queued_lead():
-    """Get the oldest item in the queue (FIFO)"""
+    """Get oldest queued lead (FIFO)"""
     result = directus_request(
         'GET',
         '/items/news_leads?filter[status][_eq]=queued&sort=date_created&limit=1'
@@ -45,47 +43,22 @@ def get_oldest_queued_lead():
 
 
 def calculate_minutes_since_last_publish():
-    """Calculate how long since last publish (timezone-aware)"""
+    """Calculate minutes since last publish"""
     last_pub = get_last_published_time()
     
     if not last_pub:
-        return 999  # No previous publish
+        return 999
     
     now = get_current_utc_time()
-    time_diff = now - last_pub
-    minutes = time_diff.total_seconds() / 60
+    minutes = (now - last_pub).total_seconds() / 60
     
     return minutes
-
-
-# ==================== PUBLISHING ====================
-
-def publish_article(title, html_content, source_url, meta_description, category, image_url=None):
-    """Publish article to Directus with full metadata"""
-    payload = {
-        "status": "published",
-        "title": title,
-        "slug": create_slug(title),
-        "content": html_content,
-        "short_description": meta_description,
-        "category": category,
-        "featured_image": image_url if image_url else None
-    }
-    
-    result = directus_request('POST', f'/items/{ARTICLE_COLLECTION}', payload)
-    return result is not None
-
-
-def mark_lead_processed(lead_id):
-    """Update lead status to processed"""
-    result = directus_request('PATCH', f'/items/news_leads/{lead_id}', {"status": "processed"})
-    return result is not None
 
 
 # ==================== QUEUE PROCESSOR ====================
 
 def process_queue():
-    """Main queue processing logic"""
+    """Process queued leads with deep research"""
     try:
         minutes_since = calculate_minutes_since_last_publish()
         print(f"🕐 Last publish: {int(minutes_since)} min ago", flush=True)
@@ -104,57 +77,39 @@ def process_queue():
         print(f"🚀 Processing: {lead['title']}", flush=True)
         print(f"{'='*60}", flush=True)
         
-        # Scrape full content
-        print(f"   📥 Scraping source...", flush=True)
-        scraped = scrape_full_article(lead['source_url'], max_chars=20000)
-        
-        if scraped['word_count'] < 100:
-            print(f"   ⚠️ Low quality ({scraped['word_count']} words), skipping", flush=True)
-            mark_lead_processed(lead['id'])
-            return
-        
-        # Deep analysis
-        print(f"   🧠 Deep analysis ({scraped['word_count']} words)...", flush=True)
-        analysis = analyze_news_story(scraped)
-        
-        # Write comprehensive article
-        print(f"   ✍️  Writing 1000+ word article...", flush=True)
-        article_html = write_full_article(
+        # Create article using deep research + OpenAI
+        article_data = create_complete_article(
             title=lead['title'],
-            source_text=scraped['text'],
-            analysis=analysis
+            category=lead.get('category', 'technology')
         )
         
-        if not article_html or len(article_html) < 500:
+        if not article_data or not article_data.get('content'):
             print(f"   ❌ Article generation failed", flush=True)
-            mark_lead_processed(lead['id'])
+            update_lead_status(lead['id'], "processed")
             return
         
-        # Get metadata from analysis
-        meta_description = analysis.get('meta_description', lead.get('ai_summary', lead['title'][:150]))
-        category = analysis.get('category', 'technology')
-        
-        # Publish with full metadata
-        print(f"   📤 Publishing ({len(article_html)} chars)...", flush=True)
-        success = publish_article(
-            title=lead['title'],  # Full title
-            html_content=article_html,
+        # Publish using modular function
+        success = publish_article_to_directus(
+            title=article_data['title'],
+            content=article_data['content'],
+            short_description=article_data['short_description'],
+            category=lead.get('category', 'technology'),
             source_url=lead['source_url'],
-            meta_description=meta_description,
-            category=category
+            featured_image=article_data.get('featured_image'),
+            slug=article_data.get('slug')
         )
         
         if success:
-            mark_lead_processed(lead['id'])
-            word_count = len(article_html.split())
-            print(f"   ✅ Published! ({word_count} words)", flush=True)
+            update_lead_status(lead['id'], "processed")
+            word_count = len(article_data['content'].split())
+            print(f"   ✅ Published ({word_count} words)!", flush=True)
         else:
             print(f"   ❌ Publishing failed", flush=True)
         
         print(f"{'='*60}\n", flush=True)
         
     except Exception as e:
-        print(f"❌ Queue processing error: {e}", flush=True)
+        print(f"❌ Queue error: {e}", flush=True)
         import traceback
         traceback.print_exc()
 
@@ -163,7 +118,7 @@ def process_queue():
 
 def run_publisher():
     """Main service loop"""
-    print(f"🟢 Publisher service active", flush=True)
+    print(f"🟢 Publisher active", flush=True)
     print(f"📋 Publish interval: 20 minutes", flush=True)
     print(f"🔄 Check interval: 5 minutes\n", flush=True)
     
@@ -174,15 +129,15 @@ def run_publisher():
             process_queue()
             
         except KeyboardInterrupt:
-            print("\n👋 Shutting down publisher...")
+            print("\n👋 Shutting down...")
             break
             
         except Exception as e:
-            print(f"❌ Critical error: {e}", flush=True)
+            print(f"❌ Critical: {e}", flush=True)
             import traceback
             traceback.print_exc()
         
-        print(f"💤 Sleep 5 min...\n", flush=True)
+        print(f"💤 Sleep 5 min\n", flush=True)
         time.sleep(300)
 
 
@@ -190,14 +145,13 @@ def run_publisher():
 
 if __name__ == "__main__":
     print("="*60)
-    print("📰 PUBLISHER SERVICE v4.0 - ENHANCED")
+    print("📰 PUBLISHER v5.0 - DEEP RESEARCH")
     print("="*60)
-    print("✓ 1000+ word articles")
-    print("✓ Rich formatting (lists, bullets, quotes)")
+    print("✓ Gemini Deep Research")
+    print("✓ OpenAI GPT-4 generation")
+    print("✓ 1500-2000 word articles")
+    print("✓ Rich formatting & tables")
     print("✓ Zero AI detection")
-    print("✓ Full titles (no truncation)")
-    print("✓ SEO-optimized slugs")
-    print("✓ Category & metadata")
     print("="*60)
     print()
     

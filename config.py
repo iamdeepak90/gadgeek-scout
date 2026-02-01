@@ -1,6 +1,5 @@
 """
-Enhanced Multi-AI Configuration
-Uses multiple free APIs for maximum humanization
+Core Configuration - Centralized settings
 """
 import re
 import requests
@@ -9,7 +8,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 
-# ==================== CONFIGURATION ====================
+# ==================== DIRECTUS & SLACK ====================
 DIRECTUS_URL = "https://admin.gadgeek.in"
 DIRECTUS_TOKEN = "Cmq-X3we8iSjBHbxziDrwas55FP3d6gz"
 SLACK_BOT_TOKEN = "xoxb-10413021355318-10399647335735-VVr0Giv2PAn0pstMuP5cuDtO"
@@ -30,27 +29,111 @@ RSS_FEEDS = [
     "https://venturebeat.com/feed/"
 ]
 
-# ==================== FREE AI API KEYS ====================
-# Groq - BEST for analysis & initial drafts (14,400/day)
-GROQ_API_KEY = "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"
-
-# OpenRouter - Multiple free models
-OPENROUTER_API_KEY = "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"
-
-# Together AI - Alternative free API (1M tokens/day free tier)
-TOGETHER_API_KEY = "YOUR_TOGETHER_API_KEY_HERE"
-
-# Hugging Face - Fallback
-HUGGINGFACE_API_KEY = "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"
-
-# Gemini - Last resort fallback
+# ==================== AI API KEYS ====================
+# Gemini for Deep Research
 GEMINI_API_KEY = "AIzaSyARZL9PW073U_T6jxVIPVcFnHhXedZjgO4"
 
-# Unsplash for images (Free tier: 50 requests/hour)
-UNSPLASH_ACCESS_KEY = "Zf7mQjN04Ec-6LWBdngVEL6sKLnnXbqZTsMov5_F7CI"
+# OpenAI for Content Generation (ChatGPT)
+OPENAI_API_KEY = "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"
 
-# Pexels for images (Free, unlimited)
-PEXELS_API_KEY = "ks1X6yC5ydEypXxnu3qydCtK8Aso9KmIJcAB2R9WG292CZSx2ZZtJtVT"
+# Pexels for Images (Free)
+PEXELS_API_KEY = "ks1X6yC5ydEypXxnu3qydCtK8Aso9KmIJcAB2R9WG292CZSx2ZZtJtVT"  # Get from: https://www.pexels.com/api/
+
+# ==================== UTILITY FUNCTIONS ====================
+
+def get_current_utc_time():
+    """Get current UTC time (timezone-aware)"""
+    return datetime.now(timezone.utc)
+
+
+def extract_json(text):
+    """Extract JSON from AI response"""
+    try:
+        return json.loads(text)
+    except:
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except:
+                pass
+    return None
+
+
+def get_domain_name(url):
+    """Extract clean domain name"""
+    try:
+        domain = urlparse(url).netloc
+        return domain.replace('www.', '').split('.')[0].capitalize()
+    except:
+        return "Tech Source"
+
+
+def create_slug_from_text(text):
+    """Create SEO slug from text (no AI needed)"""
+    # Common filler words to remove
+    filler_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 
+                    'for', 'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 
+                    'be', 'has', 'have', 'this', 'that'}
+    
+    slug = text.lower().strip()
+    slug = re.sub(r'[^\w\s-]', '', slug)
+    words = slug.split()
+    keywords = [w for w in words if w not in filler_words][:6]
+    slug = '-'.join(keywords)
+    slug = re.sub(r'-+', '-', slug)
+    
+    return slug[:60]
+
+
+def directus_request(method, endpoint, data=None, timeout=20):
+    """Centralized Directus API handler"""
+    headers = {"Authorization": f"Bearer {DIRECTUS_TOKEN}"}
+    url = f"{DIRECTUS_URL}{endpoint}"
+    
+    try:
+        if method.upper() == 'GET':
+            r = requests.get(url, headers=headers, timeout=timeout)
+        elif method.upper() == 'POST':
+            r = requests.post(url, json=data, headers=headers, timeout=timeout)
+        elif method.upper() == 'PATCH':
+            r = requests.patch(url, json=data, headers=headers, timeout=timeout)
+        else:
+            return None
+        
+        if r.status_code in [200, 201]:
+            return r.json()
+        else:
+            print(f"⚠️ Directus {method} {endpoint}: {r.status_code}", flush=True)
+            if r.status_code == 500:
+                print(f"   Response: {r.text[:200]}", flush=True)
+            return None
+            
+    except Exception as e:
+        print(f"⚠️ Directus error: {str(e)[:150]}", flush=True)
+        return None
+
+
+def fetch_image_from_pexels(keywords):
+    """Fetch relevant image from Pexels"""
+    if not PEXELS_API_KEY or PEXELS_API_KEY == "YOUR_PEXELS_KEY_HERE":
+        return None
+    
+    try:
+        url = f"https://api.pexels.com/v1/search?query={keywords}&per_page=1&orientation=landscape"
+        headers = {"Authorization": PEXELS_API_KEY}
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('photos'):
+                return data['photos'][0]['src']['large']
+    except Exception as e:
+        print(f"⚠️ Image fetch failed: {e}", flush=True)
+    
+    return None
+
+
 
 # ==================== HELPER FUNCTIONS ====================
 

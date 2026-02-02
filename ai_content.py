@@ -1,688 +1,397 @@
 """
-AI Content Generation Module v7.0
-Enhanced with humanization, better prompting, and multi-model support
-Uses Gemini 2.0 for research + OpenAI for generation + Humanization layer
+ai_content.py — AI steps (Fact Pack → Article Draft → Humanization/Polish → SEO pack)
+
+IMPORTANT RULES (production + safety)
+- Do NOT generate JSON-LD (per your request).
+- Do NOT invent facts. All writing must be grounded in the fact pack (which is grounded in sources).
+- Keep the strict layout you requested.
+
+Models:
+- Primary: Gemini 2.5 Flash-Lite (fact pack + polish + SEO)
+- Primary: Gemini 2.5 Flash (long-form writing)
+- Optional fallback: OpenAI (if configured)
+
 """
-import requests
+
+from __future__ import annotations
+
 import json
-import time
 import re
-from config import GEMINI_API_KEY, OPENAI_API_KEY, extract_json, fetch_image_from_pexels, retry_on_api_error
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+
+import config
+from common import log, word_count
 
 
-# ==================== GEMINI 2.0 DEEP RESEARCH ====================
+# ---------------------------
+# Gemini (google-generativeai)
+# ---------------------------
 
-@retry_on_api_error
-def deep_research_with_gemini(title):
-    """
-    Use Gemini 2.0 Flash Thinking Exp for comprehensive research
-    
-    Args:
-        title: Article title to research
-    
-    Returns:
-        str: Deep research results with structured information
-    """
-    if not GEMINI_API_KEY:
-        print(f"   ⚠️ No Gemini API key", flush=True)
-        return f"Research topic: {title}"
-    
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-thinking-exp:generateContent?key={GEMINI_API_KEY}"
-    
-    # Enhanced research prompt for tech news
-    prompt = f"""You are a professional tech journalist conducting deep research.
-
-TOPIC TO RESEARCH: {title}
-
-Provide comprehensive, fact-based research covering:
-
-1. MAIN EVENT & WHAT HAPPENED
-   - Core details and facts
-   - When, where, and who is involved
-   - Key announcements or changes
-
-2. BACKGROUND & CONTEXT
-   - Why this matters now
-   - Previous related developments
-   - Industry trends leading to this
-
-3. TECHNICAL DETAILS
-   - Specifications, features, or capabilities
-   - Technical implications
-   - How it works (if applicable)
-
-4. MARKET IMPACT & ANALYSIS
-   - Who benefits and who loses
-   - Market positioning
-   - Competitive landscape
-   - Pricing and availability
-
-5. EXPERT PERSPECTIVES & OPINIONS
-   - Industry analyst views
-   - User reactions
-   - Critical assessments
-
-6. COMPARISONS & ALTERNATIVES
-   - How it compares to competitors
-   - Key differentiators
-   - Similar products or services
-
-7. FUTURE OUTLOOK
-   - What happens next
-   - Expected developments
-   - Long-term implications
-
-8. KEY DATA POINTS
-   - Specific numbers, dates, and statistics
-   - Release dates or timelines
-   - Important metrics
-
-Be specific, factual, and comprehensive. Include concrete details like model numbers, prices, dates, and quantitative data where available. Avoid speculation unless clearly labeled as such."""
-
-    payload = {
-        "contents": [{
-            "parts": [{"text": prompt}]
-        }],
-        "generationConfig": {
-            "temperature": 0.4,  # Lower for more factual content
-            "maxOutputTokens": 8000,
-            "topP": 0.95,
-            "topK": 40
-        }
-    }
-    
+def _gemini_client():
     try:
-        print(f"   🔬 Starting deep research with Gemini 2.0...", flush=True)
-        response = requests.post(url, json=payload, timeout=90)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        # Extract text from response
-        if 'candidates' in data and len(data['candidates']) > 0:
-            candidate = data['candidates'][0]
-            if 'content' in candidate and 'parts' in candidate['content']:
-                research_text = candidate['content']['parts'][0]['text']
-                
-                word_count = len(research_text.split())
-                print(f"   ✅ Research complete: {word_count} words", flush=True)
-                
-                return research_text
-        
-        raise ValueError("Unexpected response format from Gemini")
-        
-    except requests.exceptions.Timeout:
-        print(f"   ⏱️ Gemini request timeout", flush=True)
-        return f"Research topic: {title}\n\nDeep research unavailable due to timeout."
-    except requests.exceptions.HTTPError as e:
-        status_code = e.response.status_code
-        print(f"   ⚠️ Gemini HTTP {status_code}", flush=True)
-        
-        if status_code == 429:
-            print(f"      Rate limit hit - backing off", flush=True)
-            time.sleep(10)
-        
-        return f"Research topic: {title}\n\nPlease refer to source for details."
+        import google.generativeai as genai
+        genai.configure(api_key=config.GEMINI_API_KEY)
+        return genai
     except Exception as e:
-        print(f"   ⚠️ Gemini research failed: {str(e)[:150]}", flush=True)
-        return f"Research topic: {title}\n\nResearch unavailable."
+        raise RuntimeError("google-generativeai not installed or GEMINI_API_KEY missing") from e
+
+def gemini_generate(prompt: str, *, model: str, temperature: float, max_output_tokens: int = 4096) -> str:
+    genai = _gemini_client()
+    m = genai.GenerativeModel(model)
+    # Keep it simple & stable
+    resp = m.generate_content(
+        prompt,
+        generation_config={
+            "temperature": float(temperature),
+            "max_output_tokens": int(max_output_tokens),
+        },
+    )
+    text = getattr(resp, "text", "") or ""
+    return text.strip()
 
 
-# ==================== OPENAI CONTENT GENERATION ====================
+# ---------------------------
+# OpenAI fallback (direct HTTP; optional)
+# ---------------------------
 
-@retry_on_api_error
-def generate_article_with_openai(title, research_content, category):
-    """
-    Generate comprehensive, humanized article using OpenAI GPT-4
-    
-    Args:
-        title: Article title
-        research_content: Deep research from Gemini
-        category: Article category
-    
-    Returns:
-        dict: Complete article data with humanized content
-    """
-    if not OPENAI_API_KEY or OPENAI_API_KEY == "YOUR_OPENAI_API_KEY_HERE":
-        print(f"   ⚠️ No OpenAI API key, using fallback", flush=True)
-        return create_fallback_article(title, research_content, category)
-    
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    # ENHANCED PROMPT with HUMANIZATION techniques
-    prompt = f"""You are an experienced tech journalist writing for a major publication like The Verge or TechCrunch.
-
-RESEARCH BRIEF:
-{research_content[:15000]}
-
-YOUR TASK: Write a comprehensive, engaging article that sounds 100% human-written.
-
-OUTPUT FORMAT (JSON):
-{{
-  "title": "engaging 60-70 char title",
-  "short_description": "compelling 200 char SEO description",
-  "slug": "seo-slug-5-6-keywords",
-  "content": "full HTML article",
-  "image_keywords": "3-4 keywords for image search"
-}}
-
-=== TITLE GUIDELINES (60-70 chars) ===
-✓ Natural and conversational
-✓ Include key details (company, product, feature)
-✓ Use active voice
-✓ Make it slightly intriguing
-✗ NO clickbait
-✗ NO "You won't believe" style
-
-GOOD: "Google's Gemini 2.0 Beats GPT-4 in Latest Benchmarks"
-BAD: "Google Just Released Something That Will CHANGE EVERYTHING"
-
-=== SHORT DESCRIPTION (200 chars, 2 sentences) ===
-First sentence: What happened (main news)
-Second sentence: Why it matters or key detail
-
-MUST include:
-- Key company/product name
-- Main action or announcement
-- One compelling stat or detail
-
-=== CONTENT STRUCTURE (1500-2000 words) ===
-
-<p><strong>Opening hook:</strong> Start with the most compelling fact. Make it punchy. 2-3 sentences max.</p>
-
-<h2>What Just Happened</h2>
-<p>Explain the news clearly. What did [Company] announce? When? What's new? Keep paragraphs short (2-3 sentences).</p>
-
-<p>Add context. Why now? What problem does this solve?</p>
-
-<h3>The Key Details</h3>
-<ul>
-<li>Specific feature or spec with numbers</li>
-<li>Another concrete detail with data</li>
-<li>Third important point with context</li>
-</ul>
-
-<h2>Why This Actually Matters</h2>
-<p>Real-world impact. How does this change things for users?</p>
-
-<h3>For Consumers</h3>
-<p>Practical implications. What can people actually do with this?</p>
-
-<h3>For the Industry</h3>
-<p>Bigger picture. How does this shift the market?</p>
-
-<h2>Breaking Down the Tech</h2>
-
-<h3>How It Works</h3>
-<p>Explain the technology without jargon. If you must use technical terms, explain them.</p>
-
-<h3>The Numbers</h3>
-<table style="width:100%;border-collapse:collapse;margin:20px 0;">
-<tr style="background:#f5f5f5;"><th style="padding:10px;text-align:left;border:1px solid #ddd;">Metric</th><th style="padding:10px;text-align:left;border:1px solid #ddd;">Performance</th></tr>
-<tr><td style="padding:10px;border:1px solid #ddd;">Key spec 1</td><td style="padding:10px;border:1px solid #ddd;">Actual data</td></tr>
-<tr><td style="padding:10px;border:1px solid #ddd;">Key spec 2</td><td style="padding:10px;border:1px solid #ddd;">Actual data</td></tr>
-</table>
-
-<h2>How It Stacks Up</h2>
-
-<h3>Against the Competition</h3>
-<p>Real comparison with specific competitors.</p>
-
-<ol>
-<li><strong>Competitor 1:</strong> How it compares with specifics</li>
-<li><strong>Competitor 2:</strong> Advantages and disadvantages</li>
-<li><strong>Market position:</strong> Where this fits in</li>
-</ol>
-
-<blockquote style="border-left:4px solid #007bff;padding-left:20px;margin:20px 0;font-style:italic;">
-Key insight or important takeaway that deserves emphasis
-</blockquote>
-
-<h2>What Happens Next</h2>
-
-<h3>Release Timeline</h3>
-<p>When people can actually get this. Dates, availability, regions.</p>
-
-<h3>Pricing</h3>
-<p>Cost details. How it compares price-wise. Any deals or tiers.</p>
-
-<h3>Looking Ahead</h3>
-<p>Future plans. What the company says is coming. Industry expectations.</p>
-
-<h2>The Bottom Line</h2>
-
-<p>Synthesize everything. What's the verdict? Who should care? What's the smart take?</p>
-
-<h3>Key Takeaways</h3>
-<ul>
-<li>First major point with specific impact</li>
-<li>Second important conclusion with context</li>
-<li>Third forward-looking takeaway</li>
-</ul>
-
-<p>Final paragraph. Bring it home with a strong conclusion or thought-provoking angle.</p>
-
-=== HUMANIZATION RULES (CRITICAL) ===
-
-1. CONVERSATIONAL TONE
-   ✓ Use contractions: "it's", "that's", "won't", "they're", "we've"
-   ✓ Ask rhetorical questions: "What does this mean?", "Why now?", "Who benefits?"
-   ✓ Use transitions: "Here's the thing", "But wait", "What's more interesting"
-   ✓ Personal touches: "Let's dig in", "Here's what matters", "Think about it"
-   
-2. VARIED SENTENCE STRUCTURE
-   ✓ Mix short punchy sentences with longer detailed ones
-   ✓ Start sentences differently - avoid patterns
-   ✓ Use sentence fragments occasionally for emphasis
-   ✗ Never use the same sentence pattern 3+ times in a row
-
-3. NATURAL PHRASING
-   ✓ "Apple says" not "Apple announced that"
-   ✓ "The new chip is fast" not "The new chip exhibits enhanced performance"
-   ✓ "This changes everything" not "This represents a paradigm shift"
-   
-4. FORBIDDEN AI PHRASES (NEVER USE):
-   ✗ "It's worth noting"
-   ✗ "Interestingly"
-   ✗ "In conclusion"
-   ✗ "Furthermore" / "Moreover" / "Additionally"
-   ✗ "It's no secret that"
-   ✗ "In today's digital landscape"
-   ✗ "At the end of the day"
-   ✗ "The bottom line is" (except in actual conclusion)
-   ✗ "Dive deep into"
-   ✗ "Shed light on"
-   
-5. HUMAN TOUCHES
-   ✓ Use specific numbers and examples
-   ✓ Include real-world comparisons
-   ✓ Show, don't tell ("The phone felt premium" vs "The build quality is high")
-   ✓ Use active voice exclusively
-   ✓ Add casual asides in parentheses when appropriate
-   
-6. PARAGRAPH FLOW
-   ✓ Keep paragraphs short (2-4 sentences usually)
-   ✓ Each paragraph should flow naturally to the next
-   ✓ Use transition sentences
-   ✗ Avoid formulaic structures
-
-7. WORD CHOICE
-   ✓ Use simple, concrete words
-   ✓ Prefer "use" over "utilize"
-   ✓ Prefer "help" over "facilitate"
-   ✓ Prefer "show" over "demonstrate"
-   ✓ Mix formal and informal appropriately
-
-8. FORMATTING
-   <strong> for key terms (8-12 times)
-   <em> for subtle emphasis (3-5 times)
-   <ul> for features/lists (3-4 lists)
-   <ol> for ranked/sequential items (2-3 lists)
-   <table> for specs/data (1-2 tables)
-   <blockquote> for key quotes/insights (2-3)
-
-=== SEO SLUG ===
-- Extract 5-6 main keywords from title
-- Remove filler words (the, a, an, is, for, etc.)
-- Lowercase with hyphens
-- Under 60 characters
-
-EXAMPLE: "Google Gemini 2.0 Beats GPT-4" → "google-gemini-20-beats-gpt4"
-
-Return ONLY valid JSON. Make the article sound completely human - natural, engaging, and authentic. No robotic phrasing whatsoever."""
-
-    payload = {
-        "model": "gpt-4-turbo-preview",
-        "messages": [
-            {
-                "role": "system", 
-                "content": "You are an expert tech journalist who writes engaging, human-sounding articles. Your writing style is conversational yet informative, with varied sentence structures and natural phrasing. You avoid AI clichés and robotic language. You ALWAYS write at least 1500 words with proper HTML formatting."
-            },
-            {
-                "role": "user", 
-                "content": prompt
-            }
+def openai_generate(prompt: str, *, model: str, temperature: float, max_output_tokens: int = 4096) -> str:
+    if not config.OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    url = "https://api.openai.com/v1/responses"
+    headers = {"Authorization": f"Bearer {config.OPENAI_API_KEY}", "Content-Type": "application/json"}
+    body = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": "You are a helpful, factual tech editor."},
+            {"role": "user", "content": prompt},
         ],
-        "temperature": 0.8,  # Higher for more creative, human-like writing
-        "max_tokens": 8000,  # Increased from 4000 to allow longer articles
-        "top_p": 0.95,
-        "frequency_penalty": 0.3,  # Reduce repetition
-        "presence_penalty": 0.3,   # Encourage diverse topics
-        "response_format": {"type": "json_object"}
+        "temperature": float(temperature),
+        "max_output_tokens": int(max_output_tokens),
     }
-    
+    r = requests.post(url, headers=headers, json=body, timeout=45)
+    if r.status_code >= 300:
+        raise RuntimeError(f"OpenAI failed: {r.status_code} {r.text[:300]}")
+    data = r.json()
+    # Response API format: take first output_text
     try:
-        print(f"   ✍️ Generating article with OpenAI GPT-4...", flush=True)
-        response = requests.post(url, headers=headers, json=payload, timeout=120)
-        response.raise_for_status()
-        
-        data = response.json()
-        content = data['choices'][0]['message']['content']
-        article = extract_json(content)
-        
-        if article and 'content' in article:
-            word_count = len(article['content'].split())
-            
-            # Check if article is too short
-            if word_count < 500:
-                print(f"   ⚠️ OpenAI article too short ({word_count} words)", flush=True)
-                print(f"   🔄 Retrying with Gemini-only generation...", flush=True)
-                
-                # Try Gemini as backup
-                return generate_article_with_gemini_only(title, research_content, category)
-            
-            print(f"   ✅ Article generated: {word_count} words", flush=True)
-            
-            # Fetch image if keywords provided
-            if 'image_keywords' in article and article['image_keywords']:
-                article['featured_image'] = fetch_image_from_pexels(article['image_keywords'])
-            else:
-                # Use title for image search as fallback
-                article['featured_image'] = fetch_image_from_pexels(title[:50])
-            
-            # Post-process: Additional humanization pass
-            article['content'] = apply_humanization_polish(article['content'])
-            
-            return article
-        else:
-            raise ValueError("Invalid article structure from OpenAI")
-            
-    except requests.exceptions.Timeout:
-        print(f"   ⏱️ OpenAI request timeout", flush=True)
-        return create_fallback_article(title, research_content, category)
-    except requests.exceptions.HTTPError as e:
-        status_code = e.response.status_code
-        print(f"   ⚠️ OpenAI HTTP {status_code}", flush=True)
-        
-        if status_code == 429:
-            print(f"      Rate limit exceeded", flush=True)
-        elif status_code == 401:
-            print(f"      Invalid API key", flush=True)
-        
-        return create_fallback_article(title, research_content, category)
+        out = data["output"][0]["content"][0]["text"]
+    except Exception:
+        out = ""
+    return (out or "").strip()
+
+
+def llm_generate(prompt: str, *, primary_model: str, primary_temp: float, fallback_model: str = "", fallback_temp: float = 0.7,
+                 max_output_tokens: int = 4096) -> str:
+    # Gemini primary
+    try:
+        return gemini_generate(prompt, model=primary_model, temperature=primary_temp, max_output_tokens=max_output_tokens)
     except Exception as e:
-        print(f"   ⚠️ OpenAI generation failed: {str(e)[:150]}", flush=True)
-        return create_fallback_article(title, research_content, category)
+        log.warning(f"Gemini failed ({primary_model}): {e}")
+        if config.OPENAI_API_KEY and fallback_model:
+            return openai_generate(prompt, model=fallback_model, temperature=fallback_temp, max_output_tokens=max_output_tokens)
+        raise
 
 
-# ==================== HUMANIZATION POLISH ====================
+# ---------------------------
+# Prompts
+# ---------------------------
 
-def apply_humanization_polish(content):
-    """
-    Apply final humanization touches to content
-    Removes common AI patterns and adds natural variation
-    
-    Args:
-        content: HTML content string
-    
-    Returns:
-        str: Polished content
-    """
-    
-    # Remove common AI tell-tale phrases (case-insensitive)
-    ai_phrases = [
-        r"it'?s? worth noting that",
-        r"interestingly,?",
-        r"in conclusion,?",
-        r"furthermore,?",
-        r"moreover,?",
-        r"additionally,?",
-        r"it'?s? no secret that",
-        r"in today'?s? digital landscape",
-        r"at the end of the day,?",
-        r"dive deep(?:er)? into",
-        r"sheds? light on",
-        r"it'?s? important to (?:note|remember|understand) that",
-        r"one of the key (?:aspects|features|benefits) is"
-    ]
-    
-    for phrase in ai_phrases:
-        # Replace with nothing or minimal transition
-        content = re.sub(phrase, '', content, flags=re.IGNORECASE)
-    
-    # Clean up any double spaces or punctuation issues
-    content = re.sub(r'\s+', ' ', content)  # Multiple spaces → single space
-    content = re.sub(r'\s+([.,;:!?])', r'\1', content)  # Space before punctuation
-    content = re.sub(r'([.,;:!?])([A-Z])', r'\1 \2', content)  # Add space after punctuation
-    
-    # Clean up extra paragraph breaks
-    content = re.sub(r'</p>\s*<p>', '</p>\n<p>', content)
-    
-    return content.strip()
+def prompt_fact_pack(title: str, category_slug: str, sources: List[Dict[str,Any]]) -> str:
+    # Provide sources as compact JSON
+    src_compact = []
+    for s in sources:
+        src_compact.append({
+            "url": s.get("url",""),
+            "domain": s.get("domain",""),
+            "title": s.get("title",""),
+            "text": (s.get("text","") or "")[:12000],  # cap to avoid huge prompts
+        })
+    payload = json.dumps(src_compact, ensure_ascii=False)
 
+    return f"""
+You are a careful tech researcher and editor.
 
-# ==================== FALLBACK ARTICLE ====================
+TASK
+Build a structured "Fact Pack" for the topic below, grounded ONLY in the provided sources.
+Do not invent any facts. If something isn't in sources, mark it "unknown".
 
-def create_fallback_article(title, research_content, category):
-    """
-    Create basic article if AI generation fails
-    Uses research content to create a simple but complete article
-    
-    Args:
-        title: Article title
-        research_content: Research data from Gemini
-        category: Article category
-    
-    Returns:
-        dict: Basic article structure
-    """
-    from config import create_slug_from_text
-    
-    # Extract first 200 chars for description
-    description_text = research_content[:300] if research_content else title
-    description_text = re.sub(r'<[^>]+>', '', description_text)  # Remove HTML
-    description = ' '.join(description_text.split()[:30])  # First 30 words
-    
-    if not description.endswith('.'):
-        # Find last sentence end
-        last_period = description.rfind('.')
-        if last_period > 50:
-            description = description[:last_period + 1]
-        else:
-            description += '...'
-    
-    # Use more research content to meet minimum length
-    research_excerpt = research_content[:5000] if research_content else ""
-    
-    # Split research into paragraphs
-    paragraphs = research_excerpt.split('\n\n') if research_excerpt else []
-    
-    # Create richer HTML content
-    content = f"""<p><strong>{title}</strong></p>
+TOPIC
+Title: {title}
+Category slug: {category_slug}
 
-<p>{description}</p>
+SOURCES (JSON, each has url/domain/title/text):
+{payload}
 
-<h2>Latest Update</h2>
-<p>This is a developing story in the {category} category. Here's what we know so far based on available information.</p>
-
-<h2>Key Information</h2>"""
-    
-    # Add research paragraphs
-    for i, para in enumerate(paragraphs[:5]):
-        if para.strip() and len(para.strip()) > 50:
-            content += f"\n<p>{para.strip()}</p>\n"
-    
-    content += """
-<h2>What This Means</h2>
-<p>This development has significant implications for the tech industry. The announcement represents an important step forward in this area.</p>
-
-<h3>Industry Impact</h3>
-<p>Technology experts are closely watching this development as it could influence market trends and consumer choices in the coming months.</p>
-
-<h2>Looking Ahead</h2>
-<p>As this story develops, we'll continue to monitor for updates and additional information. The full impact of this news will likely become clearer in the weeks ahead.</p>
-
-<h3>What to Watch For</h3>
-<ul>
-<li>Further announcements and official statements</li>
-<li>Market reaction and industry response</li>
-<li>Impact on consumers and related products</li>
-<li>Competitive responses from other companies</li>
-</ul>
-
-<h2>Stay Informed</h2>
-<p>For the most up-to-date information and complete details, please refer to the original source article. We'll update this story as more information becomes available.</p>
-
-<p><strong>Note:</strong> This is a developing story. Check back for updates or visit the source link for additional details.</p>"""
-    
-    return {
-        'title': title,
-        'short_description': description[:250],
-        'content': content,
-        'slug': create_slug_from_text(title),
-        'featured_image': None
-    }
-
-
-# ==================== MAIN WORKFLOW ====================
-
-def create_complete_article(title, category):
-    """
-    Complete article generation workflow with research + generation + humanization
-    
-    Args:
-        title: Article title
-        category: Article category
-    
-    Returns:
-        dict: Complete article data
-    """
-    print(f"\n{'='*60}", flush=True)
-    print(f"📝 Creating article: {title[:60]}...", flush=True)
-    print(f"📁 Category: {category}", flush=True)
-    print(f"{'='*60}", flush=True)
-    
-    # Step 1: Deep research with Gemini 2.0
-    print(f"\n[1/3] Research Phase", flush=True)
-    research = deep_research_with_gemini(title)
-    time.sleep(2)  # Rate limit buffer
-    
-    # Step 2: Generate article with OpenAI
-    print(f"\n[2/3] Generation Phase", flush=True)
-    article = generate_article_with_openai(title, research, category)
-    time.sleep(1)
-    
-    # Step 3: Final validation
-    print(f"\n[3/3] Validation Phase", flush=True)
-    
-    if article and article.get('content'):
-        word_count = len(article['content'].split())
-        
-        # Quality checks
-        has_headings = '<h2>' in article['content']
-        has_lists = '<ul>' in article['content'] or '<ol>' in article['content']
-        is_long_enough = word_count >= 800
-        
-        print(f"   Word count: {word_count}", flush=True)
-        print(f"   Has headings: {'✅' if has_headings else '❌'}", flush=True)
-        print(f"   Has lists: {'✅' if has_lists else '❌'}", flush=True)
-        print(f"   Length OK: {'✅' if is_long_enough else '⚠️'}", flush=True)
-        
-        if not is_long_enough:
-            print(f"   ⚠️ Article may be shorter than ideal", flush=True)
-    
-    print(f"{'='*60}\n", flush=True)
-    
-    return article
-
-
-# ==================== ALTERNATIVE: GEMINI-ONLY GENERATION ====================
-
-@retry_on_api_error
-def generate_article_with_gemini_only(title, research_content, category):
-    """
-    Fallback: Generate article using only Gemini (if OpenAI unavailable)
-    This is a backup option if OpenAI key is invalid or rate-limited
-    
-    Args:
-        title: Article title
-        research_content: Research data
-        category: Article category
-    
-    Returns:
-        dict: Article data
-    """
-    if not GEMINI_API_KEY:
-        return create_fallback_article(title, research_content, category)
-    
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-thinking-exp:generateContent?key={GEMINI_API_KEY}"
-    
-    prompt = f"""You are a professional tech journalist. Write a comprehensive article based on this research.
-
-RESEARCH DATA:
-{research_content[:10000]}
-
-TITLE: {title}
-CATEGORY: {category}
-
-Write a complete article in JSON format with these exact fields:
+OUTPUT FORMAT (valid JSON only; no markdown):
 {{
-  "title": "Engaging 60-70 character title",
-  "short_description": "Compelling 200 character SEO description",
-  "slug": "seo-friendly-slug-with-keywords",
-  "content": "Full HTML article (1500+ words minimum)",
-  "image_keywords": "keywords for image search"
+  "topic": "...",
+  "category": "{category_slug}",
+  "one_sentence_summary": "...",
+  "highlights": ["...", "...", "..."],
+  "key_facts": [{{"fact":"...", "sources":["url1","url2"]}}],
+  "numbers_and_specs": [{{"label":"...", "value":"...", "sources":["url"]}}],
+  "timeline": [{{"when":"...", "what":"...", "sources":["url"]}}],
+  "confirmed": ["..."],
+  "uncertain_or_conflicting": [{{"claim":"...", "notes":"...", "sources":["url1","url2"]}}],
+  "what_it_means": ["...", "..."],
+  "reader_takeaways": ["...", "..."],
+  "seo": {{
+    "primary_keyword": "...",
+    "supporting_keywords": ["...", "...", "..."],
+    "entities": ["...", "..."]
+  }},
+  "recommended_table": {{
+    "title": "...",
+    "columns": ["...", "...", "..."],
+    "rows": [["...", "...", "..."]]
+  }}
+}}
+""".strip()
+
+
+def prompt_article(fact_pack: Dict[str,Any]) -> str:
+    fp = json.dumps(fact_pack, ensure_ascii=False)
+
+    return f"""
+You are an experienced human tech journalist and editor.
+
+RULES (must follow)
+- Use ONLY the facts from the Fact Pack. Do NOT add new facts.
+- Write an original, reader-friendly article (not a rewrite of any one source).
+- Target length: {config.ARTICLE_WORD_TARGET_MIN}-{config.ARTICLE_WORD_TARGET_MAX} words.
+- Keep paragraphs short (2–3 sentences).
+- Use a neutral, professional newsroom tone.
+- Avoid phrases like "as an AI" or "this article will".
+- Do not include JSON-LD or schema markup.
+
+STRUCTURE (exact)
+1) H2: "Article Highlights" + 2–3 bullet points
+2) H2: "Hook" + {config.HOOK_WORDS_MIN}-{config.HOOK_WORDS_MAX} words
+3) 4–5 H2 headings (each 100–200 words) with optional H3 subheadings when helpful
+4) Use at least:
+   - one numbered list
+   - one bullet list (highlights already counts)
+   - exactly ONE table (if Fact Pack provides a table, use it)
+   - include an image placeholder: <figure><img src="{{IMAGE_URL}}" alt="{{IMAGE_ALT}}"/><figcaption>{{IMAGE_CAPTION}}</figcaption></figure>
+5) End with H2: "Sources" and list the source URLs used (bullets)
+
+OUTPUT
+Return HTML only (no markdown, no code fences).
+Use <h2>, <h3>, <p>, <ul>, <ol>, <table>, <figure> tags.
+
+FACT PACK JSON:
+{fp}
+""".strip()
+
+
+def prompt_polish(html: str, fact_pack: Dict[str,Any]) -> str:
+    fp = json.dumps({
+        "highlights": fact_pack.get("highlights", []),
+        "key_facts": fact_pack.get("key_facts", []),
+        "numbers_and_specs": fact_pack.get("numbers_and_specs", []),
+        "seo": fact_pack.get("seo", {}),
+    }, ensure_ascii=False)
+
+    return f"""
+You are a senior tech editor.
+
+TASK
+Polish the article HTML to make it feel human-edited and user-friendly, while preserving facts.
+
+HARD RULES
+- Do NOT add new facts, numbers, dates, quotes, or claims.
+- Do NOT change any numbers/specs.
+- Keep the same overall structure (Highlights, Hook, 4–5 H2 sections, Sources).
+- Improve readability: shorter sentences, better transitions, remove repetition, more scannable.
+- Keep table count <= {config.TABLE_MAX}.
+- Do not add JSON-LD.
+
+Return HTML only.
+
+FACT CONSTRAINTS (do not go beyond these):
+{fp}
+
+ARTICLE HTML:
+{html}
+""".strip()
+
+
+def prompt_seo_pack(html: str, fact_pack: Dict[str,Any]) -> str:
+    fp = json.dumps(fact_pack.get("seo", {}), ensure_ascii=False)
+    return f"""
+You are an SEO editor for a tech news site.
+
+TASK
+Create SEO fields for the article. Do NOT output JSON-LD.
+
+Return valid JSON only (no markdown), with:
+{{
+  "meta_title": "...",
+  "meta_description": "...",
+  "focus_keyword": "...",
+  "tags": ["...", "...", "..."],
+  "short_description": "One short paragraph summary (max 300 chars)",
+  "image_alt": "SEO-friendly descriptive alt text",
+  "image_caption": "Short caption (max 140 chars)"
 }}
 
-CONTENT REQUIREMENTS:
-- 1500+ words minimum (this is critical)
-- Use proper HTML: <p>, <h2>, <h3>, <strong>, <ul>, <ol>, <li>
-- Include 6-8 <h2> section headings
-- Include 4-5 <h3> subheadings
-- Add bullet lists with <ul><li> for features
-- Keep paragraphs short (2-4 sentences)
-- Make it conversational and engaging
-- Use specific numbers and facts from research
+Constraints:
+- meta_title 55–65 chars target
+- meta_description 150–160 chars target
+- tags 5–10
+- Keep it human and accurate, based on the article and the SEO hints.
 
-STRUCTURE:
-<p>Opening paragraph with hook</p>
-<h2>What Happened</h2>
-<p>Main news with details</p>
-<h3>Key Features</h3>
-<ul><li>Feature 1</li><li>Feature 2</li></ul>
-<h2>Why This Matters</h2>
-<p>Impact and significance</p>
-<h2>Technical Details</h2>
-<h2>How It Compares</h2>
-<h2>What's Next</h2>
+SEO HINTS JSON:
+{fp}
 
-Return ONLY valid JSON. The content field must be at least 1500 words."""
-    
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 8000,  # Increased for longer content
-            "topP": 0.95,
-            "topK": 40
-        }
-    }
-    
+ARTICLE HTML:
+{html}
+""".strip()
+
+
+# ---------------------------
+# JSON extraction helpers
+# ---------------------------
+
+_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+def extract_json_object(text: str) -> Dict[str,Any]:
+    t = (text or "").strip()
+    # Try direct parse
     try:
-        print(f"   🔄 Generating with Gemini 2.0...", flush=True)
-        response = requests.post(url, json=payload, timeout=90)
-        response.raise_for_status()
-        
-        data = response.json()
-        content_text = data['candidates'][0]['content']['parts'][0]['text']
-        article = extract_json(content_text)
-        
-        if article and 'content' in article:
-            word_count = len(article['content'].split())
-            print(f"   ✅ Gemini article: {word_count} words", flush=True)
-            
-            # If still too short, use fallback
-            if word_count < 500:
-                print(f"   ⚠️ Still too short, using enhanced fallback", flush=True)
-                return create_fallback_article(title, research_content, category)
-            
-            return article
-        
-    except Exception as e:
-        print(f"   ⚠️ Gemini generation failed: {str(e)[:100]}", flush=True)
-    
-    return create_fallback_article(title, research_content, category)
+        return json.loads(t)
+    except Exception:
+        pass
+    # Extract first JSON object block
+    m = _JSON_RE.search(t)
+    if not m:
+        raise ValueError("No JSON object found in model output")
+    block = m.group(0)
+    return json.loads(block)
+
+
+# ---------------------------
+# Validation helpers
+# ---------------------------
+
+def validate_structure(html: str) -> List[str]:
+    issues = []
+    if "<h2" not in html.lower():
+        issues.append("Missing H2 headings")
+    if "Article Highlights" not in html:
+        issues.append("Missing 'Article Highlights' section")
+    if "Hook" not in html:
+        issues.append("Missing 'Hook' section")
+    if "<table" in html.lower():
+        # Count tables
+        tbl = len(re.findall(r"<table\b", html.lower()))
+        if tbl > config.TABLE_MAX:
+            issues.append(f"Too many tables ({tbl})")
+    else:
+        issues.append("Missing table")
+    if "{IMAGE_URL}" in html or "{{IMAGE_URL}}" in html:
+        issues.append("Image placeholders not filled")
+    if "<h2" in html.lower():
+        h2_count = len(re.findall(r"<h2\b", html.lower()))
+        # Expected: Highlights + Hook + 4-5 sections + Sources => 7-9
+        if h2_count < (2 + config.H2_MIN + 1):
+            issues.append(f"Too few H2 sections ({h2_count})")
+    wc = word_count(re.sub(r"<[^>]+>", " ", html))
+    if wc < config.ARTICLE_WORD_TARGET_MIN:
+        issues.append(f"Too short ({wc} words)")
+    if wc > config.ARTICLE_WORD_TARGET_MAX + 250:
+        issues.append(f"Too long ({wc} words)")
+    if "Sources" not in html:
+        issues.append("Missing Sources section")
+    return issues
+
+
+# ---------------------------
+# Public orchestration
+# ---------------------------
+
+def build_fact_pack(title: str, category_slug: str, sources: List[Dict[str,Any]]) -> Dict[str,Any]:
+    prompt = prompt_fact_pack(title, category_slug, sources)
+    out = llm_generate(
+        prompt,
+        primary_model=config.GEMINI_MODEL_FACTPACK,
+        primary_temp=config.GEMINI_TEMPERATURE_FACTPACK,
+        fallback_model=config.OPENAI_MODEL_WRITER,
+        fallback_temp=0.2,
+        max_output_tokens=4096
+    )
+    fp = extract_json_object(out)
+    return fp
+
+def draft_article_html(fact_pack: Dict[str,Any]) -> str:
+    prompt = prompt_article(fact_pack)
+    html = llm_generate(
+        prompt,
+        primary_model=config.GEMINI_MODEL_WRITER,
+        primary_temp=config.GEMINI_TEMPERATURE_WRITER,
+        fallback_model=config.OPENAI_MODEL_WRITER,
+        fallback_temp=0.7,
+        max_output_tokens=8192
+    )
+    return html
+
+def polish_article_html(html: str, fact_pack: Dict[str,Any]) -> str:
+    prompt = prompt_polish(html, fact_pack)
+    polished = llm_generate(
+        prompt,
+        primary_model=config.GEMINI_MODEL_FACTPACK,
+        primary_temp=config.GEMINI_TEMPERATURE_POLISH,
+        fallback_model=config.OPENAI_MODEL_WRITER,
+        fallback_temp=0.6,
+        max_output_tokens=8192
+    )
+    return polished
+
+def seo_pack(html: str, fact_pack: Dict[str,Any]) -> Dict[str,Any]:
+    prompt = prompt_seo_pack(html, fact_pack)
+    out = llm_generate(
+        prompt,
+        primary_model=config.GEMINI_MODEL_FACTPACK,
+        primary_temp=0.3,
+        fallback_model=config.OPENAI_MODEL_WRITER,
+        fallback_temp=0.3,
+        max_output_tokens=1200
+    )
+    return extract_json_object(out)
+
+def create_complete_article(*,
+                            title: str,
+                            seed_url: str,
+                            category_slug: str,
+                            sources: List[Dict[str,Any]],
+                            image_url: str,
+                            image_alt: str,
+                            image_caption: str) -> Dict[str,Any]:
+    """
+    Returns:
+      {
+        "fact_pack": {...},
+        "html": "...",
+        "seo": {...},
+        "word_count": int
+      }
+    """
+    fp = build_fact_pack(title, category_slug, sources)
+
+    html = draft_article_html(fp)
+
+    # Fill image placeholders early
+    html = html.replace("{IMAGE_URL}", image_url).replace("{IMAGE_ALT}", image_alt).replace("{IMAGE_CAPTION}", image_caption)
+    html = html.replace("{{IMAGE_URL}}", image_url).replace("{{IMAGE_ALT}}", image_alt).replace("{{IMAGE_CAPTION}}", image_caption)
+
+    # If structure issues, do one polish pass; then validate again
+    html2 = polish_article_html(html, fp)
+
+    seo = seo_pack(html2, fp)
+
+    wc = word_count(re.sub(r"<[^>]+>", " ", html2))
+
+    return {"fact_pack": fp, "html": html2, "seo": seo, "word_count": wc}

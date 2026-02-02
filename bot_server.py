@@ -39,7 +39,7 @@ def health():
     return _ok()
 
 
-@app.post("/slack/actions")
+@app.post("/slack/interactions")
 def slack_actions():
     # Verify Slack signature
     if config.SLACK_SIGNING_SECRET and not config.SLACK_SIGNING_SECRET.startswith("YOUR_"):

@@ -2,7 +2,8 @@
 bot_server.py — Slack interactive approval server.
 
 Endpoints:
-- POST /slack/actions  (Slack interactive components)
+- POST /slack/interactions  (Slack interactive components; configure this in your Slack App)
+- POST /slack/actions       (alias; supported too)
 - GET  /health
 
 This server updates Directus lead statuses based on Slack button clicks:
@@ -39,7 +40,7 @@ def health():
     return _ok()
 
 
-@app.post("/slack/interactions")
+@app.route("/slack/actions", methods=["POST"], strict_slashes=False)
 def slack_actions():
     # Verify Slack signature
     if config.SLACK_SIGNING_SECRET and not config.SLACK_SIGNING_SECRET.startswith("YOUR_"):
@@ -100,6 +101,12 @@ def slack_actions():
     except Exception as e:
         log.error(f"Slack action error: {e}\n{traceback.format_exc()}")
         return jsonify({"error": "server error"}), 500
+
+
+# Backward/compat route: your Slack app is configured to call /slack/interactions
+@app.route("/slack/interactions", methods=["POST"], strict_slashes=False)
+def slack_interactions():
+    return slack_actions()
 
 
 def _publish_thread(lead_id: str, channel: str, ts: str):

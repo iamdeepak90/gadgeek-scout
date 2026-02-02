@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import time
 import traceback
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import config
 from common import (
@@ -23,9 +23,24 @@ from common import (
     fetch_rss_entries, classify_item,
     canonicalize_url, compute_fingerprint, domain_of,
     directus_item_exists_by_filters, directus_create_lead, directus_update_lead,
+    directus_find_items,
     slack_post_candidate,
-    newsdata_discover
+    newsdata_discover,
+    utcnow_iso,
 )
+
+
+def _priority_boost(category_slug: str) -> int:
+    """Boost score by configured category priority.
+
+    priority: 1 highest, 3 lowest.
+    """
+    p = int(config.FEATURED_CATEGORIES.get(category_slug, {}).get("priority", 3))
+    return {1: 30, 2: 15, 3: 0}.get(p, 0)
+
+
+def _final_score(category_slug: str, match_score: int) -> int:
+    return int(match_score) + _priority_boost(category_slug)
 
 
 def already_seen(title: str, url: str) -> bool:
@@ -67,7 +82,8 @@ def create_lead(item: Dict[str,Any], category_slug: str, score: int, matched_key
         config.LEAD_F_SOURCE_DOMAIN: domain_of(url),
         config.LEAD_F_CATEGORY: category_slug,
         config.LEAD_F_STATUS: status,
-        config.LEAD_F_DISCOVERED_AT: item.get("discovered_at") or None,
+        # Always stamp discovery time; RSS timestamps can be missing or inconsistent.
+        config.LEAD_F_DISCOVERED_AT: item.get("discovered_at") or utcnow_iso(),
         config.LEAD_F_PUBLISHED_AT: item.get("published_raw") or "",
         config.LEAD_F_FINGERPRINT: fp,
         config.LEAD_F_MATCHED_KEYWORDS: matched_keywords,
@@ -127,45 +143,183 @@ def discover_candidates() -> List[Dict[str,Any]]:
 
 
 def run_once() -> int:
-    new_count = 0
+    """Discover, create leads, and post a limited number to Slack.
+
+    Important production behaviors:
+    - Hard cap Slack posts per run (prevents 150+ messages).
+    - Per-category and per-domain caps (prevents single-category spam).
+    - Priority-aware ordering using FEATURED_CATEGORIES[slug]['priority'].
+    """
+
+    # Limits (defaults if not present)
+    max_new_leads = getattr(config, "SCOUT_MAX_NEW_LEADS_PER_RUN", 80)
+    max_slack = getattr(config, "SCOUT_MAX_SLACK_PER_RUN", 10)
+    max_slack_per_cat = getattr(config, "SCOUT_MAX_SLACK_PER_CATEGORY_PER_RUN", 2)
+    max_slack_per_domain = getattr(config, "SCOUT_MAX_SLACK_PER_DOMAIN_PER_RUN", 2)
+    min_score = getattr(config, "SCOUT_MIN_SCORE_TO_CREATE", 0)
+
     items = discover_candidates()
     log.info(f"Discovered {len(items)} candidates")
 
+    # 1) Classify quickly and compute final score
+    candidates: List[Dict[str, Any]] = []
     for it in items:
         try:
-            title = it["title"]
-            url = it["url"]
-            if already_seen(title, url):
+            title = it.get("title") or ""
+            url = it.get("url") or ""
+            if not title or not url:
                 continue
-
-            category_slug, score, hits = classify_item(title, it.get("snippet",""))
+            category_slug, match_score, hits = classify_item(title, it.get("snippet", ""))
             if not category_slug:
                 continue
+            fs = _final_score(category_slug, match_score)
+            if fs < min_score:
+                continue
+            candidates.append({
+                "item": it,
+                "title": title,
+                "url": url,
+                "category_slug": category_slug,
+                "match_score": int(match_score),
+                "final_score": int(fs),
+                "hits": hits,
+                "domain": domain_of(url),
+            })
+        except Exception:
+            continue
 
-            # Create lead
+    candidates.sort(key=lambda x: x.get("final_score", 0), reverse=True)
+
+    # 2) Create leads (cap to avoid excessive DB writes)
+    created_leads: List[Dict[str, Any]] = []
+    created_count = 0
+    for c in candidates:
+        if created_count >= max_new_leads:
+            break
+        try:
+            title = c["title"]
+            url = c["url"]
+            if already_seen(title, url):
+                continue
+            category_slug = c["category_slug"]
+            hits = c.get("hits") or []
             status = config.LEAD_STATUS_PENDING if config.REQUIRE_SLACK_APPROVAL else config.LEAD_STATUS_QUEUED
-            lead_id, fp = create_lead(it, category_slug, score, hits, status)
-
-            # Slack notify
-            if config.REQUIRE_SLACK_APPROVAL:
-                resp = slack_post_candidate(lead_id, title, url, category_slug, score, hits)
-                if resp:
-                    ch, ts = resp
-                    directus_update_lead(lead_id, {config.LEAD_F_SLACK_TS: ts, config.LEAD_F_SLACK_CHANNEL: ch})
-                else:
-                    # If Slack fails, still queue it (avoid interruption)
-                    directus_update_lead(lead_id, {config.LEAD_F_STATUS: config.LEAD_STATUS_QUEUED})
-            new_count += 1
-
+            lead_id, _ = create_lead(c["item"], category_slug, c["final_score"], hits, status)
+            created_leads.append({
+                "id": lead_id,
+                "title": title,
+                "url": url,
+                "category_slug": category_slug,
+                "score": c["final_score"],
+                "hits": hits,
+                "domain": c.get("domain") or domain_of(url),
+            })
+            created_count += 1
         except Exception as e:
-            log.error(f"Error processing candidate: {e}\n{traceback.format_exc()}")
+            log.error(f"Error creating lead: {e}\n{traceback.format_exc()}")
 
-    log.info(f"New leads created: {new_count}")
-    return new_count
+    # 3) Slack posting (hard cap + quotas)
+    if config.REQUIRE_SLACK_APPROVAL and max_slack > 0:
+        slack_remaining = max_slack
+
+        def _select_with_quotas(rows: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            cat_count: Dict[str, int] = {}
+            dom_count: Dict[str, int] = {}
+            for r in rows:
+                if len(out) >= limit:
+                    break
+                cat = r.get("category_slug") or ""
+                dom = r.get("domain") or domain_of(r.get("url") or "")
+                if max_slack_per_cat and cat_count.get(cat, 0) >= max_slack_per_cat:
+                    continue
+                if max_slack_per_domain and dom_count.get(dom, 0) >= max_slack_per_domain:
+                    continue
+                out.append(r)
+                cat_count[cat] = cat_count.get(cat, 0) + 1
+                dom_count[dom] = dom_count.get(dom, 0) + 1
+            return out
+
+        # Prefer newest/highest score among newly created leads
+        created_leads.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
+        to_post = _select_with_quotas(created_leads, slack_remaining)
+
+        def _post_one(lead_row: Dict[str, Any]) -> bool:
+            lead_id = lead_row["id"]
+            title = lead_row.get("title") or ""
+            url = lead_row.get("url") or ""
+            category_slug = lead_row.get("category_slug") or ""
+            score = int(lead_row.get("score") or 0)
+            hits = lead_row.get("hits") or []
+            resp = slack_post_candidate(lead_id, title, url, category_slug, score, hits)
+            if resp:
+                ch, ts = resp
+                directus_update_lead(lead_id, {config.LEAD_F_SLACK_TS: ts, config.LEAD_F_SLACK_CHANNEL: ch})
+                return True
+            # If Slack fails, still queue it (avoid interruptions)
+            directus_update_lead(lead_id, {config.LEAD_F_STATUS: config.LEAD_STATUS_QUEUED})
+            return False
+
+        posted = 0
+        for row in to_post:
+            if slack_remaining <= 0:
+                break
+            if _post_one(row):
+                posted += 1
+                slack_remaining -= 1
+
+        # Post backlog pending leads that do not yet have slack_ts
+        if slack_remaining > 0:
+            try:
+                backlog_filters = {
+                    config.LEAD_F_STATUS: {"_eq": config.LEAD_STATUS_PENDING},
+                    config.LEAD_F_SLACK_TS: {"_null": True},
+                }
+                fields = [
+                    "id",
+                    config.LEAD_F_TITLE,
+                    config.LEAD_F_SOURCE_URL,
+                    config.LEAD_F_CATEGORY,
+                    config.LEAD_F_PRIORITY,
+                    config.LEAD_F_MATCHED_KEYWORDS,
+                ]
+                backlog = directus_find_items(
+                    config.LEADS_COLLECTION,
+                    backlog_filters,
+                    fields=fields,
+                    limit=50,
+                    sort=f"-{config.LEAD_F_PRIORITY},-{config.LEAD_F_DISCOVERED_AT}",
+                )
+                backlog_rows: List[Dict[str, Any]] = []
+                for b in backlog:
+                    backlog_rows.append({
+                        "id": b.get("id"),
+                        "title": b.get(config.LEAD_F_TITLE) or "",
+                        "url": b.get(config.LEAD_F_SOURCE_URL) or "",
+                        "category_slug": b.get(config.LEAD_F_CATEGORY) or "",
+                        "score": int(b.get(config.LEAD_F_PRIORITY) or 3) * 10,
+                        "hits": b.get(config.LEAD_F_MATCHED_KEYWORDS) or [],
+                        "domain": domain_of(b.get(config.LEAD_F_SOURCE_URL) or ""),
+                    })
+                backlog_rows.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
+                backlog_pick = _select_with_quotas(backlog_rows, slack_remaining)
+                for row in backlog_pick:
+                    if slack_remaining <= 0:
+                        break
+                    if _post_one(row):
+                        posted += 1
+                        slack_remaining -= 1
+            except Exception as e:
+                log.warning(f"Backlog Slack posting failed: {e}")
+
+        log.info(f"Slack posted {posted} item(s) (cap={max_slack})")
+
+    log.info(f"New leads created: {created_count}")
+    return created_count
 
 
 def main():
-    interval = 20 * 60  # 20 minutes
+    interval = int(getattr(config, "SCOUT_INTERVAL_SECONDS", 30 * 60))
     log.info("Scout started")
     while True:
         try:

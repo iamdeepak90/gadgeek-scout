@@ -76,6 +76,24 @@ REQUIRE_SLACK_APPROVAL = True
 ENABLE_RSS_DISCOVERY = True
 ENABLE_NEWSDATA_DISCOVERY = False
 
+# Scout behavior (how many leads and Slack messages per run)
+# NOTE: scheduling is typically handled by cron/systemd. If you run scout.py in loop mode,
+# it will sleep this many seconds between runs.
+SCOUT_INTERVAL_SECONDS = 30 * 60
+
+# Hard cap Slack messages per run (prevents 150+ messages)
+SCOUT_MAX_SLACK_PER_RUN = 10
+
+# Quotas to avoid spam from a single category or single source domain
+SCOUT_MAX_SLACK_PER_CATEGORY_PER_RUN = 2
+SCOUT_MAX_SLACK_PER_DOMAIN_PER_RUN = 2
+
+# How many new leads to create per run (can be > Slack cap; backlog will be posted in later runs)
+SCOUT_MAX_NEW_LEADS_PER_RUN = 80
+
+# Minimum "final_score" to create a lead (final_score = classifier score + priority boost)
+SCOUT_MIN_SCORE_TO_CREATE = 0
+
 # NewsData.io — optional supplement for discovery (title/URL only)
 NEWSDATA_API_KEY = "YOUR_NEWSDATA_KEY"
 NEWSDATA_ENDPOINT = "https://newsdata.io/api/1/news"

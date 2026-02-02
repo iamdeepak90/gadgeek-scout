@@ -57,7 +57,7 @@ gunicorn -w 2 -b 0.0.0.0:8000 bot_server:app
 ```
 
 Configure Slack Interactivity URL to:
-`https://YOUR-SERVER/slack/actions`
+`https://YOUR-SERVER/slack/interactions`
 
 ### C) Publisher
 

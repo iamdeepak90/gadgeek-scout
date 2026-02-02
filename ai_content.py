@@ -38,17 +38,27 @@ def _gemini_client():
     except Exception as e:
         raise RuntimeError("google-generativeai not installed or GEMINI_API_KEY missing") from e
 
-def gemini_generate(prompt: str, *, model: str, temperature: float, max_output_tokens: int = 4096) -> str:
+def gemini_generate(
+    prompt: str,
+    *,
+    model: str,
+    temperature: float,
+    max_output_tokens: int = 4096,
+    response_mime_type: str | None = None,
+) -> str:
     genai = _gemini_client()
     m = genai.GenerativeModel(model)
     # Keep it simple & stable
-    resp = m.generate_content(
-        prompt,
-        generation_config={
-            "temperature": float(temperature),
-            "max_output_tokens": int(max_output_tokens),
-        },
-    )
+    gen_cfg = {
+        "temperature": float(temperature),
+        "max_output_tokens": int(max_output_tokens),
+    }
+    # Newer google-generativeai versions support response_mime_type (e.g., application/json).
+    # If unsupported, it will be ignored by the SDK.
+    if response_mime_type:
+        gen_cfg["response_mime_type"] = response_mime_type
+
+    resp = m.generate_content(prompt, generation_config=gen_cfg)
     text = getattr(resp, "text", "") or ""
     return text.strip()
 
@@ -83,11 +93,30 @@ def openai_generate(prompt: str, *, model: str, temperature: float, max_output_t
     return (out or "").strip()
 
 
-def llm_generate(prompt: str, *, primary_model: str, primary_temp: float, fallback_model: str = "", fallback_temp: float = 0.7,
-                 max_output_tokens: int = 4096) -> str:
+def llm_generate(
+    prompt: str,
+    *,
+    primary_model: str,
+    primary_temp: float,
+    fallback_model: str = "",
+    fallback_temp: float = 0.7,
+    max_output_tokens: int = 4096,
+    expect_json: bool = False,
+) -> str:
+    """Generate text from LLM.
+
+    If expect_json=True, we ask Gemini SDK for application/json when supported.
+    This dramatically reduces invalid JSON responses.
+    """
     # Gemini primary
     try:
-        return gemini_generate(prompt, model=primary_model, temperature=primary_temp, max_output_tokens=max_output_tokens)
+        return gemini_generate(
+            prompt,
+            model=primary_model,
+            temperature=primary_temp,
+            max_output_tokens=max_output_tokens,
+            response_mime_type=("application/json" if expect_json else None),
+        )
     except Exception as e:
         log.warning(f"Gemini failed ({primary_model}): {e}")
         if config.OPENAI_API_KEY and fallback_model:
@@ -256,21 +285,130 @@ ARTICLE HTML:
 # JSON extraction helpers
 # ---------------------------
 
-_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+def _strip_code_fences(t: str) -> str:
+    t = (t or "").strip()
+    # Remove common markdown code fences.
+    t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"```\s*$", "", t)
+    return t.strip()
+
+
+def _extract_first_json_object(t: str) -> str | None:
+    """Extract the first top-level JSON object using brace balancing.
+
+    This is safer than regex because model outputs may contain extra braces in text.
+    """
+    if not t:
+        return None
+    start = None
+    depth = 0
+    in_str = False
+    esc = False
+    for i, ch in enumerate(t):
+        if start is None:
+            if ch == "{":
+                start = i
+                depth = 1
+            continue
+
+        # inside object
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                return t[start : i + 1]
+    return None
+
+
+def _basic_json_sanitize(t: str) -> str:
+    """Best-effort sanitization for near-JSON produced by LLMs."""
+    if not t:
+        return t
+    # Normalize fancy quotes
+    t = t.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
+    t = t.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+    # Remove trailing commas before } or ]
+    t = re.sub(r",\s*([}\]])", r"\1", t)
+    return t
+
+
+def _repair_json_with_llm(bad_json: str) -> Dict[str, Any]:
+    """Ask the LLM to repair JSON syntax.
+
+    This is the most reliable fix for missing commas / unescaped characters.
+    """
+    prompt = (
+        "You are a strict JSON repair tool.\n"
+        "TASK: Fix the following so it becomes valid JSON.\n"
+        "RULES:\n"
+        "- Preserve the same keys and values (do NOT add new facts).\n"
+        "- Only fix syntax issues (commas, quotes, escapes).\n"
+        "- Output ONLY the repaired JSON object. No markdown, no commentary.\n\n"
+        f"BROKEN JSON:\n{bad_json}"
+    )
+    out = llm_generate(
+        prompt,
+        primary_model=config.GEMINI_MODEL_FACTPACK,
+        primary_temp=0.0,
+        fallback_model=config.OPENAI_MODEL_WRITER,
+        fallback_temp=0.0,
+        max_output_tokens=4096,
+        expect_json=True,
+    )
+    cleaned = _strip_code_fences(out)
+    block = _extract_first_json_object(cleaned) or cleaned
+    return json.loads(_basic_json_sanitize(block))
+
 
 def extract_json_object(text: str) -> Dict[str,Any]:
-    t = (text or "").strip()
-    # Try direct parse
+    """Parse a JSON object from model output robustly.
+
+    Strategy:
+      1) direct json.loads
+      2) extract first balanced {...} block
+      3) sanitize common issues and retry
+      4) if still failing, use an LLM repair pass (most reliable)
+    """
+    t = _strip_code_fences(text)
+    if not t:
+        raise ValueError("Empty model output")
+
+    # 1) direct
     try:
         return json.loads(t)
     except Exception:
         pass
-    # Extract first JSON object block
-    m = _JSON_RE.search(t)
-    if not m:
+
+    # 2) first balanced object
+    block = _extract_first_json_object(t)
+    if not block:
         raise ValueError("No JSON object found in model output")
-    block = m.group(0)
-    return json.loads(block)
+
+    # 3) sanitize and parse
+    block2 = _basic_json_sanitize(block)
+    try:
+        return json.loads(block2)
+    except Exception as e:
+        log.warning(f"JSON parse failed, attempting repair: {e}")
+
+    # 4) LLM repair (requires Gemini or OpenAI key configured)
+    try:
+        return _repair_json_with_llm(block2)
+    except Exception as e:
+        # Raise the original parse error context
+        raise ValueError(f"Failed to parse JSON even after repair attempt: {e}")
 
 
 # ---------------------------
@@ -321,7 +459,8 @@ def build_fact_pack(title: str, category_slug: str, sources: List[Dict[str,Any]]
         primary_temp=config.GEMINI_TEMPERATURE_FACTPACK,
         fallback_model=config.OPENAI_MODEL_WRITER,
         fallback_temp=0.2,
-        max_output_tokens=4096
+        max_output_tokens=4096,
+        expect_json=True,
     )
     fp = extract_json_object(out)
     return fp
@@ -358,7 +497,8 @@ def seo_pack(html: str, fact_pack: Dict[str,Any]) -> Dict[str,Any]:
         primary_temp=0.3,
         fallback_model=config.OPENAI_MODEL_WRITER,
         fallback_temp=0.3,
-        max_output_tokens=1200
+        max_output_tokens=1200,
+        expect_json=True,
     )
     return extract_json_object(out)
 

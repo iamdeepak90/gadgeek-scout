@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Gadgeek Bot Settings</title>
+  <link rel="stylesheet" href="/static/settings.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Gadgeek Automation Settings</h1>
+      <p class="muted">Manage feeds, models and system settings. Categories are read-only from Directus.</p>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="overview">Overview</button>
+      <button class="tab" data-tab="system">System</button>
+      <button class="tab" data-tab="feeds">RSS Feeds</button>
+      <button class="tab" data-tab="models">Models</button>
+      <button class="tab" data-tab="categories">Categories (Read‑only)</button>
+    </nav>
+
+    <section id="overview" class="panel active">
+      <div class="card">
+        <h2>Status</h2>
+        <div id="health"></div>
+      </div>
+      <div class="card">
+        <h2>Quick notes</h2>
+        <ul>
+          <li>Secrets are never shown back in this UI. If a secret is already set, you’ll see a “configured” badge.</li>
+          <li>Scout runs via cron: <code>python scout.py</code>. Publisher runs: <code>python publisher.py</code>.</li>
+          <li>Slack Interactivity URL should be: <code>https://bot.gadgeek.in/slack/interactions</code></li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="system" class="panel">
+      <div class="card">
+        <h2>Core connections</h2>
+        <div class="grid">
+          <label>Directus URL
+            <input id="directus_url" placeholder="https://admin.gadgeek.in" />
+          </label>
+          <label>Directus Token <span id="directus_token_badge" class="badge"></span>
+            <input id="directus_token" type="password" placeholder="Paste token to set/update" />
+          </label>
+          <label>Leads Collection
+            <input id="directus_leads_collection" placeholder="news_leads" />
+          </label>
+          <label>Articles Collection
+            <input id="directus_articles_collection" placeholder="Articles" />
+          </label>
+          <label>Categories Collection
+            <input id="directus_categories_collection" placeholder="categories" />
+          </label>
+        </div>
+        <button class="primary" id="save_system_1">Save</button>
+      </div>
+
+      <div class="card">
+        <h2>Slack</h2>
+        <div class="grid">
+          <label>Slack Channel ID
+            <input id="slack_channel_id" placeholder="C0123..." />
+          </label>
+          <label>Slack Bot Token <span id="slack_bot_token_badge" class="badge"></span>
+            <input id="slack_bot_token" type="password" placeholder="xoxb-..." />
+          </label>
+          <label>Slack Signing Secret <span id="slack_signing_secret_badge" class="badge"></span>
+            <input id="slack_signing_secret" type="password" placeholder="signing secret" />
+          </label>
+        </div>
+        <button class="primary" id="save_system_2">Save</button>
+      </div>
+
+      <div class="card">
+        <h2>API Keys</h2>
+        <div class="grid">
+          <label>Tavily API Key <span id="tavily_api_key_badge" class="badge"></span>
+            <input id="tavily_api_key" type="password" placeholder="tavily key" />
+          </label>
+          <label>Together API Key <span id="together_api_key_badge" class="badge"></span>
+            <input id="together_api_key" type="password" placeholder="together key" />
+          </label>
+          <label>OpenRouter API Key <span id="openrouter_api_key_badge" class="badge"></span>
+            <input id="openrouter_api_key" type="password" placeholder="openrouter key" />
+          </label>
+        </div>
+        <button class="primary" id="save_system_3">Save</button>
+      </div>
+
+      <div class="card">
+        <h2>Runtime</h2>
+        <div class="grid">
+          <label>Publish interval (minutes)
+            <input id="publish_interval_minutes" type="number" min="1" step="1" />
+          </label>
+          <label>Scout interval (minutes)
+            <input id="scout_interval_minutes" type="number" min="1" step="1" />
+          </label>
+          <label>HTTP timeout (seconds)
+            <input id="http_timeout" type="number" min="5" step="1" />
+          </label>
+          <label>User-Agent
+            <input id="user_agent" />
+          </label>
+        </div>
+        <button class="primary" id="save_system_4">Save</button>
+      </div>
+
+      <div class="card">
+        <h2>Images</h2>
+        <div class="grid">
+          <label>Prefer extracted images (Tavily)
+            <select id="prefer_extracted_image">
+              <option value="1">Yes (recommended)</option>
+              <option value="0">No</option>
+            </select>
+          </label>
+          <label>Together image model
+            <input id="image_model" placeholder="black-forest-labs/FLUX.1-schnell" />
+          </label>
+          <label>Image response format
+            <select id="image_response_format">
+              <option value="url">url</option>
+              <option value="base64">base64</option>
+            </select>
+          </label>
+        </div>
+        <button class="primary" id="save_system_5">Save</button>
+      </div>
+    </section>
+
+    <section id="feeds" class="panel">
+      <div class="card">
+        <h2>Add / Update feed</h2>
+        <div class="grid">
+          <label>RSS/Atom URL
+            <input id="feed_url" placeholder="https://example.com/rss" />
+          </label>
+          <label>Enabled
+            <select id="feed_enabled">
+              <option value="1">Yes</option>
+              <option value="0">No</option>
+            </select>
+          </label>
+          <label>Category hint (optional slug)
+            <input id="feed_category_hint" placeholder="smartphones" />
+          </label>
+          <label>title_key (optional)
+            <input id="feed_title_key" placeholder="title" />
+          </label>
+          <label>description_key (optional)
+            <input id="feed_description_key" placeholder="summary" />
+          </label>
+          <label>content_key (optional)
+            <input id="feed_content_key" placeholder="content.0.value" />
+          </label>
+          <label>category_key (optional)
+            <input id="feed_category_key" placeholder="tags.0.term" />
+          </label>
+        </div>
+        <div class="row">
+          <button class="primary" id="feed_save">Save Feed</button>
+          <button id="feed_test">Test Feed</button>
+        </div>
+        <pre id="feed_test_out" class="pre"></pre>
+      </div>
+
+      <div class="card">
+        <h2>Feeds</h2>
+        <div id="feeds_list"></div>
+      </div>
+    </section>
+
+    <section id="models" class="panel">
+      <div class="card">
+        <h2>Stage routing</h2>
+        <p class="muted">Choose Together or OpenRouter per stage. Model IDs must match the provider.</p>
+        <div id="models_form"></div>
+        <button class="primary" id="models_save">Save model routing</button>
+      </div>
+    </section>
+
+    <section id="categories" class="panel">
+      <div class="card">
+        <h2>Categories (from Directus)</h2>
+        <p class="muted">Read-only. Edit in Directus.</p>
+        <div id="categories_table"></div>
+      </div>
+    </section>
+
+    <footer class="muted small">
+      <p>Protected by Basic Auth. User: <code>settings@gadgeek.in</code></p>
+    </footer>
+  </div>
+
+  <script src="/static/settings.js"></script>
+</body>
+</html>

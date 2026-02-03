@@ -1,263 +1,556 @@
-"""
-common.py — All shared/common functions & helpers live here.
-
-This module intentionally centralizes:
-- logging
-- HTTP + retry
-- URL normalization + hashing
-- RSS parsing helpers
-- Directus REST helpers
-- Slack message helpers
-- SQLite state store (dedupe + caches)
-- Search helpers (LangSearch, Brave, NewsData)
-- Text extraction
-- Image selection (Unsplash/Pexels/Pixabay/Wikimedia/Openverse)
-
-Per project requirement:
-- credentials are in config.py
-- common/shared code is here
-"""
-
-from __future__ import annotations
-
+import base64
+import datetime as _dt
+import functools
+import hmac
+import hashlib
 import json
+import logging
 import os
 import re
-import time
-import math
-import hashlib
-import logging
 import sqlite3
-import datetime as dt
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from urllib.parse import urlencode, urlparse
 
 import requests
-from bs4 import BeautifulSoup
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from cachetools import TTLCache
-
 import feedparser
 
-try:
-    import trafilatura
-except Exception:
-    trafilatura = None
+from config import SETTINGS_DB_PATH
 
-from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
+LOG = logging.getLogger("technews")
 
-import config
-
-
-# ---------------------------
+# -------------------------
 # Logging
-# ---------------------------
+# -------------------------
+def setup_logging(level: str = "INFO") -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
 
-def setup_logger(name: str = "technews", level: int = logging.INFO) -> logging.Logger:
-    logger = logging.getLogger(name)
-    if logger.handlers:
-        return logger
-    logger.setLevel(level)
-    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
+# -------------------------
+# SQLite settings store
+# -------------------------
 
-    # Optional file log
-    os.makedirs(config.DATA_DIR, exist_ok=True)
-    fh = logging.FileHandler(os.path.join(config.DATA_DIR, "app.log"), encoding="utf-8")
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-    return logger
+DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 
+CREATE TABLE IF NOT EXISTS rss_feeds (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  url TEXT NOT NULL UNIQUE,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  category_hint TEXT,
+  title_key TEXT,
+  description_key TEXT,
+  content_key TEXT,
+  category_key TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 
-log = setup_logger()
+CREATE TABLE IF NOT EXISTS model_routes (
+  stage TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  temperature REAL,
+  max_tokens INTEGER,
+  updated_at TEXT NOT NULL
+);
 
+CREATE INDEX IF NOT EXISTS idx_rss_enabled ON rss_feeds(enabled);
+"""
 
-# ---------------------------
-# State Store (SQLite)
-# ---------------------------
-
-class StateStore:
-    """
-    Small SQLite-based store for:
-      - fingerprint dedupe (seen items, published, rejected)
-      - HTML/text cache for URLs
-      - publish counters and last publish time
-    """
-
-    def __init__(self, db_path: str):
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self.db_path = db_path
-        self._init()
-
-    def _conn(self):
-        return sqlite3.connect(self.db_path, timeout=30)
-
-    def _init(self):
-        with self._conn() as con:
-            cur = con.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS fingerprints(
-                    fp TEXT PRIMARY KEY,
-                    kind TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS url_cache(
-                    url TEXT PRIMARY KEY,
-                    fetched_at TEXT NOT NULL,
-                    text TEXT NOT NULL
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS kv(
-                    k TEXT PRIMARY KEY,
-                    v TEXT NOT NULL
-                )
-            """)
-            con.commit()
-
-    def has_fp(self, fp: str) -> bool:
-        with self._conn() as con:
-            cur = con.cursor()
-            cur.execute("SELECT 1 FROM fingerprints WHERE fp=? LIMIT 1", (fp,))
-            return cur.fetchone() is not None
-
-    def put_fp(self, fp: str, kind: str):
-        with self._conn() as con:
-            cur = con.cursor()
-            cur.execute(
-                "INSERT OR REPLACE INTO fingerprints(fp, kind, created_at) VALUES (?,?,?)",
-                (fp, kind, utcnow_iso()),
-            )
-            con.commit()
-
-    def get_cached_text(self, url: str, max_age_hours: int = 72) -> Optional[str]:
-        with self._conn() as con:
-            cur = con.cursor()
-            cur.execute("SELECT fetched_at, text FROM url_cache WHERE url=? LIMIT 1", (url,))
-            row = cur.fetchone()
-            if not row:
-                return None
-            fetched_at, text = row
-            try:
-                t = dt.datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
-            except Exception:
-                return None
-            age = (dt.datetime.now(dt.timezone.utc) - t).total_seconds() / 3600.0
-            if age > max_age_hours:
-                return None
-            return text
-
-    def set_cached_text(self, url: str, text: str):
-        with self._conn() as con:
-            cur = con.cursor()
-            cur.execute(
-                "INSERT OR REPLACE INTO url_cache(url, fetched_at, text) VALUES (?,?,?)",
-                (url, utcnow_iso(), text),
-            )
-            con.commit()
-
-    def kv_get(self, k: str) -> Optional[str]:
-        with self._conn() as con:
-            cur = con.cursor()
-            cur.execute("SELECT v FROM kv WHERE k=? LIMIT 1", (k,))
-            row = cur.fetchone()
-            return row[0] if row else None
-
-    def kv_set(self, k: str, v: str):
-        with self._conn() as con:
-            cur = con.cursor()
-            cur.execute("INSERT OR REPLACE INTO kv(k, v) VALUES (?,?)", (k, v))
-            con.commit()
-
-
-state = StateStore(config.STATE_DB_PATH)
-
-
-# ---------------------------
-# Time / formatting
-# ---------------------------
-
-def utcnow_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-def parse_time_hhmm(s: str) -> Tuple[int, int]:
-    m = re.match(r"^(\d{1,2}):(\d{2})$", s.strip())
-    if not m:
-        raise ValueError(f"Invalid time string: {s}")
-    return int(m.group(1)), int(m.group(2))
-
-def in_publish_window(now_local: dt.datetime, start_hhmm: str, end_hhmm: str) -> bool:
-    sh, sm = parse_time_hhmm(start_hhmm)
-    eh, em = parse_time_hhmm(end_hhmm)
-    start = now_local.replace(hour=sh, minute=sm, second=0, microsecond=0)
-    end = now_local.replace(hour=eh, minute=em, second=0, microsecond=0)
-    return start <= now_local <= end
-
-def word_count(text: str) -> int:
-    return len(re.findall(r"\b\w+\b", text or ""))
-
-
-# ---------------------------
-# URL normalization / hashing
-# ---------------------------
-
-_TRACKING_KEYS = {
-    "utm_source","utm_medium","utm_campaign","utm_term","utm_content",
-    "gclid","fbclid","mc_cid","mc_eid","ref","source"
+DEFAULTS_SETTINGS: Dict[str, str] = {
+    # endpoints
+    "directus_url": "",
+    "directus_token": "",
+    "directus_leads_collection": "news_leads",
+    "directus_articles_collection": "Articles",
+    "directus_categories_collection": "categories",
+    # slack
+    "slack_bot_token": "",
+    "slack_signing_secret": "",
+    "slack_channel_id": "",
+    # api keys
+    "tavily_api_key": "",
+    "together_api_key": "",
+    "openrouter_api_key": "",
+    # runtime
+    "http_timeout": "30",
+    "user_agent": "Mozilla/5.0 (compatible; TechNewsAutomation/1.0; +https://bot.gadgeek.in/settings)",
+    "publish_interval_minutes": "20",
+    "scout_interval_minutes": "30",
+    # pipeline options
+    "prefer_extracted_image": "1",  # 1=true
+    "image_model": "black-forest-labs/FLUX.1-schnell",
+    "image_response_format": "url",  # url or base64
 }
 
-def canonicalize_url(url: str) -> str:
-    if not url:
-        return ""
-    url = url.strip()
+DEFAULT_MODEL_ROUTES = {
+    "generation": {"provider": "together", "model": "deepseek-ai/DeepSeek-V3.1", "temperature": 0.6, "max_tokens": 2200},
+    "humanize":   {"provider": "together", "model": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo", "temperature": 0.7, "max_tokens": 2200},
+    "seo":        {"provider": "together", "model": "meta-llama/Llama-3.2-3B-Instruct-Turbo", "temperature": 0.4, "max_tokens": 900},
+}
+
+def _now_iso() -> str:
+    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def _db_path() -> str:
+    # Ensure parent dir exists
+    p = os.path.join(os.getcwd(), SETTINGS_DB_PATH)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    return p
+
+def init_db() -> None:
+    path = _db_path()
+    con = sqlite3.connect(path)
     try:
-        p = urlparse(url)
+        con.executescript(DB_SCHEMA)
+        # defaults settings
+        cur = con.cursor()
+        for k, v in DEFAULTS_SETTINGS.items():
+            cur.execute("INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES (?, ?, ?)", (k, v, _now_iso()))
+        # defaults model routes
+        for stage, cfg in DEFAULT_MODEL_ROUTES.items():
+            cur.execute(
+                "INSERT OR IGNORE INTO model_routes(stage, provider, model, temperature, max_tokens, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (stage, cfg["provider"], cfg["model"], cfg.get("temperature"), cfg.get("max_tokens"), _now_iso()),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+def _with_con():
+    return sqlite3.connect(_db_path())
+
+def get_setting(key: str, default: Optional[str] = None) -> str:
+    con = _with_con()
+    try:
+        cur = con.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = cur.fetchone()
+        if row:
+            return row[0]
+        return default if default is not None else ""
+    finally:
+        con.close()
+
+def set_setting(key: str, value: str) -> None:
+    con = _with_con()
+    try:
+        con.execute(
+            "INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, value, _now_iso()),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+def list_settings() -> Dict[str, str]:
+    con = _with_con()
+    try:
+        rows = con.execute("SELECT key, value FROM settings").fetchall()
+        return {k: v for k, v in rows}
+    finally:
+        con.close()
+
+def list_feeds() -> List[Dict[str, Any]]:
+    con = _with_con()
+    try:
+        rows = con.execute(
+            "SELECT id, url, enabled, category_hint, title_key, description_key, content_key, category_key, created_at, updated_at "
+            "FROM rss_feeds ORDER BY id DESC"
+        ).fetchall()
+        keys = ["id","url","enabled","category_hint","title_key","description_key","content_key","category_key","created_at","updated_at"]
+        out = []
+        for r in rows:
+            d = dict(zip(keys, r))
+            d["enabled"] = bool(d["enabled"])
+            out.append(d)
+        return out
+    finally:
+        con.close()
+
+def upsert_feed(feed: Dict[str, Any]) -> int:
+    # feed must contain url
+    con = _with_con()
+    try:
+        now = _now_iso()
+        cur = con.cursor()
+        cur.execute("SELECT id FROM rss_feeds WHERE url = ?", (feed["url"],))
+        row = cur.fetchone()
+        if row:
+            feed_id = row[0]
+            cur.execute(
+                "UPDATE rss_feeds SET enabled=?, category_hint=?, title_key=?, description_key=?, content_key=?, category_key=?, updated_at=? WHERE id=?",
+                (
+                    1 if feed.get("enabled", True) else 0,
+                    feed.get("category_hint"),
+                    feed.get("title_key"),
+                    feed.get("description_key"),
+                    feed.get("content_key"),
+                    feed.get("category_key"),
+                    now,
+                    feed_id,
+                ),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO rss_feeds(url, enabled, category_hint, title_key, description_key, content_key, category_key, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    feed["url"],
+                    1 if feed.get("enabled", True) else 0,
+                    feed.get("category_hint"),
+                    feed.get("title_key"),
+                    feed.get("description_key"),
+                    feed.get("content_key"),
+                    feed.get("category_key"),
+                    now,
+                    now,
+                ),
+            )
+            feed_id = cur.lastrowid
+        con.commit()
+        return int(feed_id)
+    finally:
+        con.close()
+
+def delete_feed(feed_id: int) -> None:
+    con = _with_con()
+    try:
+        con.execute("DELETE FROM rss_feeds WHERE id = ?", (feed_id,))
+        con.commit()
+    finally:
+        con.close()
+
+def get_model_routes() -> Dict[str, Dict[str, Any]]:
+    con = _with_con()
+    try:
+        rows = con.execute("SELECT stage, provider, model, temperature, max_tokens FROM model_routes").fetchall()
+        out = {}
+        for stage, provider, model, temp, max_tokens in rows:
+            out[stage] = {"provider": provider, "model": model, "temperature": temp, "max_tokens": max_tokens}
+        return out
+    finally:
+        con.close()
+
+def set_model_route(stage: str, provider: str, model: str, temperature: Optional[float], max_tokens: Optional[int]) -> None:
+    con = _with_con()
+    try:
+        con.execute(
+            "INSERT INTO model_routes(stage, provider, model, temperature, max_tokens, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(stage) DO UPDATE SET provider=excluded.provider, model=excluded.model, temperature=excluded.temperature, max_tokens=excluded.max_tokens, updated_at=excluded.updated_at",
+            (stage, provider, model, temperature, max_tokens, _now_iso()),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+# -------------------------
+# HTTP helpers
+# -------------------------
+
+class TransientHTTPError(RuntimeError):
+    pass
+
+def http_timeout() -> int:
+    try:
+        return int(float(get_setting("http_timeout", "30")))
     except Exception:
-        return url
-    # strip fragments
-    p = p._replace(fragment="")
-    # normalize netloc to lowercase
-    netloc = p.netloc.lower()
-    # remove default ports
-    netloc = re.sub(r":(80|443)$", "", netloc)
-    # strip tracking query params
-    q = []
-    for k, v in parse_qsl(p.query, keep_blank_values=True):
-        if k.lower() in _TRACKING_KEYS:
-            continue
-        q.append((k, v))
-    query = urlencode(q, doseq=True)
-    # normalize path (remove trailing slash except root)
-    path = p.path or "/"
-    if path != "/" and path.endswith("/"):
-        path = path[:-1]
-    return urlunparse((p.scheme or "https", netloc, path, p.params, query, ""))
+        return 30
 
-def normalize_title(title: str) -> str:
-    t = (title or "").strip().lower()
-    t = re.sub(r"\s+", " ", t)
-    return t
+def default_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    h = {
+        "User-Agent": get_setting("user_agent", DEFAULTS_SETTINGS["user_agent"]),
+        "Accept": "application/json, text/plain, */*",
+    }
+    if extra:
+        h.update(extra)
+    return h
 
-def sha256_hex(s: str) -> str:
-    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
+def request_with_retry(method: str, url: str, headers: Optional[Dict[str, str]] = None, json_body: Any = None, data: Any = None, params: Dict[str, Any] = None, timeout: Optional[int] = None, max_attempts: int = 4) -> requests.Response:
+    timeout = timeout or http_timeout()
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.request(
+                method=method,
+                url=url,
+                headers=headers or default_headers(),
+                json=json_body,
+                data=data,
+                params=params,
+                timeout=timeout,
+            )
+            if resp.status_code in (429, 500, 502, 503, 504):
+                raise TransientHTTPError(f"HTTP {resp.status_code} for {url}")
+            return resp
+        except (requests.RequestException, TransientHTTPError) as e:
+            last_exc = e
+            sleep_s = min(2 ** attempt, 12) + (0.1 * attempt)
+            LOG.warning("HTTP retry %s/%s for %s due to %s; sleeping %.1fs", attempt, max_attempts, url, e, sleep_s)
+            time.sleep(sleep_s)
+    raise RuntimeError(f"HTTP request failed after retries: {url} ({last_exc})")
 
-def compute_fingerprint(title: str, url: str) -> str:
-    return sha256_hex(f"{normalize_title(title)}|{canonicalize_url(url)}")
+# -------------------------
+# Basic Auth for /settings
+# -------------------------
 
-def slugify(text: str, max_len: int = 80) -> str:
-    s = (text or "").lower().strip()
-    s = re.sub(r"[’']", "", s)
-    s = re.sub(r"[^a-z0-9]+", "-", s)
-    s = re.sub(r"-{2,}", "-", s).strip("-")
-    if len(s) > max_len:
-        s = s[:max_len].rstrip("-")
-    return s or sha256_hex(text)[:12]
+BASIC_AUTH_USER = "settings@gadgeek.in"
+BASIC_AUTH_PASS = "HelloGG@$44"
+
+def _basic_auth_ok(auth_header: str) -> bool:
+    if not auth_header or not auth_header.lower().startswith("basic "):
+        return False
+    try:
+        raw = base64.b64decode(auth_header.split(" ", 1)[1]).decode("utf-8")
+        user, pw = raw.split(":", 1)
+        return user == BASIC_AUTH_USER and pw == BASIC_AUTH_PASS
+    except Exception:
+        return False
+
+def require_basic_auth(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        from flask import request, Response
+        if _basic_auth_ok(request.headers.get("Authorization", "")):
+            return fn(*args, **kwargs)
+        return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="settings"'})
+    return wrapper
+
+# -------------------------
+# Slack
+# -------------------------
+
+def slack_signing_secret() -> str:
+    return get_setting("slack_signing_secret", "")
+
+def slack_bot_token() -> str:
+    return get_setting("slack_bot_token", "")
+
+def slack_channel_id() -> str:
+    return get_setting("slack_channel_id", "")
+
+def verify_slack_signature(headers: Dict[str, str], body: bytes) -> bool:
+    secret = slack_signing_secret()
+    if not secret:
+        # If not configured yet, allow (but log).
+        LOG.warning("Slack signing secret not set; skipping signature verification.")
+        return True
+    timestamp = headers.get("X-Slack-Request-Timestamp", "")
+    sig = headers.get("X-Slack-Signature", "")
+    if not timestamp or not sig:
+        return False
+    try:
+        ts = int(timestamp)
+        if abs(time.time() - ts) > 60 * 5:
+            return False
+    except Exception:
+        return False
+    basestring = b"v0:" + timestamp.encode("utf-8") + b":" + body
+    my_sig = "v0=" + hmac.new(secret.encode("utf-8"), basestring, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(my_sig, sig)
+
+def slack_api(method: str, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    token = slack_bot_token()
+    if not token:
+        raise RuntimeError("Slack bot token not configured in /settings.")
+    url = f"https://slack.com/api/{endpoint}"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
+    resp = request_with_retry(method, url, headers=headers, json_body=payload, timeout=20)
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Slack API error: {data}")
+    return data
+
+def slack_post_lead(title: str, category_name: str, lead_id: int) -> Tuple[str, str]:
+    """Post to default channel. Returns (channel, ts)."""
+    channel = slack_channel_id()
+    if not channel:
+        raise RuntimeError("Slack channel id not configured in /settings.")
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*\n_{category_name}_"}},
+        {"type": "actions", "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "Approve ✅"}, "style": "primary", "action_id": "approve", "value": str(lead_id)},
+            {"type": "button", "text": {"type": "plain_text", "text": "Urgent ⚡"}, "style": "danger", "action_id": "urgent", "value": str(lead_id)},
+            {"type": "button", "text": {"type": "plain_text", "text": "Reject ❌"}, "action_id": "reject", "value": str(lead_id)},
+        ]},
+    ]
+    data = slack_api("POST", "chat.postMessage", {"channel": channel, "text": title, "blocks": blocks})
+    return data["channel"], data["ts"]
+
+def slack_update_published(channel: str, ts: str, title: str) -> None:
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*\n_Published ✅_"}}]
+    slack_api("POST", "chat.update", {"channel": channel, "ts": ts, "text": f"{title} (Published)", "blocks": blocks})
+
+def slack_ephemeral(response_url: str, text: str) -> None:
+    try:
+        request_with_retry("POST", response_url, headers={"Content-Type": "application/json"}, json_body={"response_type": "ephemeral", "text": text}, timeout=10, max_attempts=2)
+    except Exception as e:
+        LOG.warning("Failed to send ephemeral response to Slack: %s", e)
+
+# -------------------------
+# Directus
+# -------------------------
+
+def directus_url(path: str) -> str:
+    base = get_setting("directus_url", "").rstrip("/")
+    if not base:
+        raise RuntimeError("Directus URL not configured in /settings.")
+    if not path.startswith("/"):
+        path = "/" + path
+    return base + path
+
+def directus_headers() -> Dict[str, str]:
+    token = get_setting("directus_token", "")
+    if not token:
+        raise RuntimeError("Directus token not configured in /settings.")
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+def directus_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    resp = request_with_retry("GET", directus_url(path), headers=directus_headers(), params=params, timeout=30)
+    return resp.json()
+
+def directus_post(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    resp = request_with_retry("POST", directus_url(path), headers=directus_headers(), json_body=body, timeout=45)
+    return resp.json()
+
+def directus_patch(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    resp = request_with_retry("PATCH", directus_url(path), headers=directus_headers(), json_body=body, timeout=45)
+    return resp.json()
+
+def leads_collection() -> str:
+    return get_setting("directus_leads_collection", "news_leads")
+
+def articles_collection() -> str:
+    return get_setting("directus_articles_collection", "Articles")
+
+def categories_collection() -> str:
+    return get_setting("directus_categories_collection", "categories")
+
+def lead_exists_by_url(source_url: str) -> bool:
+    col = leads_collection()
+    params = {"filter[source_url][_eq]": source_url, "limit": 1, "fields": "id"}
+    data = directus_get(f"/items/{col}", params=params)
+    return bool(data.get("data"))
+
+def create_lead(title: str, source_url: str, category_slug: str) -> int:
+    col = leads_collection()
+    body = {"title": title, "source_url": source_url, "category_slug": category_slug, "status": "pending"}
+    data = directus_post(f"/items/{col}", body)
+    return int(data["data"]["id"])
+
+def update_lead_status(lead_id: int, status: str) -> None:
+    col = leads_collection()
+    directus_patch(f"/items/{col}/{lead_id}", {"status": status})
+
+def get_lead(lead_id: int) -> Dict[str, Any]:
+    col = leads_collection()
+    data = directus_get(f"/items/{col}/{lead_id}")
+    return data["data"]
+
+def list_one_approved_lead_newest() -> Optional[Dict[str, Any]]:
+    col = leads_collection()
+    params = {
+        "filter[status][_eq]": "approved",
+        "limit": 1,
+        "sort": "-id",
+    }
+    data = directus_get(f"/items/{col}", params=params)
+    items = data.get("data") or []
+    return items[0] if items else None
+
+def get_categories() -> List[Dict[str, Any]]:
+    col = categories_collection()
+    params = {"limit": 200, "sort": "priority", "filter[enabled][_neq]": False}
+    data = directus_get(f"/items/{col}", params=params)
+    items = data.get("data") or []
+    # normalize
+    out = []
+    for c in items:
+        out.append({
+            "id": c.get("id"),
+            "slug": c.get("slug") or c.get("category_slug") or c.get("key"),
+            "name": c.get("name") or c.get("title") or (c.get("slug") or ""),
+            "priority": int(c.get("priority") or 999),
+            "keywords": c.get("keywords") or [],
+            "posts_per_scout": int(c.get("posts_per_scout") or c.get("posts_per_category") or 0),
+            "enabled": bool(c.get("enabled", True)),
+        })
+    # keep enabled and with slug
+    out = [c for c in out if c["slug"] and c["enabled"] and c["posts_per_scout"] > 0]
+    # sort by priority then name
+    out.sort(key=lambda x: (x["priority"], x["name"]))
+    return out
+
+# -------------------------
+# RSS parsing with selectors
+# -------------------------
+
+def _get_by_path(obj: Any, path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    cur = obj
+    for part in path.split("."):
+        if cur is None:
+            return None
+        if isinstance(cur, (list, tuple)):
+            try:
+                idx = int(part)
+            except ValueError:
+                return None
+            if idx < 0 or idx >= len(cur):
+                return None
+            cur = cur[idx]
+        elif isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
+            # feedparser objects allow attribute access via dict-like
+            try:
+                cur = cur.get(part)  # type: ignore
+            except Exception:
+                cur = getattr(cur, part, None)
+    if cur is None:
+        return None
+    if isinstance(cur, (dict, list)):
+        try:
+            return json.dumps(cur, ensure_ascii=False)
+        except Exception:
+            return str(cur)
+    return str(cur)
+
+def parse_feed(url: str) -> feedparser.FeedParserDict:
+    # feedparser fetches itself; set UA via requests? Not easily. We'll fetch with requests for consistency.
+    resp = request_with_retry("GET", url, headers=default_headers(), timeout=http_timeout())
+    return feedparser.parse(resp.content)
+
+def extract_entry_fields(entry: Any, feed_cfg: Dict[str, Any]) -> Dict[str, str]:
+    # auto extraction
+    title = _get_by_path(entry, feed_cfg.get("title_key")) or getattr(entry, "title", None) or entry.get("title", "")
+    link = entry.get("link") or getattr(entry, "link", "")
+    # description / summary
+    desc = _get_by_path(entry, feed_cfg.get("description_key")) or entry.get("summary") or entry.get("description") or ""
+    # content
+    content = _get_by_path(entry, feed_cfg.get("content_key"))
+    if not content:
+        if entry.get("content") and isinstance(entry["content"], list):
+            content = entry["content"][0].get("value") or entry["content"][0].get("content")
+    if not content:
+        content = ""
+    # category
+    cat = _get_by_path(entry, feed_cfg.get("category_key"))
+    if not cat:
+        # try tags
+        tags = entry.get("tags")
+        if tags and isinstance(tags, list):
+            cat = tags[0].get("term") or tags[0].get("label")
+    return {"title": str(title).strip(), "link": str(link).strip(), "description": str(desc).strip(), "content": str(content).strip(), "category": (cat or "").strip()}
 
 def domain_of(url: str) -> str:
     try:
@@ -265,613 +558,350 @@ def domain_of(url: str) -> str:
     except Exception:
         return ""
 
+# -------------------------
+# Tavily
+# -------------------------
 
-# ---------------------------
-# HTTP with retry
-# ---------------------------
-
-_session = requests.Session()
-_session.headers.update({"User-Agent": config.USER_AGENT})
-
-class TransientHTTPError(Exception):
-    pass
-
-def _is_retryable_status(code: int) -> bool:
-    return code in {408, 429, 500, 502, 503, 504}
-
-@retry(
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=1, min=1, max=12),
-    retry=retry_if_exception_type((requests.RequestException, TransientHTTPError)),
-)
-def http_request(method: str, url: str, *,
-                 headers: Optional[Dict[str,str]] = None,
-                 params: Optional[Dict[str,Any]] = None,
-                 json_body: Optional[Dict[str,Any]] = None,
-                 data: Any = None,
-                 timeout: int = config.HTTP_TIMEOUT) -> requests.Response:
-    h = dict(_session.headers)
-    if headers:
-        h.update(headers)
-    resp = _session.request(method=method, url=url, headers=h, params=params, json=json_body, data=data, timeout=timeout)
-    if _is_retryable_status(resp.status_code):
-        raise TransientHTTPError(f"HTTP {resp.status_code} for {url}")
-    return resp
-
-
-# ---------------------------
-# RSS ingestion
-# ---------------------------
-
-def fetch_rss_entries(feed_url: str, limit: int = 50) -> List[Dict[str,Any]]:
-    parsed = feedparser.parse(feed_url)
-    out: List[Dict[str,Any]] = []
-    for e in parsed.entries[:limit]:
-        title = (e.get("title") or "").strip()
-        link = (e.get("link") or "").strip()
-        summary = (e.get("summary") or e.get("description") or "").strip()
-        # strip HTML from summary
-        if summary and ("<" in summary and ">" in summary):
-            summary = BeautifulSoup(summary, "html.parser").get_text(" ", strip=True)
-        published = e.get("published") or e.get("updated") or ""
-        out.append({
-            "title": title,
-            "url": link,
-            "snippet": summary[:400],
-            "published_raw": published,
-            "source_feed": feed_url
-        })
-    return out
-
-
-# ---------------------------
-# Category classification
-# ---------------------------
-
-def selected_categories() -> Dict[str,Dict[str,Any]]:
-    cats = config.FEATURED_CATEGORIES.copy()
-    if not config.INCLUDE_TIER3:
-        cats = {k:v for k,v in cats.items() if v.get("priority", 9) <= 2}
-    if config.SELECTED_CATEGORY_SLUGS:
-        keep = set(config.SELECTED_CATEGORY_SLUGS)
-        cats = {k:v for k,v in cats.items() if k in keep}
-    return cats
-
-def score_category(text: str, category_keywords: List[str]) -> Tuple[int,List[str]]:
-    t = " " + (text or "").lower() + " "
-    score = 0
-    hits: List[str] = []
-    for kw in category_keywords:
-        kw_norm = kw.lower()
-        if kw_norm.strip() == "":
-            continue
-        if kw_norm in t:
-            # longer keywords get slightly higher weight
-            w = 2 if len(kw_norm) >= 10 else 1
-            score += w
-            if len(hits) < 12:
-                hits.append(kw_norm.strip())
-    return score, hits
-
-def classify_item(title: str, snippet: str) -> Tuple[Optional[str], int, List[str]]:
-    cats = selected_categories()
-    base_text = f"{title} {snippet}".strip()
-    best_slug = None
-    best_score = 0
-    best_hits: List[str] = []
-    for slug, meta in cats.items():
-        s, hits = score_category(base_text, meta.get("keywords", []))
-        # priority boost
-        pri = int(meta.get("priority", 3))
-        if pri == 1:
-            s = int(s * 1.25)
-        elif pri == 2:
-            s = int(s * 1.10)
-        if s > best_score:
-            best_slug, best_score, best_hits = slug, s, hits
-    # threshold: require at least a small match
-    if best_score < 2:
-        return None, best_score, best_hits
-    return best_slug, best_score, best_hits
-
-
-# ---------------------------
-# Directus API
-# ---------------------------
-
-def directus_headers() -> Dict[str,str]:
-    return {"Authorization": f"Bearer {config.DIRECTUS_TOKEN}", "Content-Type": "application/json"}
-
-def directus_url(path: str) -> str:
-    base = config.DIRECTUS_URL.rstrip("/")
-    if not path.startswith("/"):
-        path = "/" + path
-    return base + path
-
-def directus_get(path: str, params: Optional[Dict[str,Any]]=None) -> Dict[str,Any]:
-    resp = http_request("GET", directus_url(path), headers=directus_headers(), params=params)
-    if resp.status_code >= 300:
-        raise RuntimeError(f"Directus GET failed: {resp.status_code} {resp.text[:500]}")
+def tavily_search(query: str, max_results: int = 6) -> Dict[str, Any]:
+    key = get_setting("tavily_api_key", "")
+    if not key:
+        raise RuntimeError("Tavily API key not configured in /settings.")
+    url = "https://api.tavily.com/search"
+    payload = {
+        "api_key": key,
+        "query": query,
+        "search_depth": "basic",  # keep costs predictable
+        "max_results": max_results,
+        "include_answer": False,
+        "include_raw_content": False,
+    }
+    resp = request_with_retry("POST", url, headers={"Content-Type": "application/json"}, json_body=payload, timeout=30)
     return resp.json()
 
-def directus_post(path: str, body: Dict[str,Any]) -> Dict[str,Any]:
-    resp = http_request("POST", directus_url(path), headers=directus_headers(), json_body=body)
-    if resp.status_code >= 300:
-        raise RuntimeError(f"Directus POST failed: {resp.status_code} {resp.text[:500]}")
+def tavily_extract(urls: List[str]) -> Dict[str, Any]:
+    key = get_setting("tavily_api_key", "")
+    if not key:
+        raise RuntimeError("Tavily API key not configured in /settings.")
+    url = "https://api.tavily.com/extract"
+    payload = {
+        "api_key": key,
+        "urls": urls,
+        "extract_depth": "basic",
+        "include_images": True,
+    }
+    resp = request_with_retry("POST", url, headers={"Content-Type": "application/json"}, json_body=payload, timeout=60)
     return resp.json()
 
-def directus_patch(path: str, body: Dict[str,Any]) -> Dict[str,Any]:
-    resp = http_request("PATCH", directus_url(path), headers=directus_headers(), json_body=body)
-    if resp.status_code >= 300:
-        raise RuntimeError(f"Directus PATCH failed: {resp.status_code} {resp.text[:500]}")
-    return resp.json()
-
-def _directus_filter_params(filters: Dict[str,Any]) -> Dict[str,Any]:
-    """
-    Converts a nested filter dict into Directus query params.
-
-    Example:
-      {"status":{"_eq":"queued"}, "id":{"_eq":123}}
-    -> {"filter[status][_eq]":"queued", "filter[id][_eq]":123}
-    """
-    out: Dict[str,Any] = {}
-
-    def rec(prefix: str, obj: Any):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                rec(f"{prefix}[{k}]", v)
-        else:
-            out[prefix] = obj
-
-    for field, expr in (filters or {}).items():
-        rec(f"filter[{field}]", expr)
-    return out
-
-def directus_find_items(collection: str, filters: Dict[str,Any], fields: Optional[List[str]]=None, limit: int=5, sort: Optional[str]=None) -> List[Dict[str,Any]]:
-    params: Dict[str,Any] = {"limit": limit}
-    if fields:
-        params["fields"] = ",".join(fields)
-    if sort:
-        params["sort"] = sort
-    params.update(_directus_filter_params(filters))
-    data = directus_get(f"/items/{collection}", params=params)
-    return data.get("data", []) or []
-
-def directus_item_exists_by_filters(collection: str, filters: Dict[str,Any]) -> bool:
-    items = directus_find_items(collection, filters, fields=["id"], limit=1)
-    return len(items) > 0
-
-def directus_create_lead(lead: Dict[str,Any]) -> Dict[str,Any]:
-    return directus_post(f"/items/{config.LEADS_COLLECTION}", lead).get("data")
-
-def directus_update_lead(lead_id: Any, patch: Dict[str,Any]) -> Dict[str,Any]:
-    return directus_patch(f"/items/{config.LEADS_COLLECTION}/{lead_id}", patch).get("data")
-
-def directus_create_article(article: Dict[str,Any]) -> Dict[str,Any]:
-    return directus_post(f"/items/{config.ARTICLES_COLLECTION}", article).get("data")
-
-
-# ---------------------------
-# Slack helpers
-# ---------------------------
-
-_slack_client: Optional[WebClient] = None
-
-def slack_client() -> Optional[WebClient]:
-    global _slack_client
-    if not config.SLACK_BOT_TOKEN or config.SLACK_BOT_TOKEN.startswith("xoxb-YOUR"):
-        return None
-    if _slack_client is None:
-        _slack_client = WebClient(token=config.SLACK_BOT_TOKEN)
-    return _slack_client
-
-def slack_post_candidate(lead_id: Any, title: str, url: str, category_slug: str, score: int, matched_keywords: List[str]) -> Optional[Tuple[str,str]]:
-    """
-    Posts an approval card to Slack and returns (channel, ts).
-    """
-    client = slack_client()
-    if not client:
-        return None
-
-    cat = config.FEATURED_CATEGORIES.get(category_slug, {}).get("name", category_slug)
-    kw_preview = ", ".join(matched_keywords[:8]) if matched_keywords else "—"
-
-    blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": "📰 New Tech Story Candidate", "emoji": True}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*{escape_slack(title)}*\n<{url}|Open source link>"}},
-        {"type": "context", "elements": [
-            {"type": "mrkdwn", "text": f"*Category:* {escape_slack(cat)}  |  *Score:* {score}"},
-            {"type": "mrkdwn", "text": f"*Keywords:* {escape_slack(kw_preview)}"}
-        ]},
-        {"type": "actions", "elements": [
-            {"type": "button", "text": {"type": "plain_text", "text": "✅ Approve", "emoji": True},
-             "style": "primary", "action_id": "approve_lead", "value": str(lead_id)},
-            {"type": "button", "text": {"type": "plain_text", "text": "🚀 Publish now", "emoji": True},
-             "action_id": "publish_now", "value": str(lead_id)},
-            {"type": "button", "text": {"type": "plain_text", "text": "❌ Reject", "emoji": True},
-             "style": "danger", "action_id": "reject_lead", "value": str(lead_id)}
-        ]}
-    ]
-
-    try:
-        resp = client.chat_postMessage(channel=config.SLACK_CHANNEL, text=title, blocks=blocks)
-        return resp["channel"], resp["ts"]
-    except SlackApiError as e:
-        log.error(f"Slack post failed: {e}")
-        return None
-
-def slack_update_message(channel: str, ts: str, text: str):
-    client = slack_client()
-    if not client:
-        return
-    try:
-        client.chat_update(channel=channel, ts=ts, text=text, blocks=[{"type":"section","text":{"type":"mrkdwn","text":text}}])
-    except SlackApiError as e:
-        log.error(f"Slack update failed: {e}")
-
-def escape_slack(s: str) -> str:
-    return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-
-
-# ---------------------------
-# Search helpers
-# ---------------------------
-
-# Cache searches to avoid repeated calls (5 minutes)
-_search_cache = TTLCache(maxsize=512, ttl=300)
-
-def langsearch_web_search(query: str, *, count: int = None, freshness: str = None, summary: bool = False) -> List[Dict[str,Any]]:
-    if not config.LANGSEARCH_API_KEY or config.LANGSEARCH_API_KEY.startswith("YOUR_"):
-        raise RuntimeError("LangSearch API key missing in config.py")
-    count = count or config.LANGSEARCH_RESULTS
-    freshness = freshness or config.LANGSEARCH_FRESHNESS
-    cache_key = f"ls:{query}:{count}:{freshness}:{int(summary)}"
-    if cache_key in _search_cache:
-        return _search_cache[cache_key]
-
-    url = "https://api.langsearch.com/v1/web-search"
-    headers = {"Authorization": f"Bearer {config.LANGSEARCH_API_KEY}", "Content-Type":"application/json"}
-    body = {"query": query, "count": int(count), "freshness": freshness, "summary": bool(summary)}
-    resp = http_request("POST", url, headers=headers, json_body=body)
-    if resp.status_code >= 300:
-        raise RuntimeError(f"LangSearch web-search failed: {resp.status_code} {resp.text[:500]}")
-    data = resp.json()
-    results = data.get("data", {}).get("webPages", {}).get("value") or data.get("webPages", {}).get("value") or []
-    norm = []
+def build_research_pack(title: str) -> Dict[str, Any]:
+    s = tavily_search(title, max_results=6)
+    results = s.get("results") or []
+    urls = []
     for r in results:
-        norm.append({
-            "title": r.get("name") or r.get("title") or "",
-            "url": r.get("url") or "",
-            "snippet": r.get("snippet") or "",
-            "summary": r.get("summary") or ""
-        })
-    _search_cache[cache_key] = norm
-    return norm
-
-def langsearch_rerank(query: str, docs: List[Dict[str,Any]], top_n: int = 6) -> List[Dict[str,Any]]:
-    if not config.LANGSEARCH_API_KEY or config.LANGSEARCH_API_KEY.startswith("YOUR_"):
-        raise RuntimeError("LangSearch API key missing in config.py")
-    if not docs:
-        return []
-    url = "https://api.langsearch.com/v1/rerank"
-    headers = {"Authorization": f"Bearer {config.LANGSEARCH_API_KEY}", "Content-Type":"application/json"}
-    documents = []
-    for d in docs[:50]:
-        # prefer summary if present else snippet
-        txt = (d.get("summary") or d.get("snippet") or d.get("title") or "").strip()
-        documents.append(txt)
-    body = {"model": "langsearch-reranker-v1", "query": query, "documents": documents, "top_n": int(top_n)}
-    resp = http_request("POST", url, headers=headers, json_body=body)
-    if resp.status_code >= 300:
-        raise RuntimeError(f"LangSearch rerank failed: {resp.status_code} {resp.text[:500]}")
-    data = resp.json()
-    results = data.get("data") or data.get("results") or []
-    # Expected: list of {"index": i, "relevance_score": x}
-    idxs = [r.get("index") for r in results if isinstance(r, dict) and r.get("index") is not None]
-    picked = []
-    for i in idxs:
-        if 0 <= i < len(docs):
-            picked.append(docs[i])
-    return picked or docs[:top_n]
-
-def brave_search(query: str, count: int = None) -> List[Dict[str,Any]]:
-    if not config.BRAVE_SEARCH_API_KEY:
-        raise RuntimeError("Brave Search API key missing in config.py")
-    count = count or config.BRAVE_RESULTS
-    url = config.BRAVE_SEARCH_ENDPOINT
-    headers = {"Accept": "application/json", "X-Subscription-Token": config.BRAVE_SEARCH_API_KEY}
-    params = {"q": query, "count": int(count)}
-    resp = http_request("GET", url, headers=headers, params=params)
-    if resp.status_code >= 300:
-        raise RuntimeError(f"Brave search failed: {resp.status_code} {resp.text[:500]}")
-    data = resp.json()
-    web = (data.get("web") or {}).get("results") or []
-    norm = []
-    for r in web:
-        norm.append({"title": r.get("title",""), "url": r.get("url",""), "snippet": r.get("description","")})
-    return norm
-
-def newsdata_discover(query: str, *, language: str = "en", country: str = "") -> List[Dict[str,Any]]:
-    if not config.NEWSDATA_API_KEY or config.NEWSDATA_API_KEY.startswith("YOUR_"):
-        raise RuntimeError("NewsData API key missing in config.py")
-    params = {"apikey": config.NEWSDATA_API_KEY, "q": query, "language": language}
-    if country:
-        params["country"] = country
-    resp = http_request("GET", config.NEWSDATA_ENDPOINT, params=params)
-    if resp.status_code >= 300:
-        raise RuntimeError(f"NewsData failed: {resp.status_code} {resp.text[:500]}")
-    data = resp.json()
-    results = data.get("results") or []
-    out = []
-    for r in results:
-        out.append({
-            "title": (r.get("title") or "").strip(),
-            "url": (r.get("link") or "").strip(),
-            "snippet": (r.get("description") or "").strip(),
-            "published_raw": (r.get("pubDate") or "").strip(),
-            "source": (r.get("source_id") or "").strip()
-        })
-    return out
-
-
-# ---------------------------
-# Text extraction
-# ---------------------------
-
-def fetch_url_text(url: str) -> str:
-    url = canonicalize_url(url)
-    cached = state.get_cached_text(url)
-    if cached:
-        return cached
-    resp = http_request("GET", url, timeout=config.HTTP_TIMEOUT)
-    html = resp.text or ""
-    text = extract_main_text(html, base_url=url)
-    if not text:
-        text = BeautifulSoup(html, "html.parser").get_text("\n", strip=True)
-    text = cleanup_text(text)
-    state.set_cached_text(url, text)
-    return text
-
-def extract_main_text(html: str, base_url: str = "") -> str:
-    if not html:
-        return ""
-    if trafilatura:
-        try:
-            downloaded = trafilatura.extract(html, url=base_url, include_comments=False, include_tables=False)
-            return downloaded or ""
-        except Exception:
-            pass
-    # fallback: best effort with BS4
-    soup = BeautifulSoup(html, "html.parser")
-    # remove scripts/styles
-    for tag in soup(["script","style","noscript","header","footer","nav","aside"]):
-        tag.decompose()
-    # heuristic: choose the longest <article> or <main>
-    candidates = []
-    for sel in ["article","main","section"]:
-        for node in soup.select(sel):
-            txt = node.get_text(" ", strip=True)
-            if len(txt) > 400:
-                candidates.append((len(txt), txt))
-    if candidates:
-        candidates.sort(reverse=True)
-        return candidates[0][1]
-    return soup.get_text(" ", strip=True)
-
-def cleanup_text(text: str) -> str:
-    t = (text or "").strip()
-    t = re.sub(r"\s+\n", "\n", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    t = re.sub(r"[ \t]{2,}", " ", t)
-    return t
-
-
-# ---------------------------
-# Source selection helpers
-# ---------------------------
-
-def pick_unique_domains(urls: List[str], max_items: int) -> List[str]:
-    seen = set()
-    out = []
-    for u in urls:
-        d = domain_of(u)
-        if not d or d in seen:
-            continue
-        seen.add(d)
-        out.append(u)
-        if len(out) >= max_items:
+        u = r.get("url")
+        if u and u not in urls:
+            urls.append(u)
+        if len(urls) >= 5:
             break
-    return out
+    e = tavily_extract(urls) if urls else {"results": []}
+    return {"query": title, "search": s, "extract": e, "urls": urls}
 
-
-# ---------------------------
-# Image helpers
-# ---------------------------
-
-def pick_image_for_query(query: str) -> Optional[Dict[str,Any]]:
-    """
-    Tries multiple providers and returns:
-      {url, provider, credit, alt}
-    """
-    q = (query or "").strip()
-    if not q:
-        return None
-
-    # Try Unsplash
-    if config.UNSPLASH_ACCESS_KEY:
-        img = unsplash_search(q)
-        if img:
-            return img
-
-    # Try Pexels
-    if config.PEXELS_API_KEY:
-        img = pexels_search(q)
-        if img:
-            return img
-
-    # Try Pixabay
-    if config.PIXABAY_API_KEY:
-        img = pixabay_search(q)
-        if img:
-            return img
-
-    # Try Openverse (no key)
-    img = openverse_search(q)
-    if img:
-        return img
-
-    # Try Wikimedia (no key)
-    img = wikimedia_search(q)
-    if img:
-        return img
-
+def pick_extracted_image(pack: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    # Tavily extract returns results with possibly "images"
+    extract = pack.get("extract") or {}
+    results = extract.get("results") or []
+    for r in results:
+        imgs = r.get("images") or []
+        if imgs and isinstance(imgs, list):
+            img = imgs[0]
+            img_url = img.get("url") if isinstance(img, dict) else None
+            if img_url:
+                src_url = r.get("url") or ""
+                dom = domain_of(src_url)
+                caption = img.get("caption") if isinstance(img, dict) else ""
+                credit = f"{dom}" if dom else "source"
+                return {"url": img_url, "credit": credit, "caption": caption or ""}
     return None
 
-def unsplash_search(query: str) -> Optional[Dict[str,Any]]:
-    url = "https://api.unsplash.com/search/photos"
-    params = {"query": query, "per_page": 1, "orientation": "landscape"}
-    headers = {"Authorization": f"Client-ID {config.UNSPLASH_ACCESS_KEY}"}
-    resp = http_request("GET", url, headers=headers, params=params)
-    data = resp.json()
-    results = data.get("results") or []
-    if not results:
+# -------------------------
+# LLM Providers: Together / OpenRouter
+# -------------------------
+
+TOGETHER_CHAT_URL = "https://api.together.xyz/v1/chat/completions"
+TOGETHER_IMAGES_URL = "https://api.together.xyz/v1/images/generations"
+
+OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+def _chat(provider: str, model: str, messages: List[Dict[str, str]], temperature: Optional[float], max_tokens: Optional[int]) -> str:
+    provider = (provider or "").lower().strip()
+    if provider == "together":
+        key = get_setting("together_api_key", "")
+        if not key:
+            raise RuntimeError("Together API key not configured in /settings.")
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        payload: Dict[str, Any] = {"model": model, "messages": messages}
+        if temperature is not None:
+            payload["temperature"] = float(temperature)
+        if max_tokens is not None:
+            payload["max_tokens"] = int(max_tokens)
+        resp = request_with_retry("POST", TOGETHER_CHAT_URL, headers=headers, json_body=payload, timeout=90, max_attempts=4)
+        data = resp.json()
+        return (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+    elif provider == "openrouter":
+        key = get_setting("openrouter_api_key", "")
+        if not key:
+            raise RuntimeError("OpenRouter API key not configured in /settings.")
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        payload = {"model": model, "messages": messages}
+        if temperature is not None:
+            payload["temperature"] = float(temperature)
+        if max_tokens is not None:
+            payload["max_tokens"] = int(max_tokens)
+        # Optional headers for OpenRouter ranking (safe defaults)
+        # Not adding extra headers that may break if absent.
+        resp = request_with_retry("POST", OPENROUTER_CHAT_URL, headers=headers, json_body=payload, timeout=90, max_attempts=4)
+        data = resp.json()
+        return (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+    else:
+        raise RuntimeError(f"Unknown provider: {provider}")
+
+def get_route(stage: str) -> Dict[str, Any]:
+    routes = get_model_routes()
+    if stage not in routes:
+        # fallback
+        return {"provider": "together", "model": "deepseek-ai/DeepSeek-V3.1", "temperature": 0.6, "max_tokens": 1800}
+    return routes[stage]
+
+def chat_stage(stage: str, messages: List[Dict[str, str]]) -> str:
+    route = get_route(stage)
+    return _chat(route["provider"], route["model"], messages, route.get("temperature"), route.get("max_tokens"))
+
+# -------------------------
+# Image generation (Together)
+# -------------------------
+
+def generate_image_together(prompt: str, width: int = 1024, height: int = 1024) -> Optional[Dict[str, str]]:
+    key = get_setting("together_api_key", "")
+    if not key:
         return None
-    r = results[0]
-    img_url = (r.get("urls") or {}).get("regular") or (r.get("urls") or {}).get("full")
-    user = (r.get("user") or {}).get("name") or "Unsplash contributor"
-    link = (r.get("links") or {}).get("html") or "https://unsplash.com"
-    return {"url": img_url, "provider": "unsplash", "credit": f"Photo by {user} (Unsplash) {link}", "alt": ""}
-
-def pexels_search(query: str) -> Optional[Dict[str,Any]]:
-    url = "https://api.pexels.com/v1/search"
-    headers = {"Authorization": config.PEXELS_API_KEY}
-    params = {"query": query, "per_page": 1, "orientation": "landscape"}
-    resp = http_request("GET", url, headers=headers, params=params)
+    model = get_setting("image_model", DEFAULTS_SETTINGS["image_model"])
+    response_format = get_setting("image_response_format", "url")
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "width": width,
+        "height": height,
+        "steps": 4,  # flux schnell
+        "n": 1,
+        "response_format": response_format,
+        "output_format": "jpeg",
+    }
+    resp = request_with_retry("POST", TOGETHER_IMAGES_URL, headers=headers, json_body=payload, timeout=120, max_attempts=3)
     data = resp.json()
-    photos = data.get("photos") or []
-    if not photos:
-        return None
-    p = photos[0]
-    img_url = (p.get("src") or {}).get("large2x") or (p.get("src") or {}).get("large")
-    photographer = p.get("photographer") or "Pexels contributor"
-    link = p.get("url") or "https://www.pexels.com"
-    return {"url": img_url, "provider": "pexels", "credit": f"Photo by {photographer} (Pexels) {link}", "alt": ""}
+    item = (data.get("data") or [{}])[0]
+    if response_format == "url" and item.get("url"):
+        return {"url": item["url"], "credit": "AI-generated (Together)", "caption": "AI-generated illustration"}
+    if response_format == "base64" and item.get("b64_json"):
+        # fallback: data URI
+        return {"url": f"data:image/jpeg;base64,{item['b64_json']}", "credit": "AI-generated (Together)", "caption": "AI-generated illustration"}
+    return None
 
-def pixabay_search(query: str) -> Optional[Dict[str,Any]]:
-    url = "https://pixabay.com/api/"
-    params = {"key": config.PIXABAY_API_KEY, "q": query, "image_type":"photo", "per_page": 3, "safesearch":"true"}
-    resp = http_request("GET", url, params=params)
-    data = resp.json()
-    hits = data.get("hits") or []
-    if not hits:
-        return None
-    h = hits[0]
-    img_url = h.get("largeImageURL") or h.get("webformatURL")
-    user = h.get("user") or "Pixabay contributor"
-    page = h.get("pageURL") or "https://pixabay.com"
-    return {"url": img_url, "provider": "pixabay", "credit": f"Image by {user} (Pixabay) {page}", "alt": ""}
+# -------------------------
+# Text utilities
+# -------------------------
 
-def openverse_search(query: str) -> Optional[Dict[str,Any]]:
-    # Public API
-    url = "https://api.openverse.engineering/v1/images/"
-    params = {"q": query, "page_size": 1}
-    resp = http_request("GET", url, params=params)
-    data = resp.json()
-    results = data.get("results") or []
-    if not results:
-        return None
-    r = results[0]
-    img_url = r.get("url") or r.get("thumbnail") or ""
-    creator = r.get("creator") or "Openverse"
-    license_ = r.get("license") or ""
-    source = r.get("foreign_landing_url") or "https://openverse.org"
-    credit = f"{creator} ({license_}) {source}".strip()
-    return {"url": img_url, "provider": "openverse", "credit": credit, "alt": ""}
+def slugify(text: str, max_len: int = 80) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s-]", "", text)
+    text = re.sub(r"\s+", "-", text).strip("-")
+    if len(text) > max_len:
+        text = text[:max_len].rstrip("-")
+    if not text:
+        text = "tech-news"
+    return text
 
-def wikimedia_search(query: str) -> Optional[Dict[str,Any]]:
-    # MediaWiki API search → imageinfo
-    api = "https://commons.wikimedia.org/w/api.php"
-    params = {"action":"query","format":"json","list":"search","srsearch": query, "srlimit": 1, "srnamespace": 6}
-    resp = http_request("GET", api, params=params)
-    data = resp.json()
-    search = (data.get("query") or {}).get("search") or []
-    if not search:
-        return None
-    title = search[0].get("title")  # File:Something.jpg
-    params2 = {"action":"query","format":"json","titles": title, "prop":"imageinfo", "iiprop":"url|extmetadata", "iiurlwidth": 1400}
-    resp2 = http_request("GET", api, params=params2)
-    data2 = resp2.json()
-    pages = (data2.get("query") or {}).get("pages") or {}
-    page = next(iter(pages.values()), {})
-    ii = (page.get("imageinfo") or [{}])[0]
-    img_url = ii.get("thumburl") or ii.get("url") or ""
-    meta = ii.get("extmetadata") or {}
-    artist = (meta.get("Artist") or {}).get("value") or "Wikimedia Commons"
-    license_short = (meta.get("LicenseShortName") or {}).get("value") or ""
-    credit = f"{strip_html(artist)} ({strip_html(license_short)}) https://commons.wikimedia.org/wiki/{title.replace(' ','_')}"
-    return {"url": img_url, "provider": "wikimedia", "credit": credit, "alt": ""}
+def _sanitize_json(s: str) -> str:
+    # replace smart quotes, remove trailing commas
+    s = s.replace("\u201c", '"').replace("\u201d", '"').replace("\u2019", "'")
+    s = re.sub(r",(\s*[}\]])", r"\1", s)
+    return s
 
-def strip_html(s: str) -> str:
-    if not s:
-        return ""
-    return BeautifulSoup(s, "html.parser").get_text(" ", strip=True)
-
-
-# ---------------------------
-# Locking (simple file lock)
-# ---------------------------
-
-def acquire_lock(lock_path: str, stale_seconds: int = 3600) -> bool:
-    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    # If stale, remove
-    if os.path.exists(lock_path):
-        try:
-            age = time.time() - os.path.getmtime(lock_path)
-            if age > stale_seconds:
-                os.remove(lock_path)
-        except Exception:
-            pass
+def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    # Try direct parse
+    t = text.strip()
+    t = _sanitize_json(t)
     try:
-        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, utcnow_iso().encode("utf-8"))
-        os.close(fd)
-        return True
-    except FileExistsError:
-        return False
-
-def release_lock(lock_path: str):
-    try:
-        if os.path.exists(lock_path):
-            os.remove(lock_path)
+        obj = json.loads(t)
+        if isinstance(obj, dict):
+            return obj
     except Exception:
         pass
-
-
-# ---------------------------
-# Helper: Daily publish counters
-# ---------------------------
-
-def daily_key(prefix: str = "published_count") -> str:
-    d = dt.datetime.now(dt.timezone.utc).date().isoformat()
-    return f"{prefix}:{d}"
-
-def get_published_today() -> int:
-    v = state.kv_get(daily_key())
-    return int(v) if v and v.isdigit() else 0
-
-def increment_published_today():
-    k = daily_key()
-    n = get_published_today() + 1
-    state.kv_set(k, str(n))
-
-def get_last_publish_ts() -> Optional[dt.datetime]:
-    v = state.kv_get("last_publish_ts")
-    if not v:
+    # brace-balance extraction
+    start = t.find("{")
+    if start == -1:
         return None
-    try:
-        return dt.datetime.fromisoformat(v.replace("Z", "+00:00"))
-    except Exception:
-        return None
+    depth = 0
+    for i in range(start, len(t)):
+        ch = t[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                block = t[start:i+1]
+                block = _sanitize_json(block)
+                try:
+                    obj = json.loads(block)
+                    if isinstance(obj, dict):
+                        return obj
+                except Exception:
+                    return None
+    return None
 
-def set_last_publish_ts(ts: dt.datetime):
-    state.kv_set("last_publish_ts", ts.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z"))
+# -------------------------
+# Article pipeline
+# -------------------------
+
+def build_generation_prompt(title: str, category_name: str, pack: Dict[str, Any]) -> List[Dict[str, str]]:
+    # Keep inputs short: include extracted content summaries, not raw full pages if enormous.
+    extract_results = (pack.get("extract") or {}).get("results") or []
+    snippets = []
+    for r in extract_results[:5]:
+        url = r.get("url") or ""
+        content = (r.get("content") or r.get("raw_content") or "").strip()
+        # limit length per source
+        if len(content) > 1500:
+            content = content[:1500] + "…"
+        snippets.append(f"SOURCE: {url}\n{content}")
+    sources_block = "\n\n".join(snippets) if snippets else "No extracted sources available."
+
+    system = (
+        "You are a professional tech journalist. Write accurate, reader-friendly articles grounded ONLY in the provided sources. "
+        "Do not invent facts, numbers, dates, or quotes. If something is uncertain, say so.\n\n"
+        "Return ONLY HTML (no markdown)."
+    )
+    user = (
+        f"Write a tech news article about: {title}\n"
+        f"Category: {category_name}\n\n"
+        "Required structure:\n"
+        "1) <h3>Article Highlights</h3> with 2-3 <li> bullets\n"
+        "2) <p>Hook</p> 120-150 words\n"
+        "3) 4-5 <h2> sections, each 100-200 words. Add <h3> subheadings when useful.\n"
+        "4) Use bullet lists or numbering where helpful\n"
+        "5) Include one simple HTML <table> when it helps (specs, timeline, comparison).\n"
+        "6) End with a <h3>Sources</h3> list of source URLs.\n\n"
+        "Sources (use as the only truth):\n"
+        f"{sources_block}\n"
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+def humanize_prompt(html: str) -> List[Dict[str, str]]:
+    system = (
+        "You are an editor. Improve readability and flow while keeping ALL facts identical. "
+        "Do not add new facts. Do not remove citations list. Keep output as HTML only."
+    )
+    user = (
+        "Rewrite the following HTML article to be more natural and user-friendly:\n\n"
+        f"{html}"
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+def seo_prompt(title: str, category_name: str, html: str) -> List[Dict[str, str]]:
+    system = "You are an SEO editor for a tech news site. Return STRICT JSON only."
+    user = (
+        f"Given the article HTML, produce SEO metadata.\n"
+        f"Title: {title}\nCategory: {category_name}\n\n"
+        "Return a JSON object with keys:\n"
+        "- meta_title (max ~60 chars)\n"
+        "- meta_description (max ~155 chars)\n"
+        "- short_description (1-2 sentences)\n"
+        "- tags (array of 5-10 short tags)\n"
+        "- image_alt (short alt text)\n\n"
+        "Article HTML:\n"
+        f"{html}\n"
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+def build_image_prompt(title: str) -> str:
+    # For news, avoid pretending it's a real event photo.
+    return (
+        f"High-quality realistic product-style hero image illustrating the tech topic: {title}. "
+        "No people, no brand logos, no text. Studio lighting, clean background. Looks like a magazine illustration."
+    )
+
+def create_article_from_lead(title: str, category_name: str) -> Dict[str, Any]:
+    pack = build_research_pack(title)
+    extracted_img = pick_extracted_image(pack) if get_setting("prefer_extracted_image", "1") == "1" else None
+
+    # Draft
+    draft_html = chat_stage("generation", build_generation_prompt(title, category_name, pack))
+    if not draft_html.strip():
+        raise RuntimeError("Generation returned empty content.")
+
+    # Humanize (always)
+    human_html = chat_stage("humanize", humanize_prompt(draft_html))
+    if not human_html.strip():
+        human_html = draft_html
+
+    # SEO JSON
+    seo_out = chat_stage("seo", seo_prompt(title, category_name, human_html))
+    seo = extract_json_object(seo_out) or {}
+
+    meta_title = seo.get("meta_title") or title[:60]
+    meta_description = seo.get("meta_description") or (seo.get("short_description") or "")[:155]
+    short_description = seo.get("short_description") or meta_description
+    tags = seo.get("tags") if isinstance(seo.get("tags"), list) else []
+    image_alt = seo.get("image_alt") or f"{title} — {category_name}"
+
+    # Image selection
+    img = extracted_img
+    if not img:
+        gen_img = generate_image_together(build_image_prompt(title))
+        img = gen_img
+
+    featured_image = img["url"] if img else ""
+    caption = (img.get("caption") or "Tech illustration") if img else ""
+    credit = img.get("credit") or "" if img else ""
+    featured_image_credit = f"{caption} | Credit: {credit}".strip(" |")
+
+    slug = slugify(title)
+    published_at = _now_iso()
+
+    return {
+        "title": title,
+        "slug": f"{slug}-{hashlib.md5(title.encode('utf-8')).hexdigest()[:6]}",  # collision-safe without reads
+        "status": "published",
+        "category_slug": category_name,  # will be overwritten by caller with slug; keep name for safety
+        "short_description": short_description,
+        "content": human_html,
+        "featured_image": featured_image,
+        "featured_image_credit": featured_image_credit,
+        "featured_image_alt": image_alt,
+        "meta_title": meta_title,
+        "meta_description": meta_description,
+        "tags": tags,
+        "published_at": published_at,
+    }
+
+def publish_article_to_directus(article: Dict[str, Any], category_slug: str) -> Dict[str, Any]:
+    col = articles_collection()
+    # category stored as slug string
+    payload = dict(article)
+    payload["category_slug"] = category_slug
+    # Remove empty fields (Directus validations vary; keep required ones)
+    required = {"title", "slug", "status", "category_slug", "content"}
+    clean = {}
+    for k, v in payload.items():
+        if k in required:
+            clean[k] = v
+            continue
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        if isinstance(v, list) and len(v) == 0:
+            continue
+        clean[k] = v
+    data = directus_post(f"/items/{col}", clean)
+    return data.get("data") or {}
+

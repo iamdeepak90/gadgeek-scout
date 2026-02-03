@@ -222,7 +222,7 @@ async function saveModels(){
 }
 
 async function loadCategories(){
-  const res = await apiGet("/api/categories");
+  const res = await apiGet("/api/Categories");
   const box = $("categories_table");
   if(!res.ok){
     box.innerHTML = `<p class="muted">Failed to load categories: ${res.error}</p>`;

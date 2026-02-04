@@ -172,8 +172,12 @@ async function testFeed(){
   Object.keys(payload).forEach(k=>{ if(payload[k]==="") payload[k]=null; });
   const out = $("feed_test_out");
   out.textContent = "Testing...";
-  const res = await apiPost("/api/feeds/test", payload);
-  out.textContent = JSON.stringify(res, null, 2);
+  try {
+    const res = await apiPost("/api/feeds/test", payload);
+    out.textContent = JSON.stringify(res, null, 2);
+  } catch(e) {
+    out.textContent = "Error: " + e.message;
+  }
 }
 
 async function loadModels(){
@@ -223,48 +227,67 @@ async function saveModels(){
     } else {
       payload[stage].width = document.getElementById(`width_${stage}`).value;
       payload[stage].height = document.getElementById(`height_${stage}`).value;
-tage}`).value;
-    } else {
-      payload[stage].width = document.getElementById(`width_${stage}`).value;
-      payload[stage].height = document.getElementById(`height_${stage}`).value;
-`;
-    return;
+    }
   }
-  const cats = res.categories || [];
-  if(!cats.length){
-    box.innerHTML = "<p class='muted'>No categories found.</p>";
-    return;
+  await apiPost("/api/models", payload);
+  alert("Models saved.");
+}
+
+async function loadCategories(){
+  const box = $("categories_table");
+  try {
+    const res = await apiGet("/api/categories");
+    if(!res.ok){
+      box.innerHTML = `<p class='muted'>Error loading categories: ${res.error || 'Unknown error'}</p>`;
+      return;
+    }
+    const cats = res.categories || [];
+    if(!cats.length){
+      box.innerHTML = "<p class='muted'>No categories found.</p>";
+      return;
+    }
+    let html = "<table><tr><th>Priority</th><th>Slug</th><th>Name</th><th>Posts/Scout</th><th>Keywords</th></tr>";
+    for(const c of cats){
+      html += `<tr>
+        <td>${c.priority}</td>
+        <td>${c.slug}</td>
+        <td>${c.name}</td>
+        <td>${c.posts_per_scout}</td>
+        <td>${(c.keywords||[]).slice(0,12).join(", ")}${(c.keywords||[]).length>12 ? "…" : ""}</td>
+      </tr>`;
+    }
+    html += "</table>";
+    box.innerHTML = html;
+  } catch(e) {
+    box.innerHTML = `<p class='muted'>Error: ${e.message}</p>`;
   }
-  let html = "<table><tr><th>Priority</th><th>Slug</th><th>Name</th><th>Posts/Scout</th><th>Keywords</th></tr>";
-  for(const c of cats){
-    html += `<tr>
-      <td>${c.priority}</td>
-      <td>${c.slug}</td>
-      <td>${c.name}</td>
-      <td>${c.posts_per_scout}</td>
-      <td>${(c.keywords||[]).slice(0,12).join(", ")}${(c.keywords||[]).length>12 ? "…" : ""}</td>
-    </tr>`;
-  }
-  html += "</table>";
-  box.innerHTML = html;
 }
 
 async function refreshAll(){
-  const state = await apiGet("/api/state");
-  renderHealth(state);
-  await loadSettings();
-  await loadFeeds();
-  await loadModels();
-  await loadCategories();
+  try {
+    const state = await apiGet("/api/state");
+    renderHealth(state);
+    await loadSettings();
+    await loadFeeds();
+    await loadModels();
+    await loadCategories();
+  } catch(e) {
+    console.error("Error refreshing:", e);
+    alert("Error loading settings. Check console for details.");
+  }
 }
 
 function bindButtons(){
   ["save_system_1","save_system_2","save_system_3","save_system_4"].forEach(id=>{
-    $(id).addEventListener("click", saveSystem);
+    const el = $(id);
+    if(el) el.addEventListener("click", saveSystem);
   });
-  $("feed_save").addEventListener("click", saveFeed);
-  $("feed_test").addEventListener("click", testFeed);
-  $("models_save").addEventListener("click", saveModels);
+  const feedSave = $("feed_save");
+  if(feedSave) feedSave.addEventListener("click", saveFeed);
+  const feedTest = $("feed_test");
+  if(feedTest) feedTest.addEventListener("click", testFeed);
+  const modelsSave = $("models_save");
+  if(modelsSave) modelsSave.addEventListener("click", saveModels);
 }
 
 window.addEventListener("DOMContentLoaded", async ()=>{

@@ -3,7 +3,7 @@
   --panel:#121a33;
   --muted:#9aa3b2;
   --text:#e8ecf3;
-  --accent:#6ee7ff;
+  --accent:#212aac;
   --border:#283152;
   --ok:#22c55e;
 }
@@ -23,7 +23,7 @@ header h1{margin:0 0 6px 0;font-size:24px;}
 @media (max-width:820px){.grid{grid-template-columns:1fr;}}
 label{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted);}
 input,select{padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:#0e1530;color:var(--text);outline:none;}
-button{padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:#0e1530;color:var(--text);cursor:pointer;}
+button{padding:10px 22px;margin-top:16px;border-radius:10px;border:1px solid var(--border);background:#0e1530;color:var(--text);cursor:pointer;}
 button.primary{border-color:var(--accent);}
 .row{display:flex;gap:10px;align-items:center;margin-top:10px;}
 .badge{display:inline-block;margin-left:6px;font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--border);color:var(--muted);}

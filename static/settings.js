@@ -172,12 +172,8 @@ async function testFeed(){
   Object.keys(payload).forEach(k=>{ if(payload[k]==="") payload[k]=null; });
   const out = $("feed_test_out");
   out.textContent = "Testing...";
-  try {
-    const res = await apiPost("/api/feeds/test", payload);
-    out.textContent = JSON.stringify(res, null, 2);
-  } catch(e) {
-    out.textContent = "Error: " + e.message;
-  }
+  const res = await apiPost("/api/feeds/test", payload);
+  out.textContent = JSON.stringify(res, null, 2);
 }
 
 async function loadModels(){
@@ -189,7 +185,7 @@ async function loadModels(){
     ["seo","SEO (Meta/tags/short desc)"],
     ["image","Image Generation"]
   ];
-  let html = "<table><tr><th>Stage</th><th>Provider</th><th>Model</th><th>Temp</th><th>Max tokens</th><th>Width</th><th>Height</th></tr>";
+  let html = "<table><tr><th>Stage</th><th>Provider</th><th>Model</th><th>Temp / Width</th><th>Max tokens / Height</th></tr>";
   for(const [stage,label] of stages){
     const r = routes[stage] || {};
     const isImage = stage === "image";
@@ -202,10 +198,8 @@ async function loadModels(){
         </select>
       </td>
       <td><input id="model_${stage}" value="${(r.model||"").replaceAll('"','&quot;')}" placeholder="model id"/></td>
-      <td><input id="temp_${stage}" type="number" step="0.1" value="${r.temperature??""}" ${isImage?"disabled":""} /></td>
-      <td><input id="max_${stage}" type="number" step="50" value="${r.max_tokens??""}" ${isImage?"disabled":""} /></td>
-      <td><input id="width_${stage}" type="number" step="64" value="${r.width??""}" ${!isImage?"disabled":""} /></td>
-      <td><input id="height_${stage}" type="number" step="64" value="${r.height??""}" ${!isImage?"disabled":""} /></td>
+      <td><input id="temp_${stage}" type="number" step="${isImage?'64':'0.1'}" value="${isImage?(r.width??""):(r.temperature??"")}" placeholder="${isImage?'width':'temp'}" /></td>
+      <td><input id="max_${stage}" type="number" step="${isImage?'64':'50'}" value="${isImage?(r.height??""):(r.max_tokens??"")}" placeholder="${isImage?'height':'max tokens'}" /></td>
     </tr>`;
   }
   html += "</table>";
@@ -225,69 +219,57 @@ async function saveModels(){
       payload[stage].temperature = document.getElementById(`temp_${stage}`).value;
       payload[stage].max_tokens = document.getElementById(`max_${stage}`).value;
     } else {
-      payload[stage].width = document.getElementById(`width_${stage}`).value;
-      payload[stage].height = document.getElementById(`height_${stage}`).value;
+      // For image stage, temp field = width, max field = height
+      payload[stage].width = document.getElementById(`temp_${stage}`).value;
+      payload[stage].height = document.getElementById(`max_${stage}`).value;
     }
   }
   await apiPost("/api/models", payload);
-  alert("Models saved.");
+  alert("Saved model routing.");
 }
 
 async function loadCategories(){
+  const res = await apiGet("/api/categories");
   const box = $("categories_table");
-  try {
-    const res = await apiGet("/api/categories");
-    if(!res.ok){
-      box.innerHTML = `<p class='muted'>Error loading categories: ${res.error || 'Unknown error'}</p>`;
-      return;
-    }
-    const cats = res.categories || [];
-    if(!cats.length){
-      box.innerHTML = "<p class='muted'>No categories found.</p>";
-      return;
-    }
-    let html = "<table><tr><th>Priority</th><th>Slug</th><th>Name</th><th>Posts/Scout</th><th>Keywords</th></tr>";
-    for(const c of cats){
-      html += `<tr>
-        <td>${c.priority}</td>
-        <td>${c.slug}</td>
-        <td>${c.name}</td>
-        <td>${c.posts_per_scout}</td>
-        <td>${(c.keywords||[]).slice(0,12).join(", ")}${(c.keywords||[]).length>12 ? "…" : ""}</td>
-      </tr>`;
-    }
-    html += "</table>";
-    box.innerHTML = html;
-  } catch(e) {
-    box.innerHTML = `<p class='muted'>Error: ${e.message}</p>`;
+  if(!res.ok){
+    box.innerHTML = `<p class="muted">Failed to load categories: ${res.error}</p>`;
+    return;
   }
+  const cats = res.categories || [];
+  if(!cats.length){
+    box.innerHTML = "<p class='muted'>No categories found.</p>";
+    return;
+  }
+  let html = "<table><tr><th>Priority</th><th>Slug</th><th>Name</th><th>Posts/Scout</th><th>Keywords</th></tr>";
+  for(const c of cats){
+    html += `<tr>
+      <td>${c.priority}</td>
+      <td>${c.slug}</td>
+      <td>${c.name}</td>
+      <td>${c.posts_per_scout}</td>
+      <td>${(c.keywords||[]).slice(0,12).join(", ")}${(c.keywords||[]).length>12 ? "…" : ""}</td>
+    </tr>`;
+  }
+  html += "</table>";
+  box.innerHTML = html;
 }
 
 async function refreshAll(){
-  try {
-    const state = await apiGet("/api/state");
-    renderHealth(state);
-    await loadSettings();
-    await loadFeeds();
-    await loadModels();
-    await loadCategories();
-  } catch(e) {
-    console.error("Error refreshing:", e);
-    alert("Error loading settings. Check console for details.");
-  }
+  const state = await apiGet("/api/state");
+  renderHealth(state);
+  await loadSettings();
+  await loadFeeds();
+  await loadModels();
+  await loadCategories();
 }
 
 function bindButtons(){
   ["save_system_1","save_system_2","save_system_3","save_system_4"].forEach(id=>{
-    const el = $(id);
-    if(el) el.addEventListener("click", saveSystem);
+    $(id).addEventListener("click", saveSystem);
   });
-  const feedSave = $("feed_save");
-  if(feedSave) feedSave.addEventListener("click", saveFeed);
-  const feedTest = $("feed_test");
-  if(feedTest) feedTest.addEventListener("click", testFeed);
-  const modelsSave = $("models_save");
-  if(modelsSave) modelsSave.addEventListener("click", saveModels);
+  $("feed_save").addEventListener("click", saveFeed);
+  $("feed_test").addEventListener("click", testFeed);
+  $("models_save").addEventListener("click", saveModels);
 }
 
 window.addEventListener("DOMContentLoaded", async ()=>{

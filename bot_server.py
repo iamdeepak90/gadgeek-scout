@@ -139,14 +139,18 @@ def api_get_models():
 def api_set_models():
     data = request.get_json(force=True, silent=False) or {}
     for stage, cfg in data.items():
-        if stage not in ("generation", "humanize", "seo"):
+        if stage not in ("generation", "humanize", "seo", "image"):
             continue
         provider = (cfg.get("provider") or "").strip()
         model = (cfg.get("model") or "").strip()
         if not provider or not model:
             continue
+        
         temperature = cfg.get("temperature", None)
         max_tokens = cfg.get("max_tokens", None)
+        width = cfg.get("width", None)
+        height = cfg.get("height", None)
+        
         try:
             temperature = float(temperature) if temperature is not None and temperature != "" else None
         except Exception:
@@ -155,7 +159,16 @@ def api_set_models():
             max_tokens = int(max_tokens) if max_tokens is not None and max_tokens != "" else None
         except Exception:
             max_tokens = None
-        set_model_route(stage, provider, model, temperature, max_tokens)
+        try:
+            width = int(width) if width is not None and width != "" else None
+        except Exception:
+            width = None
+        try:
+            height = int(height) if height is not None and height != "" else None
+        except Exception:
+            height = None
+        
+        set_model_route(stage, provider, model, temperature, max_tokens, width, height)
     return jsonify({"ok": True})
 
 @app.get("/api/categories")

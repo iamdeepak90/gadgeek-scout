@@ -10,7 +10,7 @@
   <div class="container">
     <header>
       <h1>Gadgeek Automation Settings</h1>
-      <p class="muted">Manage feeds, models and system settings. Categories are read-only from Directus.</p>
+      <p class="muted">Manage feeds, models and system settings. Categories are read-only from Directus. All settings stored in Redis (shared across services).</p>
     </header>
 
     <nav class="tabs">
@@ -29,9 +29,11 @@
       <div class="card">
         <h2>Quick notes</h2>
         <ul>
-          <li>Secrets are never shown back in this UI. If a secret is already set, you’ll see a “configured” badge.</li>
+          <li>All settings are stored in <strong>Redis</strong> and shared across all services (bot_server, scout, publisher).</li>
+          <li>Secrets are never shown back in this UI. If a secret is already set, you'll see a "configured" badge.</li>
           <li>Scout runs via cron: <code>python scout.py</code>. Publisher runs: <code>python publisher.py</code>.</li>
           <li>Slack Interactivity URL should be: <code>https://bot.gadgeek.in/slack/interactions</code></li>
+          <li>Make sure Redis is running and accessible at the host specified in config.py</li>
         </ul>
       </div>
     </section>
@@ -106,30 +108,14 @@
           <label>User-Agent
             <input id="user_agent" />
           </label>
-        </div>
-        <button class="primary" id="save_system_4">Save</button>
-      </div>
-
-      <div class="card">
-        <h2>Images</h2>
-        <div class="grid">
           <label>Prefer extracted images (Tavily)
             <select id="prefer_extracted_image">
               <option value="1">Yes (recommended)</option>
               <option value="0">No</option>
             </select>
           </label>
-          <label>Together image model
-            <input id="image_model" placeholder="black-forest-labs/FLUX.1-schnell" />
-          </label>
-          <label>Image response format
-            <select id="image_response_format">
-              <option value="url">url</option>
-              <option value="base64">base64</option>
-            </select>
-          </label>
         </div>
-        <button class="primary" id="save_system_5">Save</button>
+        <button class="primary" id="save_system_4">Save</button>
       </div>
     </section>
 
@@ -178,7 +164,7 @@
     <section id="models" class="panel">
       <div class="card">
         <h2>Stage routing</h2>
-        <p class="muted">Choose Together or OpenRouter per stage. Model IDs must match the provider.</p>
+        <p class="muted">Choose Together or OpenRouter per stage. Model IDs must match the provider. For image generation, width/height are used instead of temp/max_tokens.</p>
         <div id="models_form"></div>
         <button class="primary" id="models_save">Save model routing</button>
       </div>

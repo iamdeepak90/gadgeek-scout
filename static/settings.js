@@ -59,7 +59,7 @@ async function loadSettings(){
   const keys = [
     "directus_url","directus_leads_collection","directus_articles_collection","directus_categories_collection",
     "slack_channel_id","publish_interval_minutes","scout_interval_minutes","http_timeout","user_agent",
-    "prefer_extracted_image","image_model","image_response_format"
+    "prefer_extracted_image"
   ];
   keys.forEach(k=>{
     const el = $(k);
@@ -88,8 +88,6 @@ async function saveSystem(){
     http_timeout: $("http_timeout").value.trim(),
     user_agent: $("user_agent").value.trim(),
     prefer_extracted_image: $("prefer_extracted_image").value,
-    image_model: $("image_model").value.trim(),
-    image_response_format: $("image_response_format").value,
   };
 
   // secrets only if filled
@@ -124,7 +122,7 @@ async function loadFeeds(){
     html += `<tr>
       <td>${f.id}</td>
       <td><a href="${f.url}" target="_blank" rel="noreferrer">${f.url}</a></td>
-      <td>${f.enabled ? "✅" : "—"}</td>
+      <td>${f.enabled ? "✅" : "–"}</td>
       <td>${f.category_hint || ""}</td>
       <td>${keys}</td>
       <td><button data-del="${f.id}">Delete</button></td>
@@ -184,11 +182,13 @@ async function loadModels(){
   const stages = [
     ["generation","Generation (Draft article)"],
     ["humanize","Humanization (Rewrite)"],
-    ["seo","SEO (Meta/tags/short desc)"]
+    ["seo","SEO (Meta/tags/short desc)"],
+    ["image","Image Generation"]
   ];
-  let html = "<table><tr><th>Stage</th><th>Provider</th><th>Model</th><th>Temp</th><th>Max tokens</th></tr>";
+  let html = "<table><tr><th>Stage</th><th>Provider</th><th>Model</th><th>Temp</th><th>Max tokens</th><th>Width</th><th>Height</th></tr>";
   for(const [stage,label] of stages){
     const r = routes[stage] || {};
+    const isImage = stage === "image";
     html += `<tr>
       <td>${label}</td>
       <td>
@@ -198,8 +198,10 @@ async function loadModels(){
         </select>
       </td>
       <td><input id="model_${stage}" value="${(r.model||"").replaceAll('"','&quot;')}" placeholder="model id"/></td>
-      <td><input id="temp_${stage}" type="number" step="0.1" value="${r.temperature??""}" /></td>
-      <td><input id="max_${stage}" type="number" step="50" value="${r.max_tokens??""}" /></td>
+      <td><input id="temp_${stage}" type="number" step="0.1" value="${r.temperature??""}" ${isImage?"disabled":""} /></td>
+      <td><input id="max_${stage}" type="number" step="50" value="${r.max_tokens??""}" ${isImage?"disabled":""} /></td>
+      <td><input id="width_${stage}" type="number" step="64" value="${r.width??""}" ${!isImage?"disabled":""} /></td>
+      <td><input id="height_${stage}" type="number" step="64" value="${r.height??""}" ${!isImage?"disabled":""} /></td>
     </tr>`;
   }
   html += "</table>";
@@ -207,15 +209,21 @@ async function loadModels(){
 }
 
 async function saveModels(){
-  const stages = ["generation","humanize","seo"];
+  const stages = ["generation","humanize","seo","image"];
   const payload = {};
   for(const stage of stages){
+    const isImage = stage === "image";
     payload[stage] = {
       provider: document.getElementById(`prov_${stage}`).value,
       model: document.getElementById(`model_${stage}`).value.trim(),
-      temperature: document.getElementById(`temp_${stage}`).value,
-      max_tokens: document.getElementById(`max_${stage}`).value,
     };
+    if(!isImage){
+      payload[stage].temperature = document.getElementById(`temp_${stage}`).value;
+      payload[stage].max_tokens = document.getElementById(`max_${stage}`).value;
+    } else {
+      payload[stage].width = document.getElementById(`width_${stage}`).value;
+      payload[stage].height = document.getElementById(`height_${stage}`).value;
+    }
   }
   await apiPost("/api/models", payload);
   alert("Saved model routing.");
@@ -257,7 +265,7 @@ async function refreshAll(){
 }
 
 function bindButtons(){
-  ["save_system_1","save_system_2","save_system_3","save_system_4","save_system_5"].forEach(id=>{
+  ["save_system_1","save_system_2","save_system_3","save_system_4"].forEach(id=>{
     $(id).addEventListener("click", saveSystem);
   });
   $("feed_save").addEventListener("click", saveFeed);

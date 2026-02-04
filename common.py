@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,8 +14,9 @@ from urllib.parse import urlencode, urlparse
 
 import requests
 import feedparser
+import redis
 
-from config import SETTINGS_DB_PATH
+from config import REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD
 
 LOG = logging.getLogger("technews")
 
@@ -30,40 +30,24 @@ def setup_logging(level: str = "INFO") -> None:
     )
 
 # -------------------------
-# SQLite settings store
+# Redis client (shared settings store)
 # -------------------------
 
-DB_SCHEMA = """
-CREATE TABLE IF NOT EXISTS settings (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
+_REDIS_CLIENT = None
 
-CREATE TABLE IF NOT EXISTS rss_feeds (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  url TEXT NOT NULL UNIQUE,
-  enabled INTEGER NOT NULL DEFAULT 1,
-  category_hint TEXT,
-  title_key TEXT,
-  description_key TEXT,
-  content_key TEXT,
-  category_key TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS model_routes (
-  stage TEXT PRIMARY KEY,
-  provider TEXT NOT NULL,
-  model TEXT NOT NULL,
-  temperature REAL,
-  max_tokens INTEGER,
-  updated_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_rss_enabled ON rss_feeds(enabled);
-"""
+def _get_redis() -> redis.Redis:
+    global _REDIS_CLIENT
+    if _REDIS_CLIENT is None:
+        _REDIS_CLIENT = redis.Redis(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            db=REDIS_DB,
+            password=REDIS_PASSWORD if REDIS_PASSWORD else None,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+        )
+    return _REDIS_CLIENT
 
 DEFAULTS_SETTINGS: Dict[str, str] = {
     # endpoints
@@ -87,343 +71,257 @@ DEFAULTS_SETTINGS: Dict[str, str] = {
     "scout_interval_minutes": "30",
     # pipeline options
     "prefer_extracted_image": "1",  # 1=true
-    "image_model": "black-forest-labs/FLUX.1-schnell",
-    "image_response_format": "url",  # url or base64
 }
 
 DEFAULT_MODEL_ROUTES = {
     "generation": {"provider": "together", "model": "deepseek-ai/DeepSeek-V3.1", "temperature": 0.6, "max_tokens": 2200},
     "humanize":   {"provider": "together", "model": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo", "temperature": 0.7, "max_tokens": 2200},
     "seo":        {"provider": "together", "model": "meta-llama/Llama-3.2-3B-Instruct-Turbo", "temperature": 0.4, "max_tokens": 900},
+    "image":      {"provider": "together", "model": "black-forest-labs/FLUX.1-schnell", "width": 1024, "height": 768},
 }
 
 def _now_iso() -> str:
     return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-def _db_path() -> str:
-    # Ensure parent dir exists
-    p = os.path.join(os.getcwd(), SETTINGS_DB_PATH)
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    return p
-
 def init_db() -> None:
-    path = _db_path()
-    con = sqlite3.connect(path)
-    try:
-        con.executescript(DB_SCHEMA)
-        # defaults settings
-        cur = con.cursor()
-        for k, v in DEFAULTS_SETTINGS.items():
-            cur.execute("INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES (?, ?, ?)", (k, v, _now_iso()))
-        # defaults model routes
-        for stage, cfg in DEFAULT_MODEL_ROUTES.items():
-            cur.execute(
-                "INSERT OR IGNORE INTO model_routes(stage, provider, model, temperature, max_tokens, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (stage, cfg["provider"], cfg["model"], cfg.get("temperature"), cfg.get("max_tokens"), _now_iso()),
-            )
-        con.commit()
-    finally:
-        con.close()
-
-def _with_con():
-    return sqlite3.connect(_db_path())
+    """Initialize Redis with default settings and model routes"""
+    r = _get_redis()
+    
+    # Initialize default settings if not present
+    for k, v in DEFAULTS_SETTINGS.items():
+        key = f"settings:{k}"
+        if not r.exists(key):
+            r.hset(key, mapping={"value": v, "updated_at": _now_iso()})
+    
+    # Initialize default model routes if not present
+    for stage, cfg in DEFAULT_MODEL_ROUTES.items():
+        key = f"model_routes:{stage}"
+        if not r.exists(key):
+            data = {
+                "provider": cfg["provider"],
+                "model": cfg["model"],
+                "updated_at": _now_iso()
+            }
+            if "temperature" in cfg:
+                data["temperature"] = str(cfg["temperature"])
+            if "max_tokens" in cfg:
+                data["max_tokens"] = str(cfg["max_tokens"])
+            if "width" in cfg:
+                data["width"] = str(cfg["width"])
+            if "height" in cfg:
+                data["height"] = str(cfg["height"])
+            r.hset(key, mapping=data)
+    
+    LOG.info("Redis initialized with default settings")
 
 def get_setting(key: str, default: Optional[str] = None) -> str:
-    con = _with_con()
-    try:
-        cur = con.execute("SELECT value FROM settings WHERE key = ?", (key,))
-        row = cur.fetchone()
-        if row:
-            return row[0]
-        return default if default is not None else ""
-    finally:
-        con.close()
+    """Get a setting from Redis"""
+    r = _get_redis()
+    redis_key = f"settings:{key}"
+    value = r.hget(redis_key, "value")
+    if value is not None:
+        return value
+    return default if default is not None else ""
 
 def set_setting(key: str, value: str) -> None:
-    con = _with_con()
-    try:
-        con.execute(
-            "INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-            (key, value, _now_iso()),
-        )
-        con.commit()
-    finally:
-        con.close()
+    """Set a setting in Redis"""
+    r = _get_redis()
+    redis_key = f"settings:{key}"
+    r.hset(redis_key, mapping={"value": value, "updated_at": _now_iso()})
 
 def list_settings() -> Dict[str, str]:
-    con = _with_con()
-    try:
-        rows = con.execute("SELECT key, value FROM settings").fetchall()
-        return {k: v for k, v in rows}
-    finally:
-        con.close()
+    """List all settings from Redis"""
+    r = _get_redis()
+    result = {}
+    for redis_key in r.scan_iter(match="settings:*"):
+        key = redis_key.replace("settings:", "")
+        value = r.hget(redis_key, "value")
+        if value is not None:
+            result[key] = value
+    return result
+
+# -------------------------
+# RSS Feeds (Redis-based)
+# -------------------------
 
 def list_feeds() -> List[Dict[str, Any]]:
-    con = _with_con()
-    try:
-        rows = con.execute(
-            "SELECT id, url, enabled, category_hint, title_key, description_key, content_key, category_key, created_at, updated_at "
-            "FROM rss_feeds ORDER BY id DESC"
-        ).fetchall()
-        keys = ["id","url","enabled","category_hint","title_key","description_key","content_key","category_key","created_at","updated_at"]
-        out = []
-        for r in rows:
-            d = dict(zip(keys, r))
-            d["enabled"] = bool(d["enabled"])
-            out.append(d)
-        return out
-    finally:
-        con.close()
+    """List all RSS feeds from Redis"""
+    r = _get_redis()
+    feeds = []
+    for redis_key in r.scan_iter(match="feed:*"):
+        data = r.hgetall(redis_key)
+        if data:
+            feed_id = int(redis_key.replace("feed:", ""))
+            feeds.append({
+                "id": feed_id,
+                "url": data.get("url", ""),
+                "enabled": data.get("enabled", "1") == "1",
+                "category_hint": data.get("category_hint"),
+                "title_key": data.get("title_key"),
+                "description_key": data.get("description_key"),
+                "content_key": data.get("content_key"),
+                "category_key": data.get("category_key"),
+                "created_at": data.get("created_at", ""),
+                "updated_at": data.get("updated_at", ""),
+            })
+    # Sort by ID descending
+    feeds.sort(key=lambda x: x["id"], reverse=True)
+    return feeds
 
 def upsert_feed(feed: Dict[str, Any]) -> int:
-    # feed must contain url
-    con = _with_con()
-    try:
-        now = _now_iso()
-        cur = con.cursor()
-        cur.execute("SELECT id FROM rss_feeds WHERE url = ?", (feed["url"],))
-        row = cur.fetchone()
-        if row:
-            feed_id = row[0]
-            cur.execute(
-                "UPDATE rss_feeds SET enabled=?, category_hint=?, title_key=?, description_key=?, content_key=?, category_key=?, updated_at=? WHERE id=?",
-                (
-                    1 if feed.get("enabled", True) else 0,
-                    feed.get("category_hint"),
-                    feed.get("title_key"),
-                    feed.get("description_key"),
-                    feed.get("content_key"),
-                    feed.get("category_key"),
-                    now,
-                    feed_id,
-                ),
-            )
-        else:
-            cur.execute(
-                "INSERT INTO rss_feeds(url, enabled, category_hint, title_key, description_key, content_key, category_key, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    feed["url"],
-                    1 if feed.get("enabled", True) else 0,
-                    feed.get("category_hint"),
-                    feed.get("title_key"),
-                    feed.get("description_key"),
-                    feed.get("content_key"),
-                    feed.get("category_key"),
-                    now,
-                    now,
-                ),
-            )
-            feed_id = cur.lastrowid
-        con.commit()
-        return int(feed_id)
-    finally:
-        con.close()
+    """Create or update an RSS feed in Redis"""
+    r = _get_redis()
+    url = feed["url"]
+    
+    # Check if feed exists by URL
+    feed_id = None
+    for redis_key in r.scan_iter(match="feed:*"):
+        data = r.hgetall(redis_key)
+        if data.get("url") == url:
+            feed_id = int(redis_key.replace("feed:", ""))
+            break
+    
+    now = _now_iso()
+    
+    if feed_id is None:
+        # Create new feed - get next ID
+        feed_id = r.incr("feed:next_id")
+        created_at = now
+    else:
+        # Update existing
+        existing = r.hgetall(f"feed:{feed_id}")
+        created_at = existing.get("created_at", now)
+    
+    # Store feed
+    feed_data = {
+        "url": url,
+        "enabled": "1" if feed.get("enabled", True) else "0",
+        "category_hint": feed.get("category_hint") or "",
+        "title_key": feed.get("title_key") or "",
+        "description_key": feed.get("description_key") or "",
+        "content_key": feed.get("content_key") or "",
+        "category_key": feed.get("category_key") or "",
+        "created_at": created_at,
+        "updated_at": now,
+    }
+    
+    r.hset(f"feed:{feed_id}", mapping=feed_data)
+    return feed_id
 
 def delete_feed(feed_id: int) -> None:
-    con = _with_con()
-    try:
-        con.execute("DELETE FROM rss_feeds WHERE id = ?", (feed_id,))
-        con.commit()
-    finally:
-        con.close()
+    """Delete an RSS feed from Redis"""
+    r = _get_redis()
+    r.delete(f"feed:{feed_id}")
+
+# -------------------------
+# Model Routes (Redis-based)
+# -------------------------
 
 def get_model_routes() -> Dict[str, Dict[str, Any]]:
-    con = _with_con()
-    try:
-        rows = con.execute("SELECT stage, provider, model, temperature, max_tokens FROM model_routes").fetchall()
-        out = {}
-        for stage, provider, model, temp, max_tokens in rows:
-            out[stage] = {"provider": provider, "model": model, "temperature": temp, "max_tokens": max_tokens}
-        return out
-    finally:
-        con.close()
+    """Get all model routing configurations"""
+    r = _get_redis()
+    routes = {}
+    for redis_key in r.scan_iter(match="model_routes:*"):
+        stage = redis_key.replace("model_routes:", "")
+        data = r.hgetall(redis_key)
+        if data:
+            route = {
+                "provider": data.get("provider", ""),
+                "model": data.get("model", ""),
+            }
+            if "temperature" in data and data["temperature"]:
+                route["temperature"] = float(data["temperature"])
+            if "max_tokens" in data and data["max_tokens"]:
+                route["max_tokens"] = int(data["max_tokens"])
+            if "width" in data and data["width"]:
+                route["width"] = int(data["width"])
+            if "height" in data and data["height"]:
+                route["height"] = int(data["height"])
+            routes[stage] = route
+    return routes
 
-def set_model_route(stage: str, provider: str, model: str, temperature: Optional[float], max_tokens: Optional[int]) -> None:
-    con = _with_con()
-    try:
-        con.execute(
-            "INSERT INTO model_routes(stage, provider, model, temperature, max_tokens, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(stage) DO UPDATE SET provider=excluded.provider, model=excluded.model, temperature=excluded.temperature, max_tokens=excluded.max_tokens, updated_at=excluded.updated_at",
-            (stage, provider, model, temperature, max_tokens, _now_iso()),
-        )
-        con.commit()
-    finally:
-        con.close()
-
-# -------------------------
-# HTTP helpers
-# -------------------------
-
-class TransientHTTPError(RuntimeError):
-    pass
-
-def http_timeout() -> int:
-    try:
-        return int(float(get_setting("http_timeout", "30")))
-    except Exception:
-        return 30
-
-def default_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    h = {
-        "User-Agent": get_setting("user_agent", DEFAULTS_SETTINGS["user_agent"]),
-        "Accept": "application/json, text/plain, */*",
+def set_model_route(stage: str, provider: str, model: str, temperature: Optional[float] = None, 
+                    max_tokens: Optional[int] = None, width: Optional[int] = None, 
+                    height: Optional[int] = None) -> None:
+    """Set model routing for a specific stage"""
+    r = _get_redis()
+    data = {
+        "provider": provider,
+        "model": model,
+        "updated_at": _now_iso(),
     }
-    if extra:
-        h.update(extra)
-    return h
+    if temperature is not None:
+        data["temperature"] = str(temperature)
+    if max_tokens is not None:
+        data["max_tokens"] = str(max_tokens)
+    if width is not None:
+        data["width"] = str(width)
+    if height is not None:
+        data["height"] = str(height)
+    
+    r.hset(f"model_routes:{stage}", mapping=data)
 
-def request_with_retry(method: str, url: str, headers: Optional[Dict[str, str]] = None, json_body: Any = None, data: Any = None, params: Dict[str, Any] = None, timeout: Optional[int] = None, max_attempts: int = 4) -> requests.Response:
-    timeout = timeout or http_timeout()
-    last_exc = None
+# -------------------------
+# HTTP utilities
+# -------------------------
+
+@dataclass
+class Response:
+    status_code: int
+    text: str
+    headers: Dict[str, str]
+
+    def json(self):
+        return json.loads(self.text)
+
+def request_with_retry(
+    method: str,
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+    timeout: int = 30,
+    max_attempts: int = 3,
+) -> Response:
+    timeout = int(get_setting("http_timeout", str(timeout)))
+    ua = get_setting("user_agent", "TechNewsBot/1.0")
+    hdrs = headers or {}
+    if "User-Agent" not in hdrs:
+        hdrs["User-Agent"] = ua
+    
     for attempt in range(1, max_attempts + 1):
         try:
-            resp = requests.request(
-                method=method,
-                url=url,
-                headers=headers or default_headers(),
-                json=json_body,
-                data=data,
-                params=params,
-                timeout=timeout,
-            )
-            if resp.status_code in (429, 500, 502, 503, 504):
-                raise TransientHTTPError(f"HTTP {resp.status_code} for {url}")
-            return resp
-        except (requests.RequestException, TransientHTTPError) as e:
-            last_exc = e
-            sleep_s = min(2 ** attempt, 12) + (0.1 * attempt)
-            LOG.warning("HTTP retry %s/%s for %s due to %s; sleeping %.1fs", attempt, max_attempts, url, e, sleep_s)
-            time.sleep(sleep_s)
-    raise RuntimeError(f"HTTP request failed after retries: {url} ({last_exc})")
+            resp = requests.request(method, url, headers=hdrs, json=json_body, timeout=timeout)
+            return Response(status_code=resp.status_code, text=resp.text, headers=dict(resp.headers))
+        except Exception as e:
+            LOG.warning("HTTP request attempt %d/%d failed: %s", attempt, max_attempts, e)
+            if attempt == max_attempts:
+                raise
+            time.sleep(min(2 ** attempt, 10))
+    raise RuntimeError("Unreachable")
 
 # -------------------------
-# Basic Auth for /settings
+# Basic Auth
 # -------------------------
 
-BASIC_AUTH_USER = "settings@gadgeek.in"
-BASIC_AUTH_PASS = "HelloGG@$44"
-
-def _basic_auth_ok(auth_header: str) -> bool:
-    if not auth_header or not auth_header.lower().startswith("basic "):
-        return False
-    try:
-        raw = base64.b64decode(auth_header.split(" ", 1)[1]).decode("utf-8")
-        user, pw = raw.split(":", 1)
-        return user == BASIC_AUTH_USER and pw == BASIC_AUTH_PASS
-    except Exception:
-        return False
-
-def require_basic_auth(fn):
-    @functools.wraps(fn)
+def require_basic_auth(f):
+    @functools.wraps(f)
     def wrapper(*args, **kwargs):
-        from flask import request, Response
-        if _basic_auth_ok(request.headers.get("Authorization", "")):
-            return fn(*args, **kwargs)
-        return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="settings"'})
+        from flask import request, Response as FlaskResponse
+        auth = request.authorization
+        if not auth or auth.username != "settings@gadgeek.in" or auth.password != "HelloGG@$44":
+            return FlaskResponse("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="Settings"'})
+        return f(*args, **kwargs)
     return wrapper
-
-# -------------------------
-# Slack
-# -------------------------
-
-def slack_signing_secret() -> str:
-    return get_setting("slack_signing_secret", "")
-
-def slack_bot_token() -> str:
-    return get_setting("slack_bot_token", "")
-
-def slack_channel_id() -> str:
-    return get_setting("slack_channel_id", "")
-
-def verify_slack_signature(headers: Dict[str, str], body: bytes) -> bool:
-    secret = slack_signing_secret()
-    if not secret:
-        # If not configured yet, allow (but log).
-        LOG.warning("Slack signing secret not set; skipping signature verification.")
-        return True
-    timestamp = headers.get("X-Slack-Request-Timestamp", "")
-    sig = headers.get("X-Slack-Signature", "")
-    if not timestamp or not sig:
-        return False
-    try:
-        ts = int(timestamp)
-        if abs(time.time() - ts) > 60 * 5:
-            return False
-    except Exception:
-        return False
-    basestring = b"v0:" + timestamp.encode("utf-8") + b":" + body
-    my_sig = "v0=" + hmac.new(secret.encode("utf-8"), basestring, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(my_sig, sig)
-
-def slack_api(method: str, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    token = slack_bot_token()
-    if not token:
-        raise RuntimeError("Slack bot token not configured in /settings.")
-    url = f"https://slack.com/api/{endpoint}"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
-    resp = request_with_retry(method, url, headers=headers, json_body=payload, timeout=20)
-    data = resp.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Slack API error: {data}")
-    return data
-
-def slack_post_lead(title: str, category_name: str, lead_id: int) -> Tuple[str, str]:
-    """Post to default channel. Returns (channel, ts)."""
-    channel = slack_channel_id()
-    if not channel:
-        raise RuntimeError("Slack channel id not configured in /settings.")
-    blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*\n_{category_name}_"}},
-        {"type": "actions", "elements": [
-            {"type": "button", "text": {"type": "plain_text", "text": "Approve ✅"}, "style": "primary", "action_id": "approve", "value": str(lead_id)},
-            {"type": "button", "text": {"type": "plain_text", "text": "Urgent ⚡"}, "style": "danger", "action_id": "urgent", "value": str(lead_id)},
-            {"type": "button", "text": {"type": "plain_text", "text": "Reject ❌"}, "action_id": "reject", "value": str(lead_id)},
-        ]},
-    ]
-    data = slack_api("POST", "chat.postMessage", {"channel": channel, "text": title, "blocks": blocks})
-    return data["channel"], data["ts"]
-
-def slack_update_published(channel: str, ts: str, title: str) -> None:
-    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*\n_Published ✅_"}}]
-    slack_api("POST", "chat.update", {"channel": channel, "ts": ts, "text": f"{title} (Published)", "blocks": blocks})
-
-def slack_ephemeral(response_url: str, text: str) -> None:
-    try:
-        request_with_retry("POST", response_url, headers={"Content-Type": "application/json"}, json_body={"response_type": "ephemeral", "text": text}, timeout=10, max_attempts=2)
-    except Exception as e:
-        LOG.warning("Failed to send ephemeral response to Slack: %s", e)
 
 # -------------------------
 # Directus
 # -------------------------
 
-def directus_url(path: str) -> str:
-    base = get_setting("directus_url", "").rstrip("/")
-    if not base:
-        raise RuntimeError("Directus URL not configured in /settings.")
-    if not path.startswith("/"):
-        path = "/" + path
-    return base + path
+def directus_url() -> str:
+    return (get_setting("directus_url") or "").rstrip("/")
 
-def directus_headers() -> Dict[str, str]:
-    token = get_setting("directus_token", "")
-    if not token:
-        raise RuntimeError("Directus token not configured in /settings.")
-    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-def directus_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    resp = request_with_retry("GET", directus_url(path), headers=directus_headers(), params=params, timeout=30)
-    return resp.json()
-
-def directus_post(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    resp = request_with_retry("POST", directus_url(path), headers=directus_headers(), json_body=body, timeout=45)
-    return resp.json()
-
-def directus_patch(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    resp = request_with_retry("PATCH", directus_url(path), headers=directus_headers(), json_body=body, timeout=45)
-    return resp.json()
+def directus_token() -> str:
+    return get_setting("directus_token") or ""
 
 def leads_collection() -> str:
     return get_setting("directus_leads_collection", "news_leads")
@@ -434,276 +332,425 @@ def articles_collection() -> str:
 def categories_collection() -> str:
     return get_setting("directus_categories_collection", "categories")
 
+def directus_get(path: str) -> Dict[str, Any]:
+    url = f"{directus_url()}{path}"
+    headers = {"Authorization": f"Bearer {directus_token()}"}
+    resp = request_with_retry("GET", url, headers=headers)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Directus GET {path} failed: {resp.status_code} {resp.text}")
+    return resp.json()
+
+def directus_post(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{directus_url()}{path}"
+    headers = {"Authorization": f"Bearer {directus_token()}"}
+    resp = request_with_retry("POST", url, headers=headers, json_body=data)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Directus POST {path} failed: {resp.status_code} {resp.text}")
+    return resp.json()
+
+def directus_patch(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{directus_url()}{path}"
+    headers = {"Authorization": f"Bearer {directus_token()}"}
+    resp = request_with_retry("PATCH", url, headers=headers, json_body=data)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Directus PATCH {path} failed: {resp.status_code} {resp.text}")
+    return resp.json()
+
+def get_categories() -> List[Dict[str, Any]]:
+    col = categories_collection()
+    params = urlencode({"filter[enabled][_eq]": "true", "sort": "priority", "limit": "-1"})
+    data = directus_get(f"/items/{col}?{params}")
+    cats = data.get("data") or []
+    out = []
+    for c in cats:
+        kw = c.get("keywords")
+        if isinstance(kw, str):
+            try:
+                kw = json.loads(kw)
+            except Exception:
+                kw = []
+        if not isinstance(kw, list):
+            kw = []
+        out.append({
+            "slug": c.get("slug") or "",
+            "name": c.get("name") or "",
+            "priority": int(c.get("priority") or 999),
+            "posts_per_scout": int(c.get("posts_per_scout") or 0),
+            "keywords": kw,
+        })
+    return out
+
 def lead_exists_by_url(source_url: str) -> bool:
     col = leads_collection()
-    params = {"filter[source_url][_eq]": source_url, "limit": 1, "fields": "id"}
-    data = directus_get(f"/items/{col}", params=params)
-    return bool(data.get("data"))
+    params = urlencode({"filter[source_url][_eq]": source_url, "limit": "1"})
+    data = directus_get(f"/items/{col}?{params}")
+    items = data.get("data") or []
+    return len(items) > 0
 
 def create_lead(title: str, source_url: str, category_slug: str) -> int:
     col = leads_collection()
-    body = {"title": title, "source_url": source_url, "category_slug": category_slug, "status": "pending"}
-    data = directus_post(f"/items/{col}", body)
-    return int(data["data"]["id"])
+    payload = {"title": title, "source_url": source_url, "category_slug": category_slug, "status": "pending"}
+    data = directus_post(f"/items/{col}", payload)
+    item = data.get("data") or {}
+    return int(item.get("id") or 0)
+
+def get_lead(lead_id: int) -> Dict[str, Any]:
+    col = leads_collection()
+    data = directus_get(f"/items/{col}/{lead_id}")
+    return data.get("data") or {}
 
 def update_lead_status(lead_id: int, status: str) -> None:
     col = leads_collection()
     directus_patch(f"/items/{col}/{lead_id}", {"status": status})
 
-def get_lead(lead_id: int) -> Dict[str, Any]:
-    col = leads_collection()
-    data = directus_get(f"/items/{col}/{lead_id}")
-    return data["data"]
-
 def list_one_approved_lead_newest() -> Optional[Dict[str, Any]]:
     col = leads_collection()
-    params = {
-        "filter[status][_eq]": "approved",
-        "limit": 1,
-        "sort": "-id",
-    }
-    data = directus_get(f"/items/{col}", params=params)
+    params = urlencode({"filter[status][_eq]": "approved", "sort": "-id", "limit": "1"})
+    data = directus_get(f"/items/{col}?{params}")
     items = data.get("data") or []
     return items[0] if items else None
 
-def get_categories() -> List[Dict[str, Any]]:
-    col = categories_collection()
-    params = {"limit": 200, "sort": "priority", "filter[enabled][_neq]": False}
-    data = directus_get(f"/items/{col}", params=params)
-    items = data.get("data") or []
-    # normalize
-    out = []
-    for c in items:
-        out.append({
-            "id": c.get("id"),
-            "slug": c.get("slug") or c.get("category_slug") or c.get("key"),
-            "name": c.get("name") or c.get("title") or (c.get("slug") or ""),
-            "priority": int(c.get("priority") or 999),
-            "keywords": c.get("keywords") or [],
-            "posts_per_scout": int(c.get("posts_per_scout") or c.get("posts_per_category") or 0),
-            "enabled": bool(c.get("enabled", True)),
-        })
-    # keep enabled and with slug
-    out = [c for c in out if c["slug"] and c["enabled"] and c["posts_per_scout"] > 0]
-    # sort by priority then name
-    out.sort(key=lambda x: (x["priority"], x["name"]))
-    return out
-
 # -------------------------
-# RSS parsing with selectors
+# Slack
 # -------------------------
 
-def _get_by_path(obj: Any, path: Optional[str]) -> Optional[str]:
-    if not path:
-        return None
-    cur = obj
-    for part in path.split("."):
-        if cur is None:
-            return None
-        if isinstance(cur, (list, tuple)):
-            try:
-                idx = int(part)
-            except ValueError:
-                return None
-            if idx < 0 or idx >= len(cur):
-                return None
-            cur = cur[idx]
-        elif isinstance(cur, dict):
-            cur = cur.get(part)
-        else:
-            # feedparser objects allow attribute access via dict-like
-            try:
-                cur = cur.get(part)  # type: ignore
-            except Exception:
-                cur = getattr(cur, part, None)
-    if cur is None:
-        return None
-    if isinstance(cur, (dict, list)):
-        try:
-            return json.dumps(cur, ensure_ascii=False)
-        except Exception:
-            return str(cur)
-    return str(cur)
+def slack_token() -> str:
+    return get_setting("slack_bot_token") or ""
 
-def parse_feed(url: str) -> feedparser.FeedParserDict:
-    # feedparser fetches itself; set UA via requests? Not easily. We'll fetch with requests for consistency.
-    resp = request_with_retry("GET", url, headers=default_headers(), timeout=http_timeout())
+def slack_channel() -> str:
+    return get_setting("slack_channel_id") or ""
+
+def slack_signing_secret() -> str:
+    return get_setting("slack_signing_secret") or ""
+
+def verify_slack_signature(headers: Dict[str, str], body: bytes) -> bool:
+    secret = slack_signing_secret()
+    if not secret:
+        LOG.warning("Slack signing secret not set; skipping signature verification")
+        return True
+    sig = headers.get("X-Slack-Signature") or headers.get("x-slack-signature") or ""
+    ts = headers.get("X-Slack-Request-Timestamp") or headers.get("x-slack-request-timestamp") or ""
+    if not sig or not ts:
+        return False
+    base = f"v0:{ts}:{body.decode('utf-8')}"
+    expected = "v0=" + hmac.new(secret.encode(), base.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
+
+def slack_post_lead(title: str, category_name: str, lead_id: int) -> Dict[str, Any]:
+    token = slack_token()
+    channel = slack_channel()
+    if not token or not channel:
+        raise RuntimeError("Slack bot token or channel ID not configured")
+    
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*\n_{category_name}_"}},
+        {
+            "type": "actions",
+            "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "✅ Approve"}, "style": "primary", "action_id": "approve", "value": str(lead_id)},
+                {"type": "button", "text": {"type": "plain_text", "text": "🚀 Urgent"}, "style": "danger", "action_id": "urgent", "value": str(lead_id)},
+                {"type": "button", "text": {"type": "plain_text", "text": "❌ Reject"}, "action_id": "reject", "value": str(lead_id)},
+            ],
+        },
+    ]
+    
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {"channel": channel, "text": title, "blocks": blocks}
+    resp = request_with_retry("POST", "https://slack.com/api/chat.postMessage", headers=headers, json_body=payload)
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Slack post failed: {data.get('error')}")
+    return data
+
+def slack_update_published(channel: str, ts: str, title: str) -> None:
+    token = slack_token()
+    if not token:
+        return
+    
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"✅ *Published:* {title}"}},
+    ]
+    
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {"channel": channel, "ts": ts, "text": f"Published: {title}", "blocks": blocks}
+    request_with_retry("POST", "https://slack.com/api/chat.update", headers=headers, json_body=payload)
+
+def slack_ephemeral(response_url: str, text: str) -> None:
+    if not response_url:
+        return
+    payload = {"text": text, "response_type": "ephemeral", "replace_original": False}
+    request_with_retry("POST", response_url, json_body=payload)
+
+# -------------------------
+# RSS feed parsing
+# -------------------------
+
+def parse_feed(url: str):
+    ua = get_setting("user_agent", "TechNewsBot/1.0")
+    timeout = int(get_setting("http_timeout", "30"))
+    resp = requests.get(url, headers={"User-Agent": ua}, timeout=timeout)
     return feedparser.parse(resp.content)
 
-def extract_entry_fields(entry: Any, feed_cfg: Dict[str, Any]) -> Dict[str, str]:
-    # auto extraction
-    title = _get_by_path(entry, feed_cfg.get("title_key")) or getattr(entry, "title", None) or entry.get("title", "")
-    link = entry.get("link") or getattr(entry, "link", "")
-    # description / summary
-    desc = _get_by_path(entry, feed_cfg.get("description_key")) or entry.get("summary") or entry.get("description") or ""
-    # content
-    content = _get_by_path(entry, feed_cfg.get("content_key"))
-    if not content:
-        if entry.get("content") and isinstance(entry["content"], list):
-            content = entry["content"][0].get("value") or entry["content"][0].get("content")
-    if not content:
-        content = ""
-    # category
-    cat = _get_by_path(entry, feed_cfg.get("category_key"))
-    if not cat:
-        # try tags
-        tags = entry.get("tags")
-        if tags and isinstance(tags, list):
-            cat = tags[0].get("term") or tags[0].get("label")
-    return {"title": str(title).strip(), "link": str(link).strip(), "description": str(desc).strip(), "content": str(content).strip(), "category": (cat or "").strip()}
-
-def domain_of(url: str) -> str:
-    try:
-        return urlparse(url).netloc.lower()
-    except Exception:
-        return ""
-
-# -------------------------
-# Tavily
-# -------------------------
-
-def tavily_search(query: str, max_results: int = 6) -> Dict[str, Any]:
-    key = get_setting("tavily_api_key", "")
+def _nested_get(d: Any, key: str) -> Any:
     if not key:
-        raise RuntimeError("Tavily API key not configured in /settings.")
-    url = "https://api.tavily.com/search"
-    payload = {
-        "api_key": key,
-        "query": query,
-        "search_depth": "basic",  # keep costs predictable
-        "max_results": max_results,
-        "include_answer": False,
-        "include_raw_content": False,
-    }
-    resp = request_with_retry("POST", url, headers={"Content-Type": "application/json"}, json_body=payload, timeout=30)
-    return resp.json()
+        return None
+    parts = key.split(".")
+    for p in parts:
+        if isinstance(d, dict):
+            d = d.get(p)
+        elif isinstance(d, list):
+            try:
+                idx = int(p)
+                d = d[idx] if 0 <= idx < len(d) else None
+            except Exception:
+                return None
+        else:
+            return None
+        if d is None:
+            return None
+    return d
 
-def tavily_extract(urls: List[str]) -> Dict[str, Any]:
-    key = get_setting("tavily_api_key", "")
-    if not key:
-        raise RuntimeError("Tavily API key not configured in /settings.")
-    url = "https://api.tavily.com/extract"
-    payload = {
-        "api_key": key,
-        "urls": urls,
-        "extract_depth": "basic",
-        "include_images": True,
-    }
-    resp = request_with_retry("POST", url, headers={"Content-Type": "application/json"}, json_body=payload, timeout=60)
-    return resp.json()
-
-def build_research_pack(title: str) -> Dict[str, Any]:
-    s = tavily_search(title, max_results=6)
-    results = s.get("results") or []
-    urls = []
-    for r in results:
-        u = r.get("url")
-        if u and u not in urls:
-            urls.append(u)
-        if len(urls) >= 5:
-            break
-    e = tavily_extract(urls) if urls else {"results": []}
-    return {"query": title, "search": s, "extract": e, "urls": urls}
-
-def pick_extracted_image(pack: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    # Tavily extract returns results with possibly "images"
-    extract = pack.get("extract") or {}
-    results = extract.get("results") or []
-    for r in results:
-        imgs = r.get("images") or []
-        if imgs and isinstance(imgs, list):
-            img = imgs[0]
-            img_url = img.get("url") if isinstance(img, dict) else None
-            if img_url:
-                src_url = r.get("url") or ""
-                dom = domain_of(src_url)
-                caption = img.get("caption") if isinstance(img, dict) else ""
-                credit = f"{dom}" if dom else "source"
-                return {"url": img_url, "credit": credit, "caption": caption or ""}
-    return None
+def extract_entry_fields(entry: Any, selectors: Dict[str, Optional[str]]) -> Dict[str, str]:
+    title = _nested_get(entry, selectors.get("title_key") or "title") or getattr(entry, "title", "")
+    desc = _nested_get(entry, selectors.get("description_key") or "summary") or getattr(entry, "summary", "")
+    content_key = selectors.get("content_key")
+    content = ""
+    if content_key:
+        content = _nested_get(entry, content_key) or ""
+    else:
+        c = getattr(entry, "content", [])
+        if c and isinstance(c, list) and len(c) > 0:
+            content = c[0].get("value", "")
+    
+    link = getattr(entry, "link", "")
+    category_key = selectors.get("category_key")
+    category = ""
+    if category_key:
+        category = _nested_get(entry, category_key) or ""
+    else:
+        tags = getattr(entry, "tags", [])
+        if tags and isinstance(tags, list) and len(tags) > 0:
+            category = tags[0].get("term", "")
+    
+    return {"title": str(title), "link": str(link), "description": str(desc), "content": str(content), "category": str(category)}
 
 # -------------------------
-# LLM Providers: Together / OpenRouter
+# LLM chat routing (Together / OpenRouter)
 # -------------------------
 
 TOGETHER_CHAT_URL = "https://api.together.xyz/v1/chat/completions"
 TOGETHER_IMAGES_URL = "https://api.together.xyz/v1/images/generations"
-
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-def _chat(provider: str, model: str, messages: List[Dict[str, str]], temperature: Optional[float], max_tokens: Optional[int]) -> str:
-    provider = (provider or "").lower().strip()
+def chat_stage(stage: str, messages: List[Dict[str, str]]) -> str:
+    """Call LLM for a specific stage using configured routing"""
+    routes = get_model_routes()
+    route = routes.get(stage)
+    if not route:
+        raise RuntimeError(f"No model route configured for stage: {stage}")
+    
+    provider = route["provider"]
+    model = route["model"]
+    temperature = route.get("temperature", 0.7)
+    max_tokens = route.get("max_tokens", 2000)
+    
     if provider == "together":
-        key = get_setting("together_api_key", "")
-        if not key:
-            raise RuntimeError("Together API key not configured in /settings.")
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        payload: Dict[str, Any] = {"model": model, "messages": messages}
-        if temperature is not None:
-            payload["temperature"] = float(temperature)
-        if max_tokens is not None:
-            payload["max_tokens"] = int(max_tokens)
-        resp = request_with_retry("POST", TOGETHER_CHAT_URL, headers=headers, json_body=payload, timeout=90, max_attempts=4)
-        data = resp.json()
-        return (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+        return _chat_together(model, messages, temperature, max_tokens)
     elif provider == "openrouter":
-        key = get_setting("openrouter_api_key", "")
-        if not key:
-            raise RuntimeError("OpenRouter API key not configured in /settings.")
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        payload = {"model": model, "messages": messages}
-        if temperature is not None:
-            payload["temperature"] = float(temperature)
-        if max_tokens is not None:
-            payload["max_tokens"] = int(max_tokens)
-        # Optional headers for OpenRouter ranking (safe defaults)
-        # Not adding extra headers that may break if absent.
-        resp = request_with_retry("POST", OPENROUTER_CHAT_URL, headers=headers, json_body=payload, timeout=90, max_attempts=4)
-        data = resp.json()
-        return (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+        return _chat_openrouter(model, messages, temperature, max_tokens)
     else:
         raise RuntimeError(f"Unknown provider: {provider}")
 
-def get_route(stage: str) -> Dict[str, Any]:
-    routes = get_model_routes()
-    if stage not in routes:
-        # fallback
-        return {"provider": "together", "model": "deepseek-ai/DeepSeek-V3.1", "temperature": 0.6, "max_tokens": 1800}
-    return routes[stage]
-
-def chat_stage(stage: str, messages: List[Dict[str, str]]) -> str:
-    route = get_route(stage)
-    return _chat(route["provider"], route["model"], messages, route.get("temperature"), route.get("max_tokens"))
-
-# -------------------------
-# Image generation (Together)
-# -------------------------
-
-def generate_image_together(prompt: str, width: int = 1024, height: int = 1024) -> Optional[Dict[str, str]]:
-    key = get_setting("together_api_key", "")
+def _chat_together(model: str, messages: List[Dict[str, str]], temperature: float, max_tokens: int) -> str:
+    key = get_setting("together_api_key")
     if not key:
+        raise RuntimeError("Together API key not configured")
+    
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    
+    resp = request_with_retry("POST", TOGETHER_CHAT_URL, headers=headers, json_body=payload, timeout=120, max_attempts=3)
+    data = resp.json()
+    
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"Together returned no choices: {data}")
+    
+    return (choices[0].get("message") or {}).get("content") or ""
+
+def _chat_openrouter(model: str, messages: List[Dict[str, str]], temperature: float, max_tokens: int) -> str:
+    key = get_setting("openrouter_api_key")
+    if not key:
+        raise RuntimeError("OpenRouter API key not configured")
+    
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://bot.gadgeek.in",
+        "X-Title": "Gadgeek Tech News",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    
+    resp = request_with_retry("POST", OPENROUTER_CHAT_URL, headers=headers, json_body=payload, timeout=120, max_attempts=3)
+    data = resp.json()
+    
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"OpenRouter returned no choices: {data}")
+    
+    return (choices[0].get("message") or {}).get("content") or ""
+
+# -------------------------
+# Tavily research
+# -------------------------
+
+def build_research_pack(title: str) -> Dict[str, Any]:
+    key = get_setting("tavily_api_key")
+    if not key:
+        LOG.warning("Tavily API key not set; skipping research.")
+        return {"extract": {"results": []}}
+    
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "api_key": key,
+        "query": title,
+        "search_depth": "advanced",
+        "max_results": 5,
+        "include_raw_content": True,
+        "include_images": True,
+    }
+    
+    try:
+        resp = request_with_retry("POST", "https://api.tavily.com/search", headers=headers, json_body=payload, timeout=60, max_attempts=2)
+        data = resp.json()
+        return {"extract": data}
+    except Exception as e:
+        LOG.warning("Tavily research failed: %s", e)
+        return {"extract": {"results": []}}
+
+def pick_extracted_image(pack: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    results = (pack.get("extract") or {}).get("results") or []
+    images = (pack.get("extract") or {}).get("images") or []
+    
+    # Prefer images from results
+    for r in results:
+        img_url = r.get("image")
+        if img_url and img_url.startswith("http"):
+            return {"url": img_url, "credit": r.get("url", "Source"), "caption": "Featured image"}
+    
+    # Fallback to general images
+    if images and images[0].startswith("http"):
+        return {"url": images[0], "credit": "Web", "caption": "Featured image"}
+    
+    return None
+
+# -------------------------
+# Image generation (routing-based)
+# -------------------------
+
+def generate_image(prompt: str) -> Optional[Dict[str, str]]:
+    """Generate image using configured routing"""
+    routes = get_model_routes()
+    route = routes.get("image")
+    if not route:
+        LOG.warning("No image route configured; using default Together")
+        return generate_image_together(prompt, 1024, 768)
+    
+    provider = route["provider"]
+    model = route["model"]
+    width = route.get("width", 1024)
+    height = route.get("height", 768)
+    
+    if provider == "together":
+        return generate_image_together(prompt, width, height, model)
+    elif provider == "openrouter":
+        return generate_image_openrouter(prompt, width, height, model)
+    else:
+        raise RuntimeError(f"Unknown image provider: {provider}")
+
+def generate_image_together(prompt: str, width: int = 1024, height: int = 768, model: Optional[str] = None) -> Optional[Dict[str, str]]:
+    """Generate image using Together AI"""
+    key = get_setting("together_api_key")
+    if not key:
+        LOG.warning("Together API key not set")
         return None
-    model = get_setting("image_model", DEFAULTS_SETTINGS["image_model"])
-    response_format = get_setting("image_response_format", "url")
+    
+    if model is None:
+        model = "black-forest-labs/FLUX.1-schnell"
+    
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     payload = {
         "model": model,
         "prompt": prompt,
         "width": width,
         "height": height,
-        "steps": 4,  # flux schnell
+        "steps": 4,
         "n": 1,
-        "response_format": response_format,
+        "response_format": "url",
         "output_format": "jpeg",
     }
-    resp = request_with_retry("POST", TOGETHER_IMAGES_URL, headers=headers, json_body=payload, timeout=120, max_attempts=3)
-    data = resp.json()
-    item = (data.get("data") or [{}])[0]
-    if response_format == "url" and item.get("url"):
-        return {"url": item["url"], "credit": "AI-generated (Together)", "caption": "AI-generated illustration"}
-    if response_format == "base64" and item.get("b64_json"):
-        # fallback: data URI
-        return {"url": f"data:image/jpeg;base64,{item['b64_json']}", "credit": "AI-generated (Together)", "caption": "AI-generated illustration"}
+    
+    try:
+        resp = request_with_retry("POST", TOGETHER_IMAGES_URL, headers=headers, json_body=payload, timeout=120, max_attempts=3)
+        data = resp.json()
+        item = (data.get("data") or [{}])[0]
+        
+        if item.get("url"):
+            return {"url": item["url"], "credit": "AI-generated (Together)", "caption": "AI-generated illustration"}
+        if item.get("b64_json"):
+            return {"url": f"data:image/jpeg;base64,{item['b64_json']}", "credit": "AI-generated (Together)", "caption": "AI-generated illustration"}
+    except Exception as e:
+        LOG.warning("Together image generation failed: %s", e)
+    
+    return None
+
+def generate_image_openrouter(prompt: str, width: int = 1024, height: int = 768, model: str = "openai/dall-e-3") -> Optional[Dict[str, str]]:
+    """Generate image using OpenRouter (requires image-capable model)"""
+    key = get_setting("openrouter_api_key")
+    if not key:
+        LOG.warning("OpenRouter API key not set")
+        return None
+    
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://bot.gadgeek.in",
+        "X-Title": "Gadgeek Tech News",
+    }
+    
+    # OpenRouter uses chat completions format for DALL-E
+    messages = [{"role": "user", "content": prompt}]
+    payload = {
+        "model": model,
+        "messages": messages,
+    }
+    
+    try:
+        resp = request_with_retry("POST", OPENROUTER_CHAT_URL, headers=headers, json_body=payload, timeout=120, max_attempts=3)
+        data = resp.json()
+        
+        # Extract image URL from response
+        choices = data.get("choices") or []
+        if choices:
+            content = (choices[0].get("message") or {}).get("content") or ""
+            # Try to extract URL from content (format varies by model)
+            import re
+            urls = re.findall(r'https?://[^\s<>"]+', content)
+            if urls:
+                return {"url": urls[0], "credit": "AI-generated (OpenRouter)", "caption": "AI-generated illustration"}
+    except Exception as e:
+        LOG.warning("OpenRouter image generation failed: %s", e)
+    
     return None
 
 # -------------------------
@@ -721,13 +768,11 @@ def slugify(text: str, max_len: int = 80) -> str:
     return text
 
 def _sanitize_json(s: str) -> str:
-    # replace smart quotes, remove trailing commas
     s = s.replace("\u201c", '"').replace("\u201d", '"').replace("\u2019", "'")
     s = re.sub(r",(\s*[}\]])", r"\1", s)
     return s
 
 def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    # Try direct parse
     t = text.strip()
     t = _sanitize_json(t)
     try:
@@ -736,7 +781,7 @@ def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
             return obj
     except Exception:
         pass
-    # brace-balance extraction
+    
     start = t.find("{")
     if start == -1:
         return None
@@ -763,13 +808,11 @@ def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
 # -------------------------
 
 def build_generation_prompt(title: str, category_name: str, pack: Dict[str, Any]) -> List[Dict[str, str]]:
-    # Keep inputs short: include extracted content summaries, not raw full pages if enormous.
     extract_results = (pack.get("extract") or {}).get("results") or []
     snippets = []
     for r in extract_results[:5]:
         url = r.get("url") or ""
         content = (r.get("content") or r.get("raw_content") or "").strip()
-        # limit length per source
         if len(content) > 1500:
             content = content[:1500] + "…"
         snippets.append(f"SOURCE: {url}\n{content}")
@@ -823,7 +866,6 @@ def seo_prompt(title: str, category_name: str, html: str) -> List[Dict[str, str]
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 def build_image_prompt(title: str) -> str:
-    # For news, avoid pretending it's a real event photo.
     return (
         f"High-quality realistic product-style hero image illustrating the tech topic: {title}. "
         "No people, no brand logos, no text. Studio lighting, clean background. Looks like a magazine illustration."
@@ -838,12 +880,12 @@ def create_article_from_lead(title: str, category_name: str) -> Dict[str, Any]:
     if not draft_html.strip():
         raise RuntimeError("Generation returned empty content.")
 
-    # Humanize (always)
+    # Humanize
     human_html = chat_stage("humanize", humanize_prompt(draft_html))
     if not human_html.strip():
         human_html = draft_html
 
-    # SEO JSON
+    # SEO
     seo_out = chat_stage("seo", seo_prompt(title, category_name, human_html))
     seo = extract_json_object(seo_out) or {}
 
@@ -856,7 +898,7 @@ def create_article_from_lead(title: str, category_name: str) -> Dict[str, Any]:
     # Image selection
     img = extracted_img
     if not img:
-        gen_img = generate_image_together(build_image_prompt(title))
+        gen_img = generate_image(build_image_prompt(title))
         img = gen_img
 
     featured_image = img["url"] if img else ""
@@ -869,9 +911,9 @@ def create_article_from_lead(title: str, category_name: str) -> Dict[str, Any]:
 
     return {
         "title": title,
-        "slug": f"{slug}-{hashlib.md5(title.encode('utf-8')).hexdigest()[:6]}",  # collision-safe without reads
+        "slug": f"{slug}-{hashlib.md5(title.encode('utf-8')).hexdigest()[:6]}",
         "status": "published",
-        "category_slug": category_name,  # will be overwritten by caller with slug; keep name for safety
+        "category_slug": category_name,
         "short_description": short_description,
         "content": human_html,
         "featured_image": featured_image,
@@ -885,10 +927,9 @@ def create_article_from_lead(title: str, category_name: str) -> Dict[str, Any]:
 
 def publish_article_to_directus(article: Dict[str, Any], category_slug: str) -> Dict[str, Any]:
     col = articles_collection()
-    # category stored as slug string
     payload = dict(article)
     payload["category_slug"] = category_slug
-    # Remove empty fields (Directus validations vary; keep required ones)
+    
     required = {"title", "slug", "status", "category_slug", "content"}
     clean = {}
     for k, v in payload.items():
@@ -902,6 +943,6 @@ def publish_article_to_directus(article: Dict[str, Any], category_slug: str) -> 
         if isinstance(v, list) and len(v) == 0:
             continue
         clean[k] = v
+    
     data = directus_post(f"/items/{col}", clean)
     return data.get("data") or {}
-

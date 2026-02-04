@@ -185,7 +185,7 @@ async function loadModels(){
     ["seo","SEO (Meta/tags/short desc)"],
     ["image","Image Generation"]
   ];
-  let html = "<table><tr><th>Stage</th><th>Provider</th><th>Model</th><th>Temp</th><th>Max tokens</th></tr>";
+  let html = "<table><tr><th>Stage</th><th>Provider</th><th>Model</th><th>Temp</th><th>Max tokens</th><th>Width</th><th>Height</th></tr>";
   for(const [stage,label] of stages){
     const r = routes[stage] || {};
     const isImage = stage === "image";
@@ -198,8 +198,10 @@ async function loadModels(){
         </select>
       </td>
       <td><input id="model_${stage}" value="${(r.model||"").replaceAll('"','&quot;')}" placeholder="model id"/></td>
-      <td><input id="temp_${stage}" type="number" step="${isImage?'64':'0.1'}" value="${isImage?(r.width??""):(r.temperature??"")}" placeholder="${isImage?'width':'temp'}" /></td>
-      <td><input id="max_${stage}" type="number" step="${isImage?'64':'50'}" value="${isImage?(r.height??""):(r.max_tokens??"")}" placeholder="${isImage?'height':'max tokens'}" /></td>
+      <td><input id="temp_${stage}" type="number" step="0.1" value="${r.temperature??""}" ${isImage?"disabled":""} /></td>
+      <td><input id="max_${stage}" type="number" step="50" value="${r.max_tokens??""}" ${isImage?"disabled":""} /></td>
+      <td><input id="width_${stage}" type="number" step="64" value="${r.width??""}" ${!isImage?"disabled":""} /></td>
+      <td><input id="height_${stage}" type="number" step="64" value="${r.height??""}" ${!isImage?"disabled":""} /></td>
     </tr>`;
   }
   html += "</table>";
@@ -219,20 +221,13 @@ async function saveModels(){
       payload[stage].temperature = document.getElementById(`temp_${stage}`).value;
       payload[stage].max_tokens = document.getElementById(`max_${stage}`).value;
     } else {
-      // For image stage, temp field = width, max field = height
-      payload[stage].width = document.getElementById(`temp_${stage}`).value;
-      payload[stage].height = document.getElementById(`max_${stage}`).value;
-    }
-  }
-  await apiPost("/api/models", payload);
-  alert("Saved model routing.");
-}
-
-async function loadCategories(){
-  const res = await apiGet("/api/categories");
-  const box = $("categories_table");
-  if(!res.ok){
-    box.innerHTML = `<p class="muted">Failed to load categories: ${res.error}</p>`;
+      payload[stage].width = document.getElementById(`width_${stage}`).value;
+      payload[stage].height = document.getElementById(`height_${stage}`).value;
+tage}`).value;
+    } else {
+      payload[stage].width = document.getElementById(`width_${stage}`).value;
+      payload[stage].height = document.getElementById(`height_${stage}`).value;
+`;
     return;
   }
   const cats = res.categories || [];

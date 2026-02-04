@@ -1,5 +1,6 @@
 import json
 import threading
+import traceback
 from typing import Any, Dict
 
 from flask import Flask, request, jsonify, send_from_directory
@@ -26,7 +27,15 @@ from common import get_categories, parse_feed, extract_entry_fields
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
 setup_logging()
-init_db()
+
+# Try to initialize DB, but don't crash if it fails
+try:
+    init_db()
+    LOG.info("Database initialized successfully")
+except Exception as e:
+    LOG.error(f"Failed to initialize database: {e}")
+    LOG.error(traceback.format_exc())
+    # Don't exit - let the app start so we can see error details in API responses
 
 
 # -------------------------
@@ -46,80 +55,110 @@ def static_files(path):
 @app.get("/api/state")
 @require_basic_auth
 def api_state():
-    s = list_settings()
-    routes = get_model_routes()
-    feeds = list_feeds()
-    # basic health
-    def ok(v): return bool(v and str(v).strip())
-    health = {
-        "directus": ok(s.get("directus_url")) and ok(s.get("directus_token")),
-        "slack": ok(s.get("slack_bot_token")) and ok(s.get("slack_channel_id")),
-        "tavily": ok(s.get("tavily_api_key")),
-        "together": ok(s.get("together_api_key")),
-        "openrouter": ok(s.get("openrouter_api_key")),
-    }
-    return jsonify({"settings": s, "routes": routes, "feeds_count": len(feeds), "health": health})
+    try:
+        s = list_settings()
+        routes = get_model_routes()
+        feeds = list_feeds()
+        # basic health
+        def ok(v): return bool(v and str(v).strip())
+        health = {
+            "directus": ok(s.get("directus_url")) and ok(s.get("directus_token")),
+            "slack": ok(s.get("slack_bot_token")) and ok(s.get("slack_channel_id")),
+            "tavily": ok(s.get("tavily_api_key")),
+            "together": ok(s.get("together_api_key")),
+            "openrouter": ok(s.get("openrouter_api_key")),
+        }
+        return jsonify({"settings": s, "routes": routes, "feeds_count": len(feeds), "health": health})
+    except Exception as e:
+        LOG.error(f"Error in /api/state: {e}")
+        LOG.error(traceback.format_exc())
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 @app.get("/api/settings")
 @require_basic_auth
 def api_get_settings():
-    s = list_settings()
-    secret_keys = {"directus_token","slack_bot_token","slack_signing_secret","tavily_api_key","together_api_key","openrouter_api_key"}
-    out = dict(s)
-    for k in secret_keys:
-        if k in out and out[k]:
-            out[k] = ""  # never echo secrets back
-    out["_secrets_present"] = {k: bool(s.get(k)) for k in secret_keys}
-    return jsonify(out)
+    try:
+        s = list_settings()
+        secret_keys = {"directus_token","slack_bot_token","slack_signing_secret","tavily_api_key","together_api_key","openrouter_api_key"}
+        out = dict(s)
+        for k in secret_keys:
+            if k in out and out[k]:
+                out[k] = ""  # never echo secrets back
+        out["_secrets_present"] = {k: bool(s.get(k)) for k in secret_keys}
+        return jsonify(out)
+    except Exception as e:
+        LOG.error(f"Error in /api/settings: {e}")
+        LOG.error(traceback.format_exc())
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 @app.post("/api/settings")
 @require_basic_auth
 def api_set_settings():
-    data = request.get_json(force=True, silent=False) or {}
-    secret_keys = {"directus_token","slack_bot_token","slack_signing_secret","tavily_api_key","together_api_key","openrouter_api_key"}
-    for k, v in data.items():
-        if not isinstance(k, str):
-            continue
-        # For secrets: ignore empty string so users don't accidentally wipe them
-        if k in secret_keys and (v is None or str(v).strip() == ""):
-            continue
-        set_setting(k, "" if v is None else str(v))
-    return jsonify({"ok": True})
+    try:
+        data = request.get_json(force=True, silent=False) or {}
+        secret_keys = {"directus_token","slack_bot_token","slack_signing_secret","tavily_api_key","together_api_key","openrouter_api_key"}
+        for k, v in data.items():
+            if not isinstance(k, str):
+                continue
+            # For secrets: ignore empty string so users don't accidentally wipe them
+            if k in secret_keys and (v is None or str(v).strip() == ""):
+                continue
+            set_setting(k, "" if v is None else str(v))
+        return jsonify({"ok": True})
+    except Exception as e:
+        LOG.error(f"Error in /api/settings POST: {e}")
+        LOG.error(traceback.format_exc())
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 @app.get("/api/feeds")
 @require_basic_auth
 def api_list_feeds():
-    return jsonify(list_feeds())
+    try:
+        return jsonify(list_feeds())
+    except Exception as e:
+        LOG.error(f"Error in /api/feeds: {e}")
+        LOG.error(traceback.format_exc())
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 @app.post("/api/feeds")
 @require_basic_auth
 def api_upsert_feed():
-    feed = request.get_json(force=True, silent=False) or {}
-    if not feed.get("url"):
-        return jsonify({"ok": False, "error": "url required"}), 400
-    fid = upsert_feed(feed)
-    return jsonify({"ok": True, "id": fid})
+    try:
+        feed = request.get_json(force=True, silent=False) or {}
+        if not feed.get("url"):
+            return jsonify({"ok": False, "error": "url required"}), 400
+        fid = upsert_feed(feed)
+        return jsonify({"ok": True, "id": fid})
+    except Exception as e:
+        LOG.error(f"Error in /api/feeds POST: {e}")
+        LOG.error(traceback.format_exc())
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 @app.delete("/api/feeds/<int:feed_id>")
 @require_basic_auth
 def api_delete_feed(feed_id: int):
-    delete_feed(feed_id)
-    return jsonify({"ok": True})
+    try:
+        delete_feed(feed_id)
+        return jsonify({"ok": True})
+    except Exception as e:
+        LOG.error(f"Error in /api/feeds DELETE: {e}")
+        LOG.error(traceback.format_exc())
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 @app.post("/api/feeds/test")
 @require_basic_auth
 def api_test_feed():
-    payload = request.get_json(force=True, silent=False) or {}
-    url = payload.get("url")
-    if not url:
-        return jsonify({"ok": False, "error": "url required"}), 400
-    selectors = {
-        "title_key": payload.get("title_key"),
-        "description_key": payload.get("description_key"),
-        "content_key": payload.get("content_key"),
-        "category_key": payload.get("category_key"),
-    }
     try:
+        payload = request.get_json(force=True, silent=False) or {}
+        url = payload.get("url")
+        if not url:
+            return jsonify({"ok": False, "error": "url required"}), 400
+        selectors = {
+            "title_key": payload.get("title_key"),
+            "description_key": payload.get("description_key"),
+            "content_key": payload.get("content_key"),
+            "category_key": payload.get("category_key"),
+        }
         parsed = parse_feed(url)
         samples = []
         for ent in (parsed.entries or [])[:3]:
@@ -127,49 +166,61 @@ def api_test_feed():
             samples.append({"title": f.get("title"), "link": f.get("link"), "description": (f.get("description") or "")[:180], "category": f.get("category")})
         return jsonify({"ok": True, "samples": samples, "feed_title": getattr(parsed.feed, "title", "") or parsed.feed.get("title", "")})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        LOG.error(f"Error in /api/feeds/test: {e}")
+        LOG.error(traceback.format_exc())
+        return jsonify({"ok": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
 @app.get("/api/models")
 @require_basic_auth
 def api_get_models():
-    return jsonify(get_model_routes())
+    try:
+        return jsonify(get_model_routes())
+    except Exception as e:
+        LOG.error(f"Error in /api/models: {e}")
+        LOG.error(traceback.format_exc())
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 @app.post("/api/models")
 @require_basic_auth
 def api_set_models():
-    data = request.get_json(force=True, silent=False) or {}
-    for stage, cfg in data.items():
-        if stage not in ("generation", "humanize", "seo", "image"):
-            continue
-        provider = (cfg.get("provider") or "").strip()
-        model = (cfg.get("model") or "").strip()
-        if not provider or not model:
-            continue
-        
-        temperature = cfg.get("temperature", None)
-        max_tokens = cfg.get("max_tokens", None)
-        width = cfg.get("width", None)
-        height = cfg.get("height", None)
-        
-        try:
-            temperature = float(temperature) if temperature is not None and temperature != "" else None
-        except Exception:
-            temperature = None
-        try:
-            max_tokens = int(max_tokens) if max_tokens is not None and max_tokens != "" else None
-        except Exception:
-            max_tokens = None
-        try:
-            width = int(width) if width is not None and width != "" else None
-        except Exception:
-            width = None
-        try:
-            height = int(height) if height is not None and height != "" else None
-        except Exception:
-            height = None
-        
-        set_model_route(stage, provider, model, temperature, max_tokens, width, height)
-    return jsonify({"ok": True})
+    try:
+        data = request.get_json(force=True, silent=False) or {}
+        for stage, cfg in data.items():
+            if stage not in ("generation", "humanize", "seo", "image"):
+                continue
+            provider = (cfg.get("provider") or "").strip()
+            model = (cfg.get("model") or "").strip()
+            if not provider or not model:
+                continue
+            
+            temperature = cfg.get("temperature", None)
+            max_tokens = cfg.get("max_tokens", None)
+            width = cfg.get("width", None)
+            height = cfg.get("height", None)
+            
+            try:
+                temperature = float(temperature) if temperature is not None and temperature != "" else None
+            except Exception:
+                temperature = None
+            try:
+                max_tokens = int(max_tokens) if max_tokens is not None and max_tokens != "" else None
+            except Exception:
+                max_tokens = None
+            try:
+                width = int(width) if width is not None and width != "" else None
+            except Exception:
+                width = None
+            try:
+                height = int(height) if height is not None and height != "" else None
+            except Exception:
+                height = None
+            
+            set_model_route(stage, provider, model, temperature, max_tokens, width, height)
+        return jsonify({"ok": True})
+    except Exception as e:
+        LOG.error(f"Error in /api/models POST: {e}")
+        LOG.error(traceback.format_exc())
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 @app.get("/api/categories")
 @require_basic_auth
@@ -178,7 +229,9 @@ def api_categories():
         cats = get_categories()
         return jsonify({"ok": True, "categories": cats})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e), "categories": []}), 500
+        LOG.error(f"Error in /api/categories: {e}")
+        LOG.error(traceback.format_exc())
+        return jsonify({"ok": False, "error": str(e), "categories": [], "traceback": traceback.format_exc()}), 500
 
 # -------------------------
 # Slack interactions
@@ -201,32 +254,32 @@ def _async_publish(lead_id: int, slack_ctx: Dict[str, str], response_url: str = 
 
 @app.post("/slack/interactions")
 def slack_interactions():
-    raw = request.get_data() or b""
-    if not verify_slack_signature(dict(request.headers), raw):
-        return "invalid signature", 401
+    try:
+        raw = request.get_data() or b""
+        if not verify_slack_signature(dict(request.headers), raw):
+            return "invalid signature", 401
 
-    payload = _parse_slack_payload(request)
-    if not payload:
-        return jsonify({"ok": True})
-
-    # Block actions
-    if payload.get("type") == "block_actions":
-        actions = payload.get("actions") or []
-        if not actions:
-            return jsonify({"ok": True})
-        action = actions[0]
-        action_id = action.get("action_id")
-        lead_id = int(action.get("value") or 0)
-        response_url = payload.get("response_url") or ""
-
-        channel_id = (payload.get("channel") or {}).get("id") or ""
-        message_ts = (payload.get("message") or {}).get("ts") or ""
-        title = ((payload.get("message") or {}).get("text") or "").strip()
-
-        if lead_id <= 0:
+        payload = _parse_slack_payload(request)
+        if not payload:
             return jsonify({"ok": True})
 
-        try:
+        # Block actions
+        if payload.get("type") == "block_actions":
+            actions = payload.get("actions") or []
+            if not actions:
+                return jsonify({"ok": True})
+            action = actions[0]
+            action_id = action.get("action_id")
+            lead_id = int(action.get("value") or 0)
+            response_url = payload.get("response_url") or ""
+
+            channel_id = (payload.get("channel") or {}).get("id") or ""
+            message_ts = (payload.get("message") or {}).get("ts") or ""
+            title = ((payload.get("message") or {}).get("text") or "").strip()
+
+            if lead_id <= 0:
+                return jsonify({"ok": True})
+
             if action_id == "approve":
                 update_lead_status(lead_id, "approved")
                 # optional ephemeral ack
@@ -249,20 +302,32 @@ def slack_interactions():
                 # no "publishing..." message; only update after published in publisher.py
                 return jsonify({"ok": True})
 
-        except Exception as e:
-            LOG.exception("Slack action handling error: %s", e)
-            if response_url:
-                slack_ephemeral(response_url, f"❌ Error: {e}")
-            return jsonify({"ok": True})
-
-    return jsonify({"ok": True})
+        return jsonify({"ok": True})
+        
+    except Exception as e:
+        LOG.exception("Slack action handling error: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 # Backward compatible alias
 @app.post("/slack/actions")
 def slack_actions_alias():
     return slack_interactions()
 
+# Add a health check endpoint that doesn't require auth
+@app.get("/health")
+def health_check():
+    try:
+        from common import _get_redis
+        r = _get_redis()
+        r.ping()
+        return jsonify({"status": "ok", "redis": "connected"})
+    except Exception as e:
+        return jsonify({"status": "error", "redis": "disconnected", "error": str(e)}), 500
+
 if __name__ == "__main__":
     setup_logging()
-    init_db()
-    app.run(host="0.0.0.0", port=8000)
+    try:
+        init_db()
+    except Exception as e:
+        LOG.error(f"Failed to initialize DB: {e}")
+    app.run(host="0.0.0.0", port=8000, debug=False)

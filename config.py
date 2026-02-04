@@ -5,7 +5,8 @@ Only connection details for Redis are defined here.
 """
 
 # Redis connection (shared settings store across all services)
-REDIS_HOST = "redis"  # Change to your Redis service name in Coolify
+REDIS_HOST = "redis"  # Your Redis service name in Coolify
 REDIS_PORT = 6379
 REDIS_DB = 0
+REDIS_USERNAME = "default"  # Redis 6+ uses ACL with usernames
 REDIS_PASSWORD = "1lDv4AfM8MqY7ZBj8RkdrNlIjfg7P8n73umHI0FKz06cvFawaJrXbFWZIh883qxT"

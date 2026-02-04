@@ -16,7 +16,7 @@ import requests
 import feedparser
 import redis
 
-from config import REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD
+from config import REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD
 
 LOG = logging.getLogger("technews")
 
@@ -42,6 +42,7 @@ def _get_redis() -> redis.Redis:
             host=REDIS_HOST,
             port=REDIS_PORT,
             db=REDIS_DB,
+            username=REDIS_USERNAME,
             password=REDIS_PASSWORD if REDIS_PASSWORD else None,
             decode_responses=True,
             socket_connect_timeout=5,

@@ -38,16 +38,24 @@ _REDIS_CLIENT = None
 def _get_redis() -> redis.Redis:
     global _REDIS_CLIENT
     if _REDIS_CLIENT is None:
-        _REDIS_CLIENT = redis.Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
-            db=REDIS_DB,
-            username=REDIS_USERNAME,
-            password=REDIS_PASSWORD if REDIS_PASSWORD else None,
-            decode_responses=True,
-            socket_connect_timeout=5,
-            socket_timeout=5,
-        )
+        try:
+            _REDIS_CLIENT = redis.Redis(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                db=REDIS_DB,
+                username=REDIS_USERNAME,
+                password=REDIS_PASSWORD,
+                decode_responses=True,
+                socket_connect_timeout=10,
+                socket_timeout=10,
+            )
+            # Test the connection
+            _REDIS_CLIENT.ping()
+            LOG.info(f"✅ Redis connected successfully to {REDIS_HOST}:{REDIS_PORT}")
+        except Exception as e:
+            LOG.error(f"❌ Redis connection failed: {e}")
+            LOG.error(f"Host: {REDIS_HOST}, Port: {REDIS_PORT}, Username: {REDIS_USERNAME}")
+            raise RuntimeError(f"Cannot connect to Redis at {REDIS_HOST}:{REDIS_PORT}: {e}") from e
     return _REDIS_CLIENT
 
 DEFAULTS_SETTINGS: Dict[str, str] = {

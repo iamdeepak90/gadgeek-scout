@@ -178,7 +178,15 @@ def api_categories():
         cats = get_categories()
         return jsonify({"ok": True, "categories": cats})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e), "categories": []}), 500
+        LOG.exception("Categories API error")
+        import traceback
+        error_details = {
+            "ok": False, 
+            "error": str(e), 
+            "categories": [],
+            "traceback": traceback.format_exc()
+        }
+        return jsonify(error_details), 500
 
 # -------------------------
 # Slack interactions
@@ -197,7 +205,7 @@ def _parse_slack_payload(req) -> Dict[str, Any]:
 def _async_publish(lead_id: int, slack_ctx: Dict[str, str], response_url: str = ""):
     res = publisher_mod.publish_lead_by_id(lead_id, slack_ctx=slack_ctx)
     if not res.get("ok") and response_url:
-        slack_ephemeral(response_url, f"âŒ Publish failed, reverted to approved.\nError: {res.get('error')}")
+        slack_ephemeral(response_url, f"❌ Publish failed, reverted to approved.\nError: {res.get('error')}")
 
 @app.post("/slack/interactions")
 def slack_interactions():
@@ -231,13 +239,13 @@ def slack_interactions():
                 update_lead_status(lead_id, "approved")
                 # optional ephemeral ack
                 if response_url:
-                    slack_ephemeral(response_url, "âœ… Approved.")
+                    slack_ephemeral(response_url, "✅ Approved.")
                 return jsonify({"ok": True})
 
             if action_id == "reject":
                 update_lead_status(lead_id, "rejected")
                 if response_url:
-                    slack_ephemeral(response_url, "âŒ Rejected.")
+                    slack_ephemeral(response_url, "❌ Rejected.")
                 return jsonify({"ok": True})
 
             if action_id == "urgent":
@@ -252,7 +260,7 @@ def slack_interactions():
         except Exception as e:
             LOG.exception("Slack action handling error: %s", e)
             if response_url:
-                slack_ephemeral(response_url, f"âŒ Error: {e}")
+                slack_ephemeral(response_url, f"❌ Error: {e}")
             return jsonify({"ok": True})
 
     return jsonify({"ok": True})

@@ -402,49 +402,66 @@ def directus_patch(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
     return resp.json()
 
 def get_categories() -> List[Dict[str, Any]]:
-    col = categories_collection()
-    params = urlencode({"filter[enabled][_eq]": "true", "sort": "priority", "limit": "-1"})
-    data = directus_get(f"/items/{col}?{params}")
-    cats = data.get("data") or []
-    out = []
-    for c in cats:
-        kw = c.get("keywords")
-        if isinstance(kw, str):
-            try:
-                kw = json.loads(kw)
-            except Exception:
-                kw = []
-        if not isinstance(kw, list):
-            kw = []
+    try:
+        col = categories_collection()
+        params = urlencode({"filter[enabled][_eq]": "true", "sort": "priority", "limit": "-1"})
+        data = directus_get(f"/items/{col}?{params}")
+        cats = data.get("data") or []
         
-        # Handle priority safely
-        priority = c.get("priority")
-        if priority is None or priority == "":
-            priority = 999
-        else:
-            try:
-                priority = int(priority)
-            except (ValueError, TypeError):
-                priority = 999
+        if not cats:
+            LOG.warning("No categories found in Directus")
+            return []
         
-        # Handle posts_per_scout safely
-        posts_per_scout = c.get("posts_per_scout")
-        if posts_per_scout is None or posts_per_scout == "":
-            posts_per_scout = 0
-        else:
+        out = []
+        for c in cats:
             try:
-                posts_per_scout = int(posts_per_scout)
-            except (ValueError, TypeError):
-                posts_per_scout = 0
+                # Handle keywords
+                kw = c.get("keywords")
+                if isinstance(kw, str):
+                    try:
+                        kw = json.loads(kw)
+                    except Exception:
+                        kw = []
+                if not isinstance(kw, list):
+                    kw = []
+                
+                # Handle priority safely
+                priority = c.get("priority")
+                if priority is None or priority == "" or priority == "null":
+                    priority = 999
+                else:
+                    try:
+                        priority = int(float(priority))  # Handle float strings too
+                    except (ValueError, TypeError):
+                        LOG.warning(f"Invalid priority value: {priority}")
+                        priority = 999
+                
+                # Handle posts_per_scout safely
+                posts_per_scout = c.get("posts_per_scout")
+                if posts_per_scout is None or posts_per_scout == "" or posts_per_scout == "null":
+                    posts_per_scout = 0
+                else:
+                    try:
+                        posts_per_scout = int(float(posts_per_scout))  # Handle float strings too
+                    except (ValueError, TypeError):
+                        LOG.warning(f"Invalid posts_per_scout value: {posts_per_scout}")
+                        posts_per_scout = 0
+                
+                out.append({
+                    "slug": c.get("slug") or "",
+                    "name": c.get("name") or "",
+                    "priority": priority,
+                    "posts_per_scout": posts_per_scout,
+                    "keywords": kw,
+                })
+            except Exception as e:
+                LOG.error(f"Failed to process category: {c}. Error: {e}")
+                continue
         
-        out.append({
-            "slug": c.get("slug") or "",
-            "name": c.get("name") or "",
-            "priority": priority,
-            "posts_per_scout": posts_per_scout,
-            "keywords": kw,
-        })
-    return out
+        return out
+    except Exception as e:
+        LOG.error(f"Failed to fetch categories: {e}")
+        raise
 
 def lead_exists_by_url(source_url: str) -> bool:
     col = leads_collection()

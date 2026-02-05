@@ -20,6 +20,10 @@ from config import REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSW
 
 LOG = logging.getLogger("technews")
 
+# Static configuration constants
+HTTP_TIMEOUT = 60  # seconds
+USER_AGENT = "Mozilla/5.0 (compatible; GadgeekBot/2.0; +https://bot.gadgeek.in)"
+
 # -------------------------
 # Logging
 # -------------------------
@@ -74,8 +78,6 @@ DEFAULTS_SETTINGS: Dict[str, str] = {
     "together_api_key": "",
     "openrouter_api_key": "",
     # runtime
-    "http_timeout": "30",
-    "user_agent": "Mozilla/5.0 (compatible; TechNewsAutomation/1.0; +https://bot.gadgeek.in/settings)",
     "publish_interval_minutes": "20",
     "scout_interval_minutes": "30",
     # pipeline options
@@ -134,19 +136,15 @@ def init_db() -> None:
         raise
 
 def get_setting(key: str, default: Optional[str] = None) -> str:
-    """Get a setting from Redis"""
+    """Get a setting from Redis, returning default if empty or not found"""
     r = _get_redis()
-    redis_key = f"settings:{key}"
-    value = r.hget(redis_key, "value")
-    if value is not None:
-        return value
-    return default if default is not None else ""
+    value = r.hget(f"settings:{key}", "value")
+    return value if value else (default or "")
 
 def set_setting(key: str, value: str) -> None:
     """Set a setting in Redis"""
     r = _get_redis()
-    redis_key = f"settings:{key}"
-    r.hset(redis_key, mapping={"value": value, "updated_at": _now_iso()})
+    r.hset(f"settings:{key}", mapping={"value": value, "updated_at": _now_iso()})
 
 def list_settings() -> Dict[str, str]:
     """List all settings from Redis"""
@@ -324,14 +322,12 @@ def request_with_retry(
     url: str,
     headers: Optional[Dict[str, str]] = None,
     json_body: Optional[Dict[str, Any]] = None,
-    timeout: int = 30,
+    timeout: int = HTTP_TIMEOUT,
     max_attempts: int = 3,
 ) -> Response:
-    timeout = int(get_setting("http_timeout", str(timeout)))
-    ua = get_setting("user_agent", "TechNewsBot/1.0")
     hdrs = headers or {}
     if "User-Agent" not in hdrs:
-        hdrs["User-Agent"] = ua
+        hdrs["User-Agent"] = USER_AGENT
     
     for attempt in range(1, max_attempts + 1):
         try:
@@ -363,10 +359,10 @@ def require_basic_auth(f):
 # -------------------------
 
 def directus_url() -> str:
-    return (get_setting("directus_url") or "").rstrip("/")
+    return get_setting("directus_url", "").rstrip("/")
 
 def directus_token() -> str:
-    return get_setting("directus_token") or ""
+    return get_setting("directus_token", "")
 
 def leads_collection() -> str:
     return get_setting("directus_leads_collection", "news_leads")
@@ -402,66 +398,50 @@ def directus_patch(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
     return resp.json()
 
 def get_categories() -> List[Dict[str, Any]]:
-    try:
-        col = categories_collection()
-        params = urlencode({"filter[enabled][_eq]": "true", "sort": "priority", "limit": "-1"})
-        data = directus_get(f"/items/{col}?{params}")
-        cats = data.get("data") or []
-        
-        if not cats:
-            LOG.warning("No categories found in Directus")
-            return []
-        
-        out = []
-        for c in cats:
-            try:
-                # Handle keywords
-                kw = c.get("keywords")
-                if isinstance(kw, str):
-                    try:
-                        kw = json.loads(kw)
-                    except Exception:
-                        kw = []
-                if not isinstance(kw, list):
+    """Fetch enabled categories from Directus"""
+    col = categories_collection()
+    params = urlencode({"filter[enabled][_eq]": "true", "sort": "priority", "limit": "-1"})
+    data = directus_get(f"/items/{col}?{params}")
+    cats = data.get("data") or []
+    
+    if not cats:
+        LOG.warning("No categories found in Directus")
+        return []
+    
+    result = []
+    for c in cats:
+        try:
+            # Parse keywords
+            kw = c.get("keywords", [])
+            if isinstance(kw, str):
+                try:
+                    kw = json.loads(kw)
+                except Exception:
                     kw = []
-                
-                # Handle priority safely
-                priority = c.get("priority")
-                if priority is None or priority == "" or priority == "null":
-                    priority = 999
-                else:
-                    try:
-                        priority = int(float(priority))  # Handle float strings too
-                    except (ValueError, TypeError):
-                        LOG.warning(f"Invalid priority value: {priority}")
-                        priority = 999
-                
-                # Handle posts_per_scout safely
-                posts_per_scout = c.get("posts_per_scout")
-                if posts_per_scout is None or posts_per_scout == "" or posts_per_scout == "null":
-                    posts_per_scout = 0
-                else:
-                    try:
-                        posts_per_scout = int(float(posts_per_scout))  # Handle float strings too
-                    except (ValueError, TypeError):
-                        LOG.warning(f"Invalid posts_per_scout value: {posts_per_scout}")
-                        posts_per_scout = 0
-                
-                out.append({
-                    "slug": c.get("slug") or "",
-                    "name": c.get("name") or "",
-                    "priority": priority,
-                    "posts_per_scout": posts_per_scout,
-                    "keywords": kw,
-                })
-            except Exception as e:
-                LOG.error(f"Failed to process category: {c}. Error: {e}")
-                continue
-        
-        return out
-    except Exception as e:
-        LOG.error(f"Failed to fetch categories: {e}")
-        raise
+            if not isinstance(kw, list):
+                kw = []
+            
+            # Safe int conversion helper
+            def safe_int(val, default):
+                if val in (None, "", "null"):
+                    return default
+                try:
+                    return int(float(val))
+                except (ValueError, TypeError):
+                    return default
+            
+            result.append({
+                "slug": c.get("slug", ""),
+                "name": c.get("name", ""),
+                "priority": safe_int(c.get("priority"), 999),
+                "posts_per_scout": safe_int(c.get("posts_per_scout"), 0),
+                "keywords": kw,
+            })
+        except Exception as e:
+            LOG.error(f"Failed to process category {c.get('slug', 'unknown')}: {e}")
+            continue
+    
+    return result
 
 def lead_exists_by_url(source_url: str) -> bool:
     col = leads_collection()
@@ -498,13 +478,13 @@ def list_one_approved_lead_newest() -> Optional[Dict[str, Any]]:
 # -------------------------
 
 def slack_token() -> str:
-    return get_setting("slack_bot_token") or ""
+    return get_setting("slack_bot_token", "")
 
 def slack_channel() -> str:
-    return get_setting("slack_channel_id") or ""
+    return get_setting("slack_channel_id", "")
 
 def slack_signing_secret() -> str:
-    return get_setting("slack_signing_secret") or ""
+    return get_setting("slack_signing_secret", "")
 
 def verify_slack_signature(headers: Dict[str, str], body: bytes) -> bool:
     secret = slack_signing_secret()
@@ -569,9 +549,7 @@ def slack_ephemeral(response_url: str, text: str) -> None:
 # -------------------------
 
 def parse_feed(url: str):
-    ua = get_setting("user_agent", "TechNewsBot/1.0")
-    timeout = int(get_setting("http_timeout", "30"))
-    resp = requests.get(url, headers={"User-Agent": ua}, timeout=timeout)
+    resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
     return feedparser.parse(resp.content)
 
 def _nested_get(d: Any, key: str) -> Any:

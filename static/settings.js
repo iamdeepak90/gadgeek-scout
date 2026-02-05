@@ -58,8 +58,7 @@ async function loadSettings(){
   // simple inputs
   const keys = [
     "directus_url","directus_leads_collection","directus_articles_collection","directus_categories_collection",
-    "slack_channel_id","publish_interval_minutes","scout_interval_minutes","http_timeout","user_agent",
-    "prefer_extracted_image"
+    "slack_channel_id","publish_interval_minutes","scout_interval_minutes","prefer_extracted_image"
   ];
   keys.forEach(k=>{
     const el = $(k);
@@ -85,8 +84,6 @@ async function saveSystem(){
     slack_channel_id: $("slack_channel_id").value.trim(),
     publish_interval_minutes: $("publish_interval_minutes").value.trim(),
     scout_interval_minutes: $("scout_interval_minutes").value.trim(),
-    http_timeout: $("http_timeout").value.trim(),
-    user_agent: $("user_agent").value.trim(),
     prefer_extracted_image: $("prefer_extracted_image").value,
   };
 

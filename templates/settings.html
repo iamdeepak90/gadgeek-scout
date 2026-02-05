@@ -102,12 +102,6 @@
           <label>Scout interval (minutes)
             <input id="scout_interval_minutes" type="number" min="1" step="1" />
           </label>
-          <label>HTTP timeout (seconds)
-            <input id="http_timeout" type="number" min="5" step="1" />
-          </label>
-          <label>User-Agent
-            <input id="user_agent" />
-          </label>
           <label>Prefer extracted images (Tavily)
             <select id="prefer_extracted_image">
               <option value="1">Yes (recommended)</option>
@@ -164,7 +158,7 @@
     <section id="models" class="panel">
       <div class="card">
         <h2>Stage routing</h2>
-        <p class="muted">Choose Together or OpenRouter per stage. Model IDs must match the provider. For image generation, width/height are used instead of temp/max_tokens.</p>
+        <p class="muted">Choose Together or OpenRouter per stage. Model IDs must match the provider. For image generation, use the Temp column for width and Max tokens column for height.</p>
         <div id="models_form"></div>
         <button class="primary" id="models_save">Save model routing</button>
       </div>

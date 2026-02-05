@@ -49,41 +49,69 @@ def api_state():
     s = list_settings()
     routes = get_model_routes()
     feeds = list_feeds()
-    # basic health
-    def ok(v): return bool(v and str(v).strip())
+    
+    # Health check helper
+    def is_configured(val): 
+        return bool(val and str(val).strip())
+    
     health = {
-        "directus": ok(s.get("directus_url")) and ok(s.get("directus_token")),
-        "slack": ok(s.get("slack_bot_token")) and ok(s.get("slack_channel_id")),
-        "tavily": ok(s.get("tavily_api_key")),
-        "together": ok(s.get("together_api_key")),
-        "openrouter": ok(s.get("openrouter_api_key")),
+        "directus": is_configured(s.get("directus_url")) and is_configured(s.get("directus_token")),
+        "slack": is_configured(s.get("slack_bot_token")) and is_configured(s.get("slack_channel_id")),
+        "tavily": is_configured(s.get("tavily_api_key")),
+        "together": is_configured(s.get("together_api_key")),
+        "openrouter": is_configured(s.get("openrouter_api_key")),
     }
-    return jsonify({"settings": s, "routes": routes, "feeds_count": len(feeds), "health": health})
+    
+    return jsonify({
+        "settings": s, 
+        "routes": routes, 
+        "feeds_count": len(feeds), 
+        "health": health
+    })
 
 @app.get("/api/settings")
 @require_basic_auth
 def api_get_settings():
     s = list_settings()
-    secret_keys = {"directus_token","slack_bot_token","slack_signing_secret","tavily_api_key","together_api_key","openrouter_api_key"}
+    
+    # Secret keys to mask
+    secret_keys = {
+        "directus_token", "slack_bot_token", "slack_signing_secret",
+        "tavily_api_key", "together_api_key", "openrouter_api_key"
+    }
+    
+    # Mask secrets in response
     out = dict(s)
-    for k in secret_keys:
-        if k in out and out[k]:
-            out[k] = ""  # never echo secrets back
-    out["_secrets_present"] = {k: bool(s.get(k)) for k in secret_keys}
+    for key in secret_keys:
+        if key in out and out[key]:
+            out[key] = ""
+    
+    # Add presence indicators for secrets
+    out["_secrets_present"] = {key: bool(s.get(key) and s.get(key).strip()) for key in secret_keys}
+    
     return jsonify(out)
 
 @app.post("/api/settings")
 @require_basic_auth
 def api_set_settings():
     data = request.get_json(force=True, silent=False) or {}
-    secret_keys = {"directus_token","slack_bot_token","slack_signing_secret","tavily_api_key","together_api_key","openrouter_api_key"}
-    for k, v in data.items():
-        if not isinstance(k, str):
+    
+    # Secret keys should not be overwritten with empty strings
+    secret_keys = {
+        "directus_token", "slack_bot_token", "slack_signing_secret",
+        "tavily_api_key", "together_api_key", "openrouter_api_key"
+    }
+    
+    for key, value in data.items():
+        if not isinstance(key, str):
             continue
-        # For secrets: ignore empty string so users don't accidentally wipe them
-        if k in secret_keys and (v is None or str(v).strip() == ""):
+        
+        # Skip empty secrets to prevent accidental deletion
+        if key in secret_keys and not str(value).strip():
             continue
-        set_setting(k, "" if v is None else str(v))
+        
+        set_setting(key, str(value) if value is not None else "")
+    
     return jsonify({"ok": True})
 
 @app.get("/api/feeds")
@@ -138,37 +166,42 @@ def api_get_models():
 @require_basic_auth
 def api_set_models():
     data = request.get_json(force=True, silent=False) or {}
+    
+    valid_stages = {"generation", "humanize", "seo", "image"}
+    
     for stage, cfg in data.items():
-        if stage not in ("generation", "humanize", "seo", "image"):
+        if stage not in valid_stages:
             continue
-        provider = (cfg.get("provider") or "").strip()
-        model = (cfg.get("model") or "").strip()
+        
+        provider = cfg.get("provider", "").strip()
+        model = cfg.get("model", "").strip()
+        
         if not provider or not model:
             continue
         
-        temperature = cfg.get("temperature", None)
-        max_tokens = cfg.get("max_tokens", None)
-        width = cfg.get("width", None)
-        height = cfg.get("height", None)
+        # Helper to safely convert to int/float
+        def safe_float(val):
+            try:
+                return float(val) if val not in (None, "") else None
+            except (ValueError, TypeError):
+                return None
         
-        try:
-            temperature = float(temperature) if temperature is not None and temperature != "" else None
-        except Exception:
-            temperature = None
-        try:
-            max_tokens = int(max_tokens) if max_tokens is not None and max_tokens != "" else None
-        except Exception:
-            max_tokens = None
-        try:
-            width = int(width) if width is not None and width != "" else None
-        except Exception:
-            width = None
-        try:
-            height = int(height) if height is not None and height != "" else None
-        except Exception:
-            height = None
+        def safe_int(val):
+            try:
+                return int(val) if val not in (None, "") else None
+            except (ValueError, TypeError):
+                return None
         
-        set_model_route(stage, provider, model, temperature, max_tokens, width, height)
+        set_model_route(
+            stage, 
+            provider, 
+            model,
+            temperature=safe_float(cfg.get("temperature")),
+            max_tokens=safe_int(cfg.get("max_tokens")),
+            width=safe_int(cfg.get("width")),
+            height=safe_int(cfg.get("height"))
+        )
+    
     return jsonify({"ok": True})
 
 @app.get("/api/categories")
@@ -179,14 +212,7 @@ def api_categories():
         return jsonify({"ok": True, "categories": cats})
     except Exception as e:
         LOG.exception("Categories API error")
-        import traceback
-        error_details = {
-            "ok": False, 
-            "error": str(e), 
-            "categories": [],
-            "traceback": traceback.format_exc()
-        }
-        return jsonify(error_details), 500
+        return jsonify({"ok": False, "error": str(e), "categories": []}), 500
 
 # -------------------------
 # Slack interactions

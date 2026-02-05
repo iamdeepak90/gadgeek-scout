@@ -94,34 +94,44 @@ def _now_iso() -> str:
 
 def init_db() -> None:
     """Initialize Redis with default settings and model routes"""
-    r = _get_redis()
-    
-    # Initialize default settings if not present
-    for k, v in DEFAULTS_SETTINGS.items():
-        key = f"settings:{k}"
-        if not r.exists(key):
-            r.hset(key, mapping={"value": v, "updated_at": _now_iso()})
-    
-    # Initialize default model routes if not present
-    for stage, cfg in DEFAULT_MODEL_ROUTES.items():
-        key = f"model_routes:{stage}"
-        if not r.exists(key):
-            data = {
-                "provider": cfg["provider"],
-                "model": cfg["model"],
-                "updated_at": _now_iso()
-            }
-            if "temperature" in cfg:
-                data["temperature"] = str(cfg["temperature"])
-            if "max_tokens" in cfg:
-                data["max_tokens"] = str(cfg["max_tokens"])
-            if "width" in cfg:
-                data["width"] = str(cfg["width"])
-            if "height" in cfg:
-                data["height"] = str(cfg["height"])
-            r.hset(key, mapping=data)
-    
-    LOG.info("Redis initialized with default settings")
+    try:
+        r = _get_redis()
+        
+        # Initialize default settings if not present
+        for k, v in DEFAULTS_SETTINGS.items():
+            key = f"settings:{k}"
+            try:
+                if not r.exists(key):
+                    r.hset(key, mapping={"value": v, "updated_at": _now_iso()})
+            except Exception as e:
+                LOG.warning(f"Failed to initialize setting {k}: {e}")
+        
+        # Initialize default model routes if not present
+        for stage, cfg in DEFAULT_MODEL_ROUTES.items():
+            key = f"model_routes:{stage}"
+            try:
+                if not r.exists(key):
+                    data = {
+                        "provider": cfg["provider"],
+                        "model": cfg["model"],
+                        "updated_at": _now_iso()
+                    }
+                    if "temperature" in cfg:
+                        data["temperature"] = str(cfg["temperature"])
+                    if "max_tokens" in cfg:
+                        data["max_tokens"] = str(cfg["max_tokens"])
+                    if "width" in cfg:
+                        data["width"] = str(cfg["width"])
+                    if "height" in cfg:
+                        data["height"] = str(cfg["height"])
+                    r.hset(key, mapping=data)
+            except Exception as e:
+                LOG.warning(f"Failed to initialize model route {stage}: {e}")
+        
+        LOG.info("Redis initialized with default settings")
+    except Exception as e:
+        LOG.error(f"Failed to initialize Redis: {e}")
+        raise
 
 def get_setting(key: str, default: Optional[str] = None) -> str:
     """Get a setting from Redis"""
@@ -158,18 +168,25 @@ def list_feeds() -> List[Dict[str, Any]]:
     r = _get_redis()
     feeds = []
     for redis_key in r.scan_iter(match="feed:*"):
+        # Skip the counter key
+        if redis_key == "feed:next_id":
+            continue
         data = r.hgetall(redis_key)
         if data:
-            feed_id = int(redis_key.replace("feed:", ""))
+            try:
+                feed_id = int(redis_key.replace("feed:", ""))
+            except ValueError:
+                # Skip non-numeric feed keys
+                continue
             feeds.append({
                 "id": feed_id,
                 "url": data.get("url", ""),
                 "enabled": data.get("enabled", "1") == "1",
-                "category_hint": data.get("category_hint"),
-                "title_key": data.get("title_key"),
-                "description_key": data.get("description_key"),
-                "content_key": data.get("content_key"),
-                "category_key": data.get("category_key"),
+                "category_hint": data.get("category_hint") or "",
+                "title_key": data.get("title_key") or "",
+                "description_key": data.get("description_key") or "",
+                "content_key": data.get("content_key") or "",
+                "category_key": data.get("category_key") or "",
                 "created_at": data.get("created_at", ""),
                 "updated_at": data.get("updated_at", ""),
             })
@@ -185,10 +202,15 @@ def upsert_feed(feed: Dict[str, Any]) -> int:
     # Check if feed exists by URL
     feed_id = None
     for redis_key in r.scan_iter(match="feed:*"):
+        if redis_key == "feed:next_id":
+            continue
         data = r.hgetall(redis_key)
         if data.get("url") == url:
-            feed_id = int(redis_key.replace("feed:", ""))
-            break
+            try:
+                feed_id = int(redis_key.replace("feed:", ""))
+                break
+            except ValueError:
+                continue
     
     now = _now_iso()
     
@@ -232,6 +254,8 @@ def get_model_routes() -> Dict[str, Dict[str, Any]]:
     routes = {}
     for redis_key in r.scan_iter(match="model_routes:*"):
         stage = redis_key.replace("model_routes:", "")
+        if not stage:  # Skip empty stage names
+            continue
         data = r.hgetall(redis_key)
         if data:
             route = {
@@ -239,13 +263,25 @@ def get_model_routes() -> Dict[str, Dict[str, Any]]:
                 "model": data.get("model", ""),
             }
             if "temperature" in data and data["temperature"]:
-                route["temperature"] = float(data["temperature"])
+                try:
+                    route["temperature"] = float(data["temperature"])
+                except (ValueError, TypeError):
+                    pass
             if "max_tokens" in data and data["max_tokens"]:
-                route["max_tokens"] = int(data["max_tokens"])
+                try:
+                    route["max_tokens"] = int(data["max_tokens"])
+                except (ValueError, TypeError):
+                    pass
             if "width" in data and data["width"]:
-                route["width"] = int(data["width"])
+                try:
+                    route["width"] = int(data["width"])
+                except (ValueError, TypeError):
+                    pass
             if "height" in data and data["height"]:
-                route["height"] = int(data["height"])
+                try:
+                    route["height"] = int(data["height"])
+                except (ValueError, TypeError):
+                    pass
             routes[stage] = route
     return routes
 
@@ -380,11 +416,32 @@ def get_categories() -> List[Dict[str, Any]]:
                 kw = []
         if not isinstance(kw, list):
             kw = []
+        
+        # Handle priority safely
+        priority = c.get("priority")
+        if priority is None or priority == "":
+            priority = 999
+        else:
+            try:
+                priority = int(priority)
+            except (ValueError, TypeError):
+                priority = 999
+        
+        # Handle posts_per_scout safely
+        posts_per_scout = c.get("posts_per_scout")
+        if posts_per_scout is None or posts_per_scout == "":
+            posts_per_scout = 0
+        else:
+            try:
+                posts_per_scout = int(posts_per_scout)
+            except (ValueError, TypeError):
+                posts_per_scout = 0
+        
         out.append({
             "slug": c.get("slug") or "",
             "name": c.get("name") or "",
-            "priority": int(c.get("priority") or 999),
-            "posts_per_scout": int(c.get("posts_per_scout") or 0),
+            "priority": priority,
+            "posts_per_scout": posts_per_scout,
             "keywords": kw,
         })
     return out

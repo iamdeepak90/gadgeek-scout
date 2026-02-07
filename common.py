@@ -397,6 +397,17 @@ def directus_patch(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError(f"Directus PATCH {path} failed: {resp.status_code} {resp.text}")
     return resp.json()
 
+def directus_import_file_url(file_url: str, title: Optional[str] = None) -> str:
+    payload: Dict[str, Any] = {"url": file_url}
+    if title:
+        payload["data"] = {"title": title}
+    data = directus_post("/files/import", payload)
+    item = data.get("data") or {}
+    file_id = item.get("id")
+    if not file_id:
+        raise RuntimeError(f"Directus file import returned no id: {data}")
+    return str(file_id)
+
 def get_categories() -> List[Dict[str, Any]]:
     """Fetch enabled categories from Directus"""
     col = categories_collection()
@@ -993,6 +1004,10 @@ def publish_article_to_directus(article: Dict[str, Any], category_slug: str) -> 
     col = articles_collection()
     payload = dict(article)
     payload["category_slug"] = category_slug
+
+    fi = payload.get("featured_image")
+    if isinstance(fi, str) and fi.strip().lower().startswith(("http://", "https://")):
+        payload["featured_image"] = directus_import_file_url(fi.strip(), title=payload.get("title"))
     
     required = {"title", "slug", "status", "category_slug", "content"}
     clean = {}

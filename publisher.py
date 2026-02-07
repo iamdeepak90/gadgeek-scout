@@ -85,7 +85,7 @@ def _publish_loop():
         try:
             lead = list_one_approved_lead_newest()
             if lead:
-                lead_id = int(lead["id"])
+                lead_id = str(lead["id"])
                 LOG.info("Publishing approved lead %s...", lead_id)
                 publish_lead_by_id(lead_id)
             else:

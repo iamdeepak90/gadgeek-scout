@@ -228,7 +228,7 @@ def _parse_slack_payload(req) -> Dict[str, Any]:
         return json.loads(payload) if payload else {}
     return {}
 
-def _async_publish(lead_id: int, slack_ctx: Dict[str, str], response_url: str = ""):
+def _async_publish(lead_id: str, slack_ctx: Dict[str, str], response_url: str = ""):
     res = publisher_mod.publish_lead_by_id(lead_id, slack_ctx=slack_ctx)
     if not res.get("ok") and response_url:
         slack_ephemeral(response_url, f"❌ Publish failed, reverted to approved.\nError: {res.get('error')}")
@@ -250,15 +250,15 @@ def slack_interactions():
             return jsonify({"ok": True})
         action = actions[0]
         action_id = action.get("action_id")
-        lead_id = int(action.get("value") or 0)
+        lead_id = str(action.get("value") or 0)
         response_url = payload.get("response_url") or ""
+
+        if not lead_id:
+            return jsonify({"ok": True})
 
         channel_id = (payload.get("channel") or {}).get("id") or ""
         message_ts = (payload.get("message") or {}).get("ts") or ""
         title = ((payload.get("message") or {}).get("text") or "").strip()
-
-        if lead_id <= 0:
-            return jsonify({"ok": True})
 
         try:
             if action_id == "approve":

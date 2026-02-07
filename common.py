@@ -450,13 +450,16 @@ def lead_exists_by_url(source_url: str) -> bool:
     items = data.get("data") or []
     return len(items) > 0
 
-def create_lead(title: str, source_url: str, category_slug: str) -> int:
+def create_lead(title: str, source_url: str, category_slug: str) -> str:
     col = leads_collection()
     payload = {"title": title, "source_url": source_url, "category_slug": category_slug, "status": "pending"}
     data = directus_post(f"/items/{col}", payload)
     item = data.get("data") or {}
-    return int(item.get("id") or 0)
-
+    lead_id = item.get("id")
+    if not lead_id:
+        raise RuntimeError(f"Directus create_lead returned no id (response data: {item})")
+    return str(lead_id)
+    
 def get_lead(lead_id: int) -> Dict[str, Any]:
     col = leads_collection()
     data = directus_get(f"/items/{col}/{lead_id}")

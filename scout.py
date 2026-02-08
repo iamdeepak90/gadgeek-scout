@@ -1,5 +1,5 @@
 import sys
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 from common import (
     LOG,
@@ -12,6 +12,8 @@ from common import (
     create_lead,
     slack_post_lead,
     get_categories,
+    DEFAULT_CATEGORY_UUID,
+    looks_like_uuid,
 )
 
 def keyword_score(text: str, keywords: List[str]) -> int:
@@ -26,25 +28,63 @@ def keyword_score(text: str, keywords: List[str]) -> int:
             score += 1
     return score
 
-def match_category(entry: Dict[str, str], categories: List[Dict[str, Any]], category_hint: str = "") -> Tuple[str, str, int]:
-    """
-    Returns (category_slug, category_name, score).
-    Uses hint if valid; otherwise keyword match on title+description+content.
-    """
-    if category_hint:
-        for c in categories:
-            if c["slug"] == category_hint:
-                return c["slug"], c["name"], 999
+def match_category(
+    entry: Dict[str, str],
+    categories: List[Dict[str, Any]],
+    category_hint: str = "",
+    default_category_id: str = DEFAULT_CATEGORY_UUID,
+) -> Tuple[str, str, int]:
+    """Return (category_id, category_name, score).
 
-    blob = " ".join([entry.get("title",""), entry.get("description",""), entry.get("content",""), entry.get("category","")])
-    best = None
+    Uses hint if it matches a category (by UUID or by slug). Otherwise keyword match on
+    title+description+content+entry.category. If nothing matches, returns the default
+    category UUID.
+    """
+
+    # Build lookup maps
+    by_id = {str(c.get("id")): c for c in categories if c.get("id")}
+    by_slug = {str(c.get("slug")): c for c in categories if c.get("slug")}
+
+    hint = (category_hint or "").strip()
+    if hint:
+        if looks_like_uuid(hint) and hint in by_id:
+            c = by_id[hint]
+            return str(c["id"]), c.get("name") or "", 999
+        if hint in by_slug:
+            c = by_slug[hint]
+            return str(c["id"]), c.get("name") or "", 999
+
+    blob = " ".join(
+        [
+            entry.get("title", ""),
+            entry.get("description", ""),
+            entry.get("content", ""),
+            entry.get("category", ""),
+        ]
+    )
+
+    best_id: Optional[str] = None
+    best_name = ""
+    best_score = -1
+    best_priority = 10**9
+
     for c in categories:
+        cid = str(c.get("id") or "")
+        if not cid:
+            continue
         score = keyword_score(blob, c.get("keywords", []))
-        if best is None or score > best[2] or (score == best[2] and c["priority"] < best[3]):
-            best = (c["slug"], c["name"], score, c["priority"])
-    if not best:
-        return "", "", 0
-    return best[0], best[1], best[2]
+        priority = int(c.get("priority") or 999)
+        if score > best_score or (score == best_score and priority < best_priority):
+            best_id = cid
+            best_name = c.get("name") or ""
+            best_score = score
+            best_priority = priority
+
+    if best_id and best_score > 0:
+        return best_id, best_name, best_score
+
+    # No match: use default UUID
+    return default_category_id, (by_id.get(default_category_id, {}) or {}).get("name", ""), 0
 
 def scout_once() -> int:
     init_db()
@@ -58,8 +98,13 @@ def scout_once() -> int:
         LOG.error("No enabled categories found in Directus. Ensure categories collection has enabled=true and posts_per_scout>0.")
         return 0
 
-    per_cat_cap = {c["slug"]: int(c.get("posts_per_scout", 0)) for c in categories}
-    picked_per_cat = {c["slug"]: 0 for c in categories}
+    # Per-category cap uses category UUIDs (relation field)
+    per_cat_cap = {str(c["id"]): int(c.get("posts_per_scout", 0)) for c in categories if c.get("id")}
+    picked_per_cat = {cid: 0 for cid in per_cat_cap.keys()}
+
+    # Ensure default category exists in caps so unmatched items can still be created.
+    per_cat_cap.setdefault(DEFAULT_CATEGORY_UUID, 999)
+    picked_per_cat.setdefault(DEFAULT_CATEGORY_UUID, 0)
 
     created = 0
 
@@ -82,17 +127,11 @@ def scout_once() -> int:
             if not title or not link:
                 continue
 
-            cat_slug, cat_name, score = match_category(fields, categories, category_hint=category_hint)
-            if not cat_slug:
-                continue
+            cat_id, cat_name, score = match_category(fields, categories, category_hint=category_hint)
 
-            # If no keyword matched and no hint, skip (keeps quality higher)
-            if score <= 0 and not category_hint:
+            if per_cat_cap.get(cat_id, 0) <= 0:
                 continue
-
-            if per_cat_cap.get(cat_slug, 0) <= 0:
-                continue
-            if picked_per_cat.get(cat_slug, 0) >= per_cat_cap.get(cat_slug, 0):
+            if picked_per_cat.get(cat_id, 0) >= per_cat_cap.get(cat_id, 0):
                 continue
 
             # Dedupe only against news_leads.source_url
@@ -104,7 +143,7 @@ def scout_once() -> int:
                 continue
 
             try:
-                lead_id = create_lead(title=title, source_url=link, category_slug=cat_slug)
+                lead_id = create_lead(title=title, source_url=link, category_id=cat_id)
             except Exception as e:
                 LOG.error("Failed to create lead in Directus: %s", e)
                 continue
@@ -114,7 +153,7 @@ def scout_once() -> int:
             except Exception as e:
                 LOG.error("Failed to post lead %s to Slack: %s", lead_id, e)
                 # lead still exists; skip posting. You can approve in Directus.
-            picked_per_cat[cat_slug] = picked_per_cat.get(cat_slug, 0) + 1
+            picked_per_cat[cat_id] = picked_per_cat.get(cat_id, 0) + 1
             created += 1
 
     LOG.info("Scout completed. Created %s leads.", created)

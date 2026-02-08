@@ -250,15 +250,15 @@ def slack_interactions():
             return jsonify({"ok": True})
         action = actions[0]
         action_id = action.get("action_id")
-        lead_id = str(action.get("value") or 0)
+        lead_id = str(action.get("value") or "").strip()
         response_url = payload.get("response_url") or ""
-
-        if not lead_id:
-            return jsonify({"ok": True})
 
         channel_id = (payload.get("channel") or {}).get("id") or ""
         message_ts = (payload.get("message") or {}).get("ts") or ""
         title = ((payload.get("message") or {}).get("text") or "").strip()
+
+        if not lead_id:
+            return jsonify({"ok": True})
 
         try:
             if action_id == "approve":

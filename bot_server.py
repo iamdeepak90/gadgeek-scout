@@ -19,6 +19,8 @@ from common import (
     verify_slack_signature,
     update_lead_status,
     slack_ephemeral,
+    get_lead,
+    get_redis_client,
 )
 import publisher as publisher_mod
 from common import get_categories, parse_feed, extract_entry_fields
@@ -228,10 +230,87 @@ def _parse_slack_payload(req) -> Dict[str, Any]:
         return json.loads(payload) if payload else {}
     return {}
 
-def _async_publish(lead_id: str, slack_ctx: Dict[str, str], response_url: str = ""):
-    res = publisher_mod.publish_lead_by_id(lead_id, slack_ctx=slack_ctx)
-    if not res.get("ok") and response_url:
-        slack_ephemeral(response_url, f"❌ Publish failed, reverted to approved.\nError: {res.get('error')}")
+
+# -------------------------
+# Urgent publish queue (Option B)
+# -------------------------
+
+URGENT_QUEUE_KEY = "queue:urgent_publish"
+_urgent_worker_started = False
+_urgent_worker_lock = threading.Lock()
+
+
+def _start_urgent_worker() -> None:
+    global _urgent_worker_started
+    with _urgent_worker_lock:
+        if _urgent_worker_started:
+            return
+        t = threading.Thread(target=_urgent_worker_loop, daemon=True)
+        t.start()
+        _urgent_worker_started = True
+
+
+def _enqueue_urgent(lead_id: str, slack_ctx: Dict[str, str], response_url: str) -> None:
+    r = get_redis_client()
+    item = {
+        "lead_id": lead_id,
+        "slack_ctx": slack_ctx,
+        "response_url": response_url,
+    }
+    r.rpush(URGENT_QUEUE_KEY, json.dumps(item))
+
+
+def _urgent_worker_loop() -> None:
+    """Publish urgent items sequentially.
+
+    Runs continuously in a single thread. If multiple urgent clicks happen,
+    they are processed one-by-one in the order they were queued.
+    """
+    r = get_redis_client()
+    while True:
+        try:
+            popped = r.blpop(URGENT_QUEUE_KEY, timeout=2)
+            if not popped:
+                continue
+            _, raw = popped
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                LOG.warning("Invalid urgent queue payload: %s", raw)
+                continue
+
+            lead_id = str(payload.get("lead_id") or "").strip()
+            slack_ctx = payload.get("slack_ctx") or {}
+            response_url = str(payload.get("response_url") or "")
+            title = (slack_ctx.get("title") or "").strip()
+
+            if not lead_id:
+                continue
+
+            # Skip if already processed
+            try:
+                lead = get_lead(lead_id)
+                status = (lead.get("status") or "").strip().lower()
+                if status == "processed":
+                    if response_url:
+                        slack_ephemeral(response_url, f"ℹ️ Already published: {title or lead_id}")
+                    continue
+            except Exception as e:
+                LOG.warning("Urgent worker could not read lead %s: %s", lead_id, e)
+
+            LOG.info("Urgent publish started for lead %s", lead_id)
+            res = publisher_mod.publish_lead_by_id(lead_id, slack_ctx=slack_ctx)
+            if res.get("ok"):
+                if response_url:
+                    slack_ephemeral(response_url, f"✅ Published: {title or lead_id}")
+            else:
+                if response_url:
+                    slack_ephemeral(
+                        response_url,
+                        f"❌ Publish failed for {title or lead_id}.\nError: {res.get('error')}",
+                    )
+        except Exception:
+            LOG.exception("Urgent worker loop error")
 
 @app.post("/slack/interactions")
 def slack_interactions():
@@ -275,12 +354,22 @@ def slack_interactions():
                 return jsonify({"ok": True})
 
             if action_id == "urgent":
-                # Mark publishing then publish immediately (prevents duplicate publish)
-                update_lead_status(lead_id, "publishing")
-                slack_ctx = {"channel": channel_id, "ts": message_ts, "title": title}
-                t = threading.Thread(target=_async_publish, args=(lead_id, slack_ctx, response_url), daemon=True)
-                t.start()
-                # no "publishing..." message; only update after published in publisher.py
+                # Queue urgent publish (Option B): publish sequentially in background worker
+                lead = get_lead(lead_id)
+                status = (lead.get("status") or "").strip().lower()
+                real_title = (lead.get("title") or title or lead_id).strip()
+
+                if status == "processed":
+                    if response_url:
+                        slack_ephemeral(response_url, f"ℹ️ Already published: *{real_title}*")
+                    return jsonify({"ok": True})
+
+                update_lead_status(lead_id, "approved_high")
+                slack_ctx = {"channel": channel_id, "ts": message_ts, "title": real_title}
+                _enqueue_urgent(lead_id, slack_ctx=slack_ctx, response_url=response_url)
+                _start_urgent_worker()
+                if response_url:
+                    slack_ephemeral(response_url, f"🚀 Urgent queued: *{real_title}*")
                 return jsonify({"ok": True})
 
         except Exception as e:

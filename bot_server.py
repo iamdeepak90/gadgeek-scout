@@ -275,8 +275,8 @@ def slack_interactions():
                 return jsonify({"ok": True})
 
             if action_id == "urgent":
-                # Mark approved then publish immediately
-                update_lead_status(lead_id, "approved")
+                # Mark publishing then publish immediately (prevents duplicate publish)
+                update_lead_status(lead_id, "publishing")
                 slack_ctx = {"channel": channel_id, "ts": message_ts, "title": title}
                 t = threading.Thread(target=_async_publish, args=(lead_id, slack_ctx, response_url), daemon=True)
                 t.start()

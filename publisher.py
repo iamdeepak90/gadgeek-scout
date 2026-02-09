@@ -14,46 +14,57 @@ from common import (
     publish_article_to_directus,
     slack_update_published,
     get_setting,
+    DEFAULT_CATEGORY_UUID,
 )
 
-# Simple in-process lock to avoid double publishes on repeated clicks.
-_PUBLISH_LOCK = set()  # lead_id strings
 _LOCK = threading.Lock()
+_PUBLISHING: set[str] = set()
 
-def _get_category_name_map():
+def _category_maps():
     cats = get_categories()
-    return {str(c.get("id")): (c.get("name") or "") for c in cats if c.get("id")}
+    by_id = {c["id"]: c for c in cats if c.get("id")}
+    return by_id
 
 def publish_lead_by_id(lead_id: str, slack_ctx: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-    """
-    Publishes an approved lead into Articles.
-    If slack_ctx is provided: {"channel": "...", "ts": "...", "title": "..."} then updates Slack after success.
-    On failure: lead status is set back to 'approved' (safe default).
-    """
     init_db()
+
     with _LOCK:
-        if lead_id in _PUBLISH_LOCK:
+        if lead_id in _PUBLISHING:
             LOG.warning("Lead %s already publishing in this process.", lead_id)
             return {"ok": False, "error": "already_publishing"}
-        _PUBLISH_LOCK.add(lead_id)
+        _PUBLISHING.add(lead_id)
 
     try:
         lead = get_lead(lead_id)
         status = (lead.get("status") or "").lower()
         if status == "published":
             return {"ok": True, "already": True}
+        if status == "publishing":
+            return {"ok": True, "already": True}
 
-        title = lead.get("title") or ""
-        category_id = str(lead.get("category") or "").strip()
-        if not title or not category_id:
-            raise RuntimeError("Lead missing title or category.")
+        # Move to publishing ASAP to avoid duplicates
+        try:
+            update_lead_status(lead_id, "publishing")
+        except Exception:
+            pass
 
-        cat_names = _get_category_name_map()
-        category_name = cat_names.get(category_id, category_id)
+        title = (lead.get("title") or "").strip()
+        category_id = (lead.get("category") or "").strip() or DEFAULT_CATEGORY_UUID
+        if not title:
+            raise RuntimeError("Lead missing title")
 
-        # Build article with configured models/providers
-        article = create_article_from_lead(title=title, category_name=category_name)
-        created = publish_article_to_directus(article, category_id=category_id)
+        cats_by_id = _category_maps()
+        cat = cats_by_id.get(category_id) or {}
+        category_name = cat.get("name") or "Uncategorized"
+        category_prompt = cat.get("prompt_generation") or ""
+
+        article = create_article_from_lead(
+            title=title,
+            category_name=category_name,
+            category_id=category_id,
+            category_prompt=category_prompt,
+        )
+        created = publish_article_to_directus(article)
 
         update_lead_status(lead_id, "published")
 
@@ -66,15 +77,15 @@ def publish_lead_by_id(lead_id: str, slack_ctx: Optional[Dict[str, str]] = None)
         return {"ok": True, "article": created}
     except Exception as e:
         LOG.exception("Publish failed for lead %s: %s", lead_id, e)
-        # revert back to approved as requested
+        # revert to approved for later retry
         try:
             update_lead_status(lead_id, "approved")
-        except Exception as ee:
-            LOG.warning("Failed to revert lead %s to approved: %s", lead_id, ee)
+        except Exception:
+            pass
         return {"ok": False, "error": str(e)}
     finally:
         with _LOCK:
-            _PUBLISH_LOCK.discard(lead_id)
+            _PUBLISHING.discard(lead_id)
 
 def _publish_loop():
     interval_min = int(float(get_setting("publish_interval_minutes", "20") or "20"))
@@ -85,12 +96,10 @@ def _publish_loop():
         try:
             lead = list_one_approved_lead_newest()
             if lead:
-                lead_id = str(lead.get("id") or "").strip()
-                if not lead_id:
-                    LOG.warning("Approved lead missing id; skipping")
-                    continue
-                LOG.info("Publishing approved lead %s...", lead_id)
-                publish_lead_by_id(lead_id)
+                lead_id = str(lead.get("id") or "")
+                if lead_id:
+                    LOG.info("Publishing approved lead %s...", lead_id)
+                    publish_lead_by_id(lead_id)
             else:
                 LOG.info("No approved leads to publish.")
         except Exception as e:

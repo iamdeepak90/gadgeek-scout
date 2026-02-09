@@ -1,5 +1,5 @@
-import sys
-from typing import Any, Dict, List, Tuple, Optional
+import time
+from typing import Any, Dict, List, Tuple
 
 from common import (
     LOG,
@@ -13,159 +13,117 @@ from common import (
     slack_post_lead,
     get_categories,
     DEFAULT_CATEGORY_UUID,
-    looks_like_uuid,
+    get_setting,
 )
 
-def keyword_score(text: str, keywords: List[str]) -> int:
-    t = (text or "").lower()
+def _normalize(s: str) -> str:
+    return (s or "").lower()
+
+def _score_category(blob: str, keywords: List[str]) -> int:
+    if not blob or not keywords:
+        return 0
     score = 0
     for kw in keywords:
         k = (kw or "").strip().lower()
         if not k:
             continue
-        # simple contains
-        if k in t:
+        # substring match; you can tighten to word-boundary if you prefer
+        if k in blob:
             score += 1
     return score
 
-def match_category(
-    entry: Dict[str, str],
-    categories: List[Dict[str, Any]],
-    category_hint: str = "",
-    default_category_id: str = DEFAULT_CATEGORY_UUID,
-) -> Tuple[str, str, int]:
-    """Return (category_id, category_name, score).
-
-    Uses hint if it matches a category (by UUID or by slug). Otherwise keyword match on
-    title+description+content+entry.category. If nothing matches, returns the default
-    category UUID.
+def pick_category(title: str, description: str, content: str, feed_cat: str) -> Tuple[str, str]:
     """
+    Returns (category_id, category_name). Falls back to DEFAULT_CATEGORY_UUID if no match.
+    """
+    cats = get_categories()
+    blob = " ".join([title, description, content, feed_cat])
+    blob_l = _normalize(blob)
 
-    # Build lookup maps
-    by_id = {str(c.get("id")): c for c in categories if c.get("id")}
-    by_slug = {str(c.get("slug")): c for c in categories if c.get("slug")}
-
-    hint = (category_hint or "").strip()
-    if hint:
-        if looks_like_uuid(hint) and hint in by_id:
-            c = by_id[hint]
-            return str(c["id"]), c.get("name") or "", 999
-        if hint in by_slug:
-            c = by_slug[hint]
-            return str(c["id"]), c.get("name") or "", 999
-
-    blob = " ".join(
-        [
-            entry.get("title", ""),
-            entry.get("description", ""),
-            entry.get("content", ""),
-            entry.get("category", ""),
-        ]
-    )
-
-    best_id: Optional[str] = None
-    best_name = ""
-    best_score = -1
-    best_priority = 10**9
-
-    for c in categories:
-        cid = str(c.get("id") or "")
-        if not cid:
+    best = None
+    for c in cats:
+        cid = c.get("id") or ""
+        name = c.get("name") or ""
+        kw = c.get("keywords") or []
+        score = _score_category(blob_l, kw)
+        if score <= 0:
             continue
-        score = keyword_score(blob, c.get("keywords", []))
-        priority = int(c.get("priority") or 999)
-        if score > best_score or (score == best_score and priority < best_priority):
-            best_id = cid
-            best_name = c.get("name") or ""
-            best_score = score
-            best_priority = priority
+        item = (score, -int(c.get("priority") or 999), cid, name)
+        if best is None or item > best:
+            best = item
 
-    if best_id and best_score > 0:
-        return best_id, best_name, best_score
+    if best:
+        _, _, cid, name = best
+        return cid, name
 
-    # No match: use default UUID
-    return default_category_id, (by_id.get(default_category_id, {}) or {}).get("name", ""), 0
+    # fallback
+    return DEFAULT_CATEGORY_UUID, "Uncategorized"
 
 def scout_once() -> int:
     init_db()
     feeds = [f for f in list_feeds() if f.get("enabled")]
     if not feeds:
-        LOG.error("No RSS feeds configured. Go to /settings -> RSS Feeds.")
+        LOG.info("No enabled feeds configured.")
         return 0
-
-    categories = get_categories()
-    if not categories:
-        LOG.error("No enabled categories found in Directus. Ensure categories collection has enabled=true and posts_per_scout>0.")
-        return 0
-
-    # Per-category cap uses category UUIDs (relation field)
-    per_cat_cap = {str(c["id"]): int(c.get("posts_per_scout", 0)) for c in categories if c.get("id")}
-    picked_per_cat = {cid: 0 for cid in per_cat_cap.keys()}
-
-    # Ensure default category exists in caps so unmatched items can still be created.
-    per_cat_cap.setdefault(DEFAULT_CATEGORY_UUID, 999)
-    picked_per_cat.setdefault(DEFAULT_CATEGORY_UUID, 0)
 
     created = 0
-
-    # Process feeds newest-first; feedparser entries are usually newest-first already.
-    for feed_cfg in feeds:
-        url = feed_cfg["url"]
-        category_hint = (feed_cfg.get("category_hint") or "").strip()
-
+    for feed in feeds:
+        url = feed.get("url") or ""
+        if not url:
+            continue
         try:
             parsed = parse_feed(url)
         except Exception as e:
-            LOG.warning("Failed to parse feed %s: %s", url, e)
+            LOG.warning("Failed to fetch feed %s: %s", url, e)
             continue
 
-        entries = parsed.entries or []
-        for ent in entries[:50]:
-            fields = extract_entry_fields(ent, feed_cfg)
-            title = fields.get("title") or ""
-            link = fields.get("link") or ""
+        selectors = {
+            "title_key": feed.get("title_key") or None,
+            "description_key": feed.get("description_key") or None,
+            "content_key": feed.get("content_key") or None,
+            "category_key": feed.get("category_key") or None,
+        }
+
+        entries = getattr(parsed, "entries", []) or []
+        for entry in entries[:30]:
+            fields = extract_entry_fields(entry, selectors)
+            title = fields.get("title", "").strip()
+            link = fields.get("link", "").strip()
+            desc = fields.get("description", "").strip()
+            content = fields.get("content", "").strip()
+            feed_cat = fields.get("category", "").strip() or (feed.get("category_hint") or "")
+
             if not title or not link:
                 continue
-
-            cat_id, cat_name, score = match_category(fields, categories, category_hint=category_hint)
-
-            if per_cat_cap.get(cat_id, 0) <= 0:
-                continue
-            if picked_per_cat.get(cat_id, 0) >= per_cat_cap.get(cat_id, 0):
-                continue
-
-            # Dedupe only against news_leads.source_url
             try:
                 if lead_exists_by_url(link):
                     continue
             except Exception as e:
-                LOG.error("Directus dedupe check failed: %s", e)
-                continue
+                LOG.warning("Directus lead_exists failed; continuing: %s", e)
+
+            cat_id, cat_name = pick_category(title, desc, content, feed_cat)
 
             try:
                 lead_id = create_lead(title=title, source_url=link, category_id=cat_id)
-            except Exception as e:
-                LOG.error("Failed to create lead in Directus: %s", e)
-                continue
-
-            try:
                 slack_post_lead(title=title, category_name=cat_name, lead_id=lead_id)
+                created += 1
             except Exception as e:
-                LOG.error("Failed to post lead %s to Slack: %s", lead_id, e)
-                # lead still exists; skip posting. You can approve in Directus.
-            picked_per_cat[cat_id] = picked_per_cat.get(cat_id, 0) + 1
-            created += 1
+                LOG.exception("Failed to create/post lead for %s: %s", link, e)
 
-    LOG.info("Scout completed. Created %s leads.", created)
     return created
 
 def main():
     setup_logging()
-    try:
-        scout_once()
-    except Exception as e:
-        LOG.exception("Scout failed: %s", e)
-        sys.exit(1)
+    init_db()
+    interval_min = int(float(get_setting("scout_interval_minutes", "30") or "30"))
+    sleep_s = max(60, interval_min * 60)
+    while True:
+        try:
+            created = scout_once()
+            LOG.info("Scout completed. Created %d leads.", created)
+        except Exception as e:
+            LOG.exception("Scout loop error: %s", e)
+        time.sleep(sleep_s)
 
 if __name__ == "__main__":
     main()

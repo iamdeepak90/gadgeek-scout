@@ -883,6 +883,15 @@ def generate_image_openrouter(prompt: str, width: int = 1024, height: int = 768,
 # Text utilities
 # -------------------------
 
+def _strip_code_fences(text: str) -> str:
+    """Remove markdown code fences (```html ... ```) that LLMs sometimes wrap output in."""
+    t = text.strip()
+    # Remove opening fence like ```html or ```
+    t = re.sub(r"^```(?:html|HTML)?\s*\n?", "", t)
+    # Remove closing fence
+    t = re.sub(r"\n?```\s*$", "", t)
+    return t.strip()
+
 def slugify(text: str, max_len: int = 80) -> str:
     text = text.lower()
     text = re.sub(r"[^a-z0-9\s-]", "", text)
@@ -1043,17 +1052,21 @@ SEO GUIDANCE:
 
 SOURCES PROVIDED:
 {sources_block}
+
+---
+
+CRITICAL REMINDER: The article MUST be 1000-1500 words. Write ALL sections listed above including Sources. Do NOT stop early. Output the COMPLETE article as valid HTML.
 """
 
 
 def _sources_block_from_pack(pack: Dict[str, Any]) -> str:
     extract_results = (pack.get("extract") or {}).get("results") or []
     snippets: List[str] = []
-    for r in extract_results[:5]:
+    for r in extract_results[:6]:
         url = r.get("url") or ""
         content = (r.get("content") or r.get("raw_content") or "").strip()
-        if len(content) > 1500:
-            content = content[:1500] + "…"
+        if len(content) > 2500:
+            content = content[:2500] + "…"
         snippets.append(f"SOURCE: {url}\n{content}")
     return "\n\n".join(snippets) if snippets else "No extracted sources available."
 
@@ -1068,11 +1081,29 @@ def render_prompt_template_strict(template: str, *, title: str, category: str, s
 
 def humanize_prompt(html: str) -> List[Dict[str, str]]:
     system = (
-        "You are an editor. Improve readability and flow while keeping ALL facts identical. "
-        "Do not add new facts. Do not remove citations list. Keep output as HTML only."
+        "You are a seasoned human tech journalist and editor with 15 years of experience writing for major publications. "
+        "Your job is to rewrite AI-generated articles so they read as if a real person wrote them from scratch.\n\n"
+        "STRICT RULES:\n"
+        "1. Preserve ALL facts, numbers, dates, quotes, specs, and source attributions exactly.\n"
+        "2. Preserve the HTML structure (h2, h3, h4, p, ul, ol, li, table, strong) — do NOT change tag types or remove sections.\n"
+        "3. The output must be the COMPLETE article — same length or slightly longer than the input. Do NOT truncate or shorten.\n"
+        "4. Output ONLY HTML. No markdown, no commentary, no preamble.\n\n"
+        "HUMANIZATION TECHNIQUES (apply all of these):\n"
+        "- Vary sentence length dramatically: mix short punchy sentences (5-8 words) with longer complex ones (20-30 words).\n"
+        "- Use contractions naturally (it's, doesn't, won't, that's, here's).\n"
+        "- Add occasional conversational transitions: 'Now,', 'Here's the thing:', 'Worth noting:', 'That said,', 'Look,', 'The big picture?'.\n"
+        "- Break up uniform paragraph lengths — some short (1-2 sentences), some longer (4-5 sentences).\n"
+        "- Replace generic AI phrases: instead of 'It is worth noting' say 'One detail that stands out'; instead of 'This represents a significant' say 'This marks a real'; instead of 'It remains to be seen' say 'We'll have to wait and see'.\n"
+        "- Avoid these AI giveaway patterns: 'In conclusion', 'Furthermore', 'Moreover', 'It is important to note', 'In the realm of', 'It's worth mentioning', 'landscape', 'paradigm', 'leverage', 'robust', 'comprehensive', 'delve'.\n"
+        "- Insert the occasional mild opinion or editorial color: 'which is frankly impressive', 'not exactly cheap', 'a smart move if it pans out'.\n"
+        "- Use em-dashes (—) and parenthetical asides occasionally for a natural writing rhythm.\n"
+        "- Start some sentences with 'And', 'But', 'So', or 'Or' — the way real writers do.\n"
+        "- Vary paragraph openers — don't start consecutive paragraphs with the same word or structure.\n"
     )
     user = (
-        "Rewrite the following HTML article to be more natural and user-friendly:\n\n"
+        "Rewrite this article using ALL the humanization techniques above. "
+        "The output must be the COMPLETE rewritten article in HTML — same number of sections, same length. "
+        "Do NOT stop early or truncate.\n\n"
         f"{html}"
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -1145,9 +1176,43 @@ def create_article_from_lead(
     if not draft_html.strip():
         raise RuntimeError("Generation returned empty content.")
 
+    # Clean up: strip markdown fences if LLM wraps output in ```html ... ```
+    draft_html = _strip_code_fences(draft_html)
+
+    # Validate generation completeness
+    word_count = len(draft_html.split())
+    if word_count < 600:
+        LOG.warning("Generation too short (%d words). Retrying with explicit length instruction.", word_count)
+        # Retry once with stronger length instruction
+        retry_msg = generation_messages.copy()
+        retry_msg.append({
+            "role": "assistant",
+            "content": draft_html,
+        })
+        retry_msg.append({
+            "role": "user",
+            "content": (
+                "The article above is incomplete and too short. Please write the COMPLETE article with ALL sections "
+                "as specified in the instructions. Target 1000-1500 words minimum. Include all sections through Sources. "
+                "Output ONLY the complete HTML article."
+            ),
+        })
+        retry_html = chat_stage("generation", retry_msg)
+        retry_html = _strip_code_fences(retry_html)
+        if len(retry_html.split()) > word_count:
+            draft_html = retry_html
+            LOG.info("Retry produced %d words (was %d).", len(retry_html.split()), word_count)
+
     # Humanize
     human_html = chat_stage("humanize", humanize_prompt(draft_html))
-    if not human_html.strip():
+    human_html = _strip_code_fences(human_html)
+
+    # If humanize truncated the content (less than 70% of draft), fall back to draft
+    if not human_html.strip() or len(human_html.split()) < len(draft_html.split()) * 0.7:
+        LOG.warning(
+            "Humanize output too short (%d words vs draft %d). Using draft.",
+            len(human_html.split()), len(draft_html.split()),
+        )
         human_html = draft_html
 
     # SEO

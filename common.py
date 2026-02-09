@@ -405,6 +405,48 @@ def directus_patch(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError(f"Directus PATCH {path} failed: {resp.status_code} {resp.text}")
     return resp.json()
 
+
+def import_image_to_directus(image_url: str, title: str = "") -> Optional[str]:
+    """Import an image URL into Directus files and return the file UUID.
+
+    Uses Directus's /files/import endpoint to download the image from the URL
+    and store it in the Directus file library.
+    Returns the UUID string on success, or None on failure.
+    """
+    if not image_url or not image_url.startswith("http"):
+        return None
+
+    base = directus_url()
+    token = directus_token()
+    if not base or not token:
+        LOG.warning("Directus URL or token not configured; cannot import image.")
+        return None
+
+    import_url = f"{base}/files/import"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {
+        "url": image_url,
+        "data": {
+            "title": title[:255] if title else "Featured image",
+        },
+    }
+
+    try:
+        resp = requests.post(import_url, headers=headers, json=payload, timeout=120)
+        if resp.status_code >= 400:
+            LOG.warning("Directus image import failed (%s): %s", resp.status_code, resp.text[:500])
+            return None
+        data = resp.json()
+        file_id = (data.get("data") or {}).get("id")
+        if file_id:
+            LOG.info("Image imported to Directus: %s -> %s", image_url[:80], file_id)
+            return str(file_id)
+        LOG.warning("Directus image import returned no file ID: %s", resp.text[:300])
+        return None
+    except Exception as e:
+        LOG.warning("Directus image import error: %s", e)
+        return None
+
 def get_categories() -> List[Dict[str, Any]]:
     """Fetch enabled categories from Directus"""
     col = categories_collection()
@@ -1124,9 +1166,18 @@ def create_article_from_lead(
         gen_img = generate_image(build_image_prompt(title, category_name))
         img = gen_img
 
-    featured_image = img["url"] if img else ""
-    caption = (img.get("caption") or "Tech illustration") if img else ""
-    credit = img.get("credit") or "" if img else ""
+    # Import image into Directus files to get a UUID
+    featured_image = ""
+    caption = ""
+    credit = ""
+    if img and img.get("url"):
+        file_uuid = import_image_to_directus(img["url"], title=title)
+        if file_uuid:
+            featured_image = file_uuid
+        else:
+            LOG.warning("Could not import image to Directus; article will have no featured image.")
+        caption = img.get("caption") or "Tech illustration"
+        credit = img.get("credit") or ""
     featured_image_credit = f"{caption} | Credit: {credit}".strip(" |")
 
     slug = slugify(title)

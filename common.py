@@ -30,24 +30,77 @@ DEFAULT_CATEGORY_UUID = "3229ec20-3076-4a32-9fa2-88b65dacfedf"
 # -------------------------
 ALLOWED_PROMPT_VARS = {"title", "category", "sources_block"}
 
-DEFAULT_GENERATION_TEMPLATE = """You are a professional tech journalist writing for the {category} section.
+DEFAULT_GENERATION_TEMPLATE = """You are a professional tech journalist writing for a leading technology publication in the {category} section.
 
-Write a tech news article about: {title}
+ASSIGNMENT: Write a comprehensive tech news article about: {title}
 
-Rules:
-- Use ONLY the sources below. Do not invent facts, numbers, dates, or quotes.
-- If something is uncertain, say so.
-- Return ONLY HTML (no markdown).
-- End with <h3>Sources</h3> listing source URLs.
+GROUND RULES:
+- Use ONLY the provided sources below. Never fabricate facts, statistics, dates, quotes, or specifications.
+- If information conflicts across sources or is uncertain, state this explicitly.
+- Cite sources when referencing key facts, prices, or specifications.
+- Output ONLY valid HTML using semantic tags (h2, h3, h4, p, ul, ol, li, table, thead, tbody, tr, th, td, strong). No inline styles, no CSS, no markdown, no code blocks.
+- Target length: 1000-1500 words. Prioritize quality over padding.
 
-Required structure:
-1) <h3>Article Highlights</h3> with 2-3 <li> bullets
-2) Hook paragraph 120-150 words
-3) 4-5 <h2> sections, each 100-200 words
-4) Add <h3> subheadings when useful
-5) Include one simple HTML <table> when it helps
+---
 
-Sources:
+ARTICLE STRUCTURE (follow this order):
+
+1. ARTICLE HIGHLIGHTS
+   <h3>Article Highlights</h3>
+   <ul> with exactly 2-3 <li> items — each a single sentence capturing a major takeaway. </ul>
+
+2. HOOK SENTENCE
+   One compelling opening sentence immediately after highlights. Grab attention and introduce the core topic. Do not wrap this in a heading — just a <p> tag.
+
+3. MAIN BODY — 5-6 sections using <h2> headings
+   - Each section: 150-250 words.
+   - Use <h3> or <h4> subheadings within sections when covering multiple subtopics.
+   - Choose section topics based on what the article naturally demands (features, pricing, impact, context, analysis, what's next, etc.). Do not force a fixed template.
+
+4. ENHANCED ELEMENTS (use where they genuinely aid clarity):
+
+   A) TABLES — for spec comparisons, pricing tiers, or feature breakdowns:
+   <table>
+     <thead><tr><th>Feature</th><th>Model A</th><th>Model B</th></tr></thead>
+     <tbody><tr><td>Display</td><td>6.7" AMOLED</td><td>6.5" OLED</td></tr></tbody>
+   </table>
+
+   B) LISTS — use <ul> or <ol> for features, pros/cons, or steps. Keep items concise but complete.
+
+   C) KEY STATS — use <strong> to emphasize critical numbers (prices, capacities, scores, dates).
+
+5. FAQ SECTION (optional — include only when the topic naturally raises common reader questions)
+   <h2>Frequently Asked Questions</h2>
+   3-5 FAQs maximum. Format: <h3>Question?</h3><p>Answer in 1-2 sentences.</p>
+   Focus on practical concerns readers would actually search for.
+
+6. CLOSING
+   <h3>Final Thoughts</h3> or <h3>Bottom Line</h3> or <h3>What This Means</h3>
+   2-3 sentences summarizing the key takeaway, ending with a forward-looking statement or recommendation.
+
+7. SOURCES
+   <h3>Sources</h3>
+   <ul> listing each source as a plain <li> with just the domain name (e.g., theverge.com, techcrunch.com). No links, no URLs — domain names only. </ul>
+
+---
+
+WRITING STYLE:
+- Professional yet conversational. Write for tech-savvy readers but explain jargon when needed.
+- Use active voice, vary sentence length, and include smooth transitions between sections.
+- Be objective and balanced — mention both strengths and weaknesses honestly.
+- Ground claims in specific details from sources: concrete numbers, real specs, actual quotes.
+- Avoid hyperbole and marketing language. Label rumors and leaks as such.
+- Provide real-world context: why does this matter to the reader? How does it compare to what exists?
+
+SEO GUIDANCE:
+- Incorporate main topic keywords naturally in <h2> headings.
+- Use semantic keyword variations throughout the body.
+- Include brand names, model numbers, and technical terms where relevant.
+- Maintain a logical heading hierarchy (H2 → H3 → H4).
+
+---
+
+SOURCES PROVIDED:
 {sources_block}
 """
 
@@ -602,7 +655,7 @@ def build_research_pack(title: str) -> Dict[str, Any]:
         LOG.warning("Tavily API key not set; skipping research.")
         return {"extract": {"results": [], "images": []}}
     headers = {"Content-Type": "application/json"}
-    payload = {"api_key": key, "query": title, "search_depth": "advanced", "max_results": 5,
+    payload = {"api_key": key, "query": title, "search_depth": "basic", "max_results": 6,
                "include_raw_content": True, "include_images": True}
     try:
         resp = request_with_retry("POST", "https://api.tavily.com/search", headers=headers, json_body=payload, timeout=60, max_attempts=2)

@@ -1067,16 +1067,20 @@ def create_article_from_lead(
     pack = build_research_pack(title)
     extracted_img = pick_extracted_image(pack) if get_setting("prefer_extracted_image", "1") == "1" else None
 
-    # Draft (category prompt override if present)
-    if category_prompt_generation and category_prompt_generation.strip():
-        sources_block = _sources_block_from_pack(pack)
-        template = category_prompt_generation.strip()
-        rendered = render_prompt_template_strict(
-            template,
-            title=title,
-            category=category_name,
-            sources_block=sources_block,
-        )
+    # Draft (category prompt override if present, otherwise use DEFAULT_GENERATION_TEMPLATE)
+    sources_block = _sources_block_from_pack(pack)
+    custom_prompt = (category_prompt_generation or "").strip()
+    template = custom_prompt or DEFAULT_GENERATION_TEMPLATE
+    rendered = render_prompt_template_strict(
+        template,
+        title=title,
+        category=category_name,
+        sources_block=sources_block,
+    )
+
+    if custom_prompt:
+        # Custom category prompts may not include full system-level framing,
+        # so we add a short system message to set ground rules.
         generation_messages = [
             {
                 "role": "system",
@@ -1089,7 +1093,11 @@ def create_article_from_lead(
             {"role": "user", "content": rendered},
         ]
     else:
-        generation_messages = build_generation_prompt(title, category_name, pack)
+        # DEFAULT_GENERATION_TEMPLATE already contains full instructions,
+        # so no separate system message needed — avoids redundancy.
+        generation_messages = [
+            {"role": "user", "content": rendered},
+        ]
 
     draft_html = chat_stage("generation", generation_messages)
     if not draft_html.strip():

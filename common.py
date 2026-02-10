@@ -407,8 +407,13 @@ def directus_patch(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def import_image_to_directus(image_url: str, title: str = "") -> Optional[str]:
-    """Import an image URL into Directus files and return the file UUID."""
-    if not image_url or not image_url.startswith("http"):
+    """Import an image into Directus files and return the file UUID.
+
+    Supports both:
+    - HTTP(S) URLs: uses Directus /files/import endpoint
+    - data:image base64 URIs: decodes and uploads via multipart form
+    """
+    if not image_url:
         return None
 
     base = directus_url()
@@ -417,6 +422,24 @@ def import_image_to_directus(image_url: str, title: str = "") -> Optional[str]:
         LOG.warning("Directus URL or token not configured; cannot import image.")
         return None
 
+    try:
+        # Handle base64 data URIs (from Together AI b64_json responses)
+        if image_url.startswith("data:image"):
+            return _upload_base64_image_to_directus(image_url, title, base, token)
+
+        # Handle HTTP URLs (from Tavily extracted images or Together URL responses)
+        if image_url.startswith("http"):
+            return _import_url_image_to_directus(image_url, title, base, token)
+
+        LOG.warning("Unsupported image format (not http or data:image): %s", image_url[:80])
+        return None
+    except Exception as e:
+        LOG.warning("Directus image import error: %s", e)
+        return None
+
+
+def _import_url_image_to_directus(image_url: str, title: str, base: str, token: str) -> Optional[str]:
+    """Import an image from URL into Directus via /files/import."""
     import_url = f"{base}/files/import"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {
@@ -426,21 +449,51 @@ def import_image_to_directus(image_url: str, title: str = "") -> Optional[str]:
         },
     }
 
-    try:
-        resp = requests.post(import_url, headers=headers, json=payload, timeout=120)
-        if resp.status_code >= 400:
-            LOG.warning("Directus image import failed (%s): %s", resp.status_code, resp.text[:500])
-            return None
-        data = resp.json()
-        file_id = (data.get("data") or {}).get("id")
-        if file_id:
-            LOG.info("Image imported to Directus: %s -> %s", image_url[:80], file_id)
-            return str(file_id)
-        LOG.warning("Directus image import returned no file ID: %s", resp.text[:300])
+    resp = requests.post(import_url, headers=headers, json=payload, timeout=120)
+    if resp.status_code >= 400:
+        LOG.warning("Directus URL image import failed (%s): %s", resp.status_code, resp.text[:500])
         return None
-    except Exception as e:
-        LOG.warning("Directus image import error: %s", e)
+    data = resp.json()
+    file_id = (data.get("data") or {}).get("id")
+    if file_id:
+        LOG.info("Image imported to Directus via URL: %s -> %s", image_url[:80], file_id)
+        return str(file_id)
+    LOG.warning("Directus URL import returned no file ID: %s", resp.text[:300])
+    return None
+
+
+def _upload_base64_image_to_directus(data_uri: str, title: str, base: str, token: str) -> Optional[str]:
+    """Upload a base64 data URI image to Directus via multipart /files upload."""
+    # Parse data URI: data:image/jpeg;base64,/9j/4AAQ...
+    match = re.match(r"data:image/(\w+);base64,(.+)", data_uri, re.DOTALL)
+    if not match:
+        LOG.warning("Could not parse base64 data URI")
         return None
+
+    img_format = match.group(1)  # jpeg, png, etc.
+    b64_data = match.group(2)
+    img_bytes = base64.b64decode(b64_data)
+
+    upload_url = f"{base}/files"
+    headers = {"Authorization": f"Bearer {token}"}
+    files = {
+        "file": (f"featured-image.{img_format}", img_bytes, f"image/{img_format}"),
+    }
+    form_data = {
+        "title": title[:255] if title else "Featured image",
+    }
+
+    resp = requests.post(upload_url, headers=headers, files=files, data=form_data, timeout=120)
+    if resp.status_code >= 400:
+        LOG.warning("Directus base64 image upload failed (%s): %s", resp.status_code, resp.text[:500])
+        return None
+    data = resp.json()
+    file_id = (data.get("data") or {}).get("id")
+    if file_id:
+        LOG.info("Image uploaded to Directus via base64: %s", file_id)
+        return str(file_id)
+    LOG.warning("Directus base64 upload returned no file ID: %s", resp.text[:300])
+    return None
 
 def get_categories() -> List[Dict[str, Any]]:
     """Fetch enabled categories from Directus"""
@@ -1110,7 +1163,7 @@ def seo_prompt(title: str, category_name: str, html: str) -> List[Dict[str, str]
         f"Category: {category_name}\n\n"
         "Analyze the HTML article below and return a JSON object with exactly these keys:\n\n"
         "{\n"
-        '  "slug": "short-seo-url-slug, 3-5 words max, lowercase, hyphens only, include brand/product name, e.g. samsung-galaxy-s26-ultra-launch",\n'
+        '  "slug": "short-seo-url-slug, 3-6 words max, lowercase, hyphens only, include brand/product name, e.g. samsung-galaxy-s26-ultra-launch",\n'
         '  "meta_title": "SEO-optimized page title, max 60 characters, include primary keyword",\n'
         '  "meta_description": "Compelling meta description, max 155 characters, include primary keyword and CTA",\n'
         '  "short_description": "1-2 sentence summary for article cards and previews",\n'
@@ -1118,7 +1171,7 @@ def seo_prompt(title: str, category_name: str, html: str) -> List[Dict[str, str]
         '  "image_alt": "Descriptive alt text for the featured image, 8-15 words"\n'
         "}\n\n"
         "Slug rules:\n"
-        "- 3-5 words separated by hyphens. No stop words (the, a, an, of, for, in, on, with).\n"
+        "- 3-6 words separated by hyphens. No stop words (the, a, an, of, for, in, on, with).\n"
         "- Must include the brand or product name.\n"
         "- Must be unique-sounding and SEO-friendly.\n"
         "- Examples: 'iphone-17-pro-launch-price', 'pixel-10-camera-specs-leaked', 'oneplus-14-india-release'\n\n"
@@ -1240,21 +1293,43 @@ def create_article_from_lead(
         slug = slugify(title)
 
     # ── Step 6: Featured image ──
-    img = extracted_img
-    if not img:
-        img = generate_image(build_image_prompt(title, category_name))
-
     featured_image = ""
     caption = ""
     credit = ""
-    if img and img.get("url"):
-        file_uuid = import_image_to_directus(img["url"], title=title)
+
+    # Try extracted image first (from Tavily)
+    if extracted_img and extracted_img.get("url"):
+        LOG.info("Attempting to import extracted image: %s", extracted_img["url"][:80])
+        file_uuid = import_image_to_directus(extracted_img["url"], title=title)
         if file_uuid:
             featured_image = file_uuid
+            caption = extracted_img.get("caption") or "Featured image"
+            credit = extracted_img.get("credit") or ""
+            LOG.info("Extracted image imported successfully: %s", file_uuid)
         else:
-            LOG.warning("Could not import image to Directus; article will have no featured image.")
-        caption = img.get("caption") or "Tech illustration"
-        credit = img.get("credit") or ""
+            LOG.warning("Extracted image failed to import to Directus. Will try AI generation.")
+            extracted_img = None  # Clear so we fall through to AI generation
+
+    # Fallback: AI-generated image
+    if not featured_image:
+        LOG.info("Generating AI image for: %s", title[:60])
+        gen_img = generate_image(build_image_prompt(title, category_name))
+        if gen_img and gen_img.get("url"):
+            LOG.info("AI image generated. Importing to Directus...")
+            file_uuid = import_image_to_directus(gen_img["url"], title=title)
+            if file_uuid:
+                featured_image = file_uuid
+                caption = gen_img.get("caption") or "AI-generated illustration"
+                credit = gen_img.get("credit") or ""
+                LOG.info("AI image imported successfully: %s", file_uuid)
+            else:
+                LOG.warning("AI image failed to import to Directus.")
+        else:
+            LOG.warning("AI image generation returned nothing.")
+
+    if not featured_image:
+        LOG.warning("No featured image available for article: %s", title[:60])
+
     featured_image_credit = f"{caption} | Credit: {credit}".strip(" |")
 
     # ── Step 7: Assemble final payload ──

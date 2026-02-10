@@ -407,12 +407,7 @@ def directus_patch(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def import_image_to_directus(image_url: str, title: str = "") -> Optional[str]:
-    """Import an image URL into Directus files and return the file UUID.
-
-    Uses Directus's /files/import endpoint to download the image from the URL
-    and store it in the Directus file library.
-    Returns the UUID string on success, or None on failure.
-    """
+    """Import an image URL into Directus files and return the file UUID."""
     if not image_url or not image_url.startswith("http"):
         return None
 
@@ -886,9 +881,7 @@ def generate_image_openrouter(prompt: str, width: int = 1024, height: int = 768,
 def _strip_code_fences(text: str) -> str:
     """Remove markdown code fences (```html ... ```) that LLMs sometimes wrap output in."""
     t = text.strip()
-    # Remove opening fence like ```html or ```
     t = re.sub(r"^```(?:html|HTML)?\s*\n?", "", t)
-    # Remove closing fence
     t = re.sub(r"\n?```\s*$", "", t)
     return t.strip()
 
@@ -942,120 +935,82 @@ def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
 # Article pipeline
 # -------------------------
 
-def build_generation_prompt(title: str, category_name: str, pack: Dict[str, Any]) -> List[Dict[str, str]]:
-    extract_results = (pack.get("extract") or {}).get("results") or []
-    snippets = []
-    for r in extract_results[:5]:
-        url = r.get("url") or ""
-        content = (r.get("content") or r.get("raw_content") or "").strip()
-        if len(content) > 1500:
-            content = content[:1500] + "…"
-        snippets.append(f"SOURCE: {url}\n{content}")
-    sources_block = "\n\n".join(snippets) if snippets else "No extracted sources available."
-
-    system = (
-        "You are a professional tech journalist. Write accurate, reader-friendly articles grounded ONLY in the provided sources. "
-        "Do not invent facts, numbers, dates, or quotes. If something is uncertain, say so.\n\n"
-        "Return ONLY HTML (no markdown)."
-    )
-    user = (
-        f"Write a tech news article about: {title}\n"
-        f"Category: {category_name}\n\n"
-        "Required structure:\n"
-        "1) <h3>Article Highlights</h3> with 2-3 <li> bullets\n"
-        "2) <p>Hook</p> 120-150 words\n"
-        "3) 4-5 <h2> sections, each 100-200 words. Add <h3> subheadings when useful.\n"
-        "4) Use bullet lists or numbering where helpful\n"
-        "5) Include one simple HTML <table> when it helps (specs, timeline, comparison).\n"
-        "6) End with a <h3>Sources</h3> list of source URLs.\n\n"
-        "Sources (use as the only truth):\n"
-        f"{sources_block}\n"
-    )
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
-
-
-# -------------------------
-# Category prompt template (strict mode)
-# -------------------------
-
 ALLOWED_PROMPT_VARS = {"title", "category", "sources_block"}
 
-DEFAULT_GENERATION_TEMPLATE = """You are a professional tech journalist writing for a leading technology publication in the {category} section.
+# ---------------------------------------------------------------------------
+# DEFAULT GENERATION TEMPLATE
+# Used when a Directus category has no custom prompt_generation field.
+# Placeholders: {title}, {category}, {sources_block}
+# ---------------------------------------------------------------------------
+DEFAULT_GENERATION_TEMPLATE = """Write a comprehensive, well-researched tech news article for the "{category}" section.
 
-ASSIGNMENT: Write a comprehensive tech news article about: {title}
+TOPIC: {title}
 
-GROUND RULES:
-- Use ONLY the provided sources below. Never fabricate facts, statistics, dates, quotes, or specifications.
-- If information conflicts across sources or is uncertain, state this explicitly.
-- Cite sources when referencing key facts, prices, or specifications.
-- Output ONLY valid HTML using semantic tags (h2, h3, h4, p, ul, ol, li, table, thead, tbody, tr, th, td, strong). No inline styles, no CSS, no markdown, no code blocks.
-- Target length: 1000-1500 words. Prioritize quality over padding.
+═══════════════════════════════════════
+GROUND RULES — read these carefully
+═══════════════════════════════════════
+• Base every claim on the SOURCES below. Never invent facts, stats, dates, quotes, or specs.
+• When sources conflict or information is uncertain, say so explicitly.
+• Output ONLY valid HTML. Allowed tags: h2, h3, h4, p, ul, ol, li, table, thead, tbody, tr, th, td, strong, em. No inline styles, no CSS, no markdown fences, no code blocks.
+• Target length: 1200–1600 words of body text. This is non-negotiable — do NOT stop before all sections are complete.
 
----
+═══════════════════════════════════════
+ARTICLE STRUCTURE (follow this exact order)
+═══════════════════════════════════════
 
-ARTICLE STRUCTURE (follow this order):
-
-1. ARTICLE HIGHLIGHTS
+1. HIGHLIGHTS
    <h3>Article Highlights</h3>
-   <ul> with exactly 2-3 <li> items — each a single sentence capturing a major takeaway. </ul>
+   <ul> with exactly 3 <li> items — each one sentence capturing a key takeaway. </ul>
 
-2. HOOK SENTENCE
-   One compelling opening sentence immediately after highlights. Grab attention and introduce the core topic. Do not wrap this in a heading — just a <p> tag.
+2. HOOK PARAGRAPH
+   A single <p> tag with 2-3 compelling sentences. Set the scene, state why this matters right now, hint at what the reader will learn. Do NOT use a heading here.
 
-3. MAIN BODY — 5-6 sections using <h2> headings
-   - Each section: 150-250 words.
-   - Use <h3> or <h4> subheadings within sections when covering multiple subtopics.
-   - Choose section topics based on what the article naturally demands (features, pricing, impact, context, analysis, what's next, etc.). Do not force a fixed template.
+3. MAIN BODY — exactly 5 sections, each with an <h2> heading
+   • Each section: 180–280 words.
+   • Use <h3> or <h4> sub-headings inside a section when covering multiple sub-topics.
+   • Choose section topics organically based on the news (e.g., specs & features, pricing & availability, competitive context, industry impact, what comes next). Do NOT use generic filler headings.
+   • Weave in at least one <table> (for specs, pricing tiers, or comparisons) and at least two <ul> or <ol> lists across the body where they genuinely help.
+   • Use <strong> to highlight key numbers: prices, dates, performance figures.
 
-4. ENHANCED ELEMENTS (use where they genuinely aid clarity):
-
-   A) TABLES — for spec comparisons, pricing tiers, or feature breakdowns:
-   <table>
-     <thead><tr><th>Feature</th><th>Model A</th><th>Model B</th></tr></thead>
-     <tbody><tr><td>Display</td><td>6.7" AMOLED</td><td>6.5" OLED</td></tr></tbody>
-   </table>
-
-   B) LISTS — use <ul> or <ol> for features, pros/cons, or steps. Keep items concise but complete.
-
-   C) KEY STATS — use <strong> to emphasize critical numbers (prices, capacities, scores, dates).
-
-5. FAQ SECTION (optional — include only when the topic naturally raises common reader questions)
+4. FAQ (include 3-4 questions)
    <h2>Frequently Asked Questions</h2>
-   3-5 FAQs maximum. Format: <h3>Question?</h3><p>Answer in 1-2 sentences.</p>
-   Focus on practical concerns readers would actually search for.
+   Format each as <h3>Question?</h3><p>Answer in 2-3 sentences.</p>
+   Focus on questions a reader would actually search for.
 
-6. CLOSING
-   <h3>Final Thoughts</h3> or <h3>Bottom Line</h3> or <h3>What This Means</h3>
-   2-3 sentences summarizing the key takeaway, ending with a forward-looking statement or recommendation.
+5. CLOSING
+   <h3>Final Thoughts</h3>
+   2-3 sentences: summarize the key takeaway and end with a forward-looking statement.
 
-7. SOURCES
+6. SOURCES
    <h3>Sources</h3>
-   <ul> listing each source as a plain <li> with just the domain name (e.g., theverge.com, techcrunch.com). No links, no URLs — domain names only. </ul>
+   <ul> listing each source domain only (e.g., <li>theverge.com</li>). No full URLs, no links. </ul>
 
----
+═══════════════════════════════════════
+WRITING VOICE
+═══════════════════════════════════════
+• Write like an experienced tech journalist — confident, clear, occasionally witty.
+• Mix sentence lengths: some short and punchy (6-10 words), some longer and descriptive (20-30 words).
+• Use contractions naturally (it's, doesn't, won't, here's, that's).
+• Use active voice. Vary paragraph lengths (some 2 sentences, some 4-5).
+• Explain jargon briefly when first introduced.
+• Be balanced — mention both strengths and weaknesses.
+• Avoid marketing fluff, hype words, and filler phrases.
+• Label rumors, leaks, and unconfirmed info as such.
 
-WRITING STYLE:
-- Professional yet conversational. Write for tech-savvy readers but explain jargon when needed.
-- Use active voice, vary sentence length, and include smooth transitions between sections.
-- Be objective and balanced — mention both strengths and weaknesses honestly.
-- Ground claims in specific details from sources: concrete numbers, real specs, actual quotes.
-- Avoid hyperbole and marketing language. Label rumors and leaks as such.
-- Provide real-world context: why does this matter to the reader? How does it compare to what exists?
+═══════════════════════════════════════
+SEO NOTES
+═══════════════════════════════════════
+• Include the main topic keyword in at least 2 of the 5 <h2> headings.
+• Use brand names, model numbers, and technical terms naturally in the text.
+• Maintain heading hierarchy: H2 → H3 → H4.
 
-SEO GUIDANCE:
-- Incorporate main topic keywords naturally in <h2> headings.
-- Use semantic keyword variations throughout the body.
-- Include brand names, model numbers, and technical terms where relevant.
-- Maintain a logical heading hierarchy (H2 → H3 → H4).
-
----
-
-SOURCES PROVIDED:
+═══════════════════════════════════════
+SOURCES PROVIDED
+═══════════════════════════════════════
 {sources_block}
 
----
-
-CRITICAL REMINDER: The article MUST be 1000-1500 words. Write ALL sections listed above including Sources. Do NOT stop early. Output the COMPLETE article as valid HTML.
+═══════════════════════════════════════
+FINAL REMINDER: The article MUST contain all 6 structural sections listed above. Do NOT stop early. Write a minimum of 1200 words of body text. Output the COMPLETE article as valid HTML with no markdown wrapping.
 """
 
 
@@ -1072,78 +1027,144 @@ def _sources_block_from_pack(pack: Dict[str, Any]) -> str:
 
 
 def render_prompt_template_strict(template: str, *, title: str, category: str, sources_block: str) -> str:
-    # Strict: reject unknown placeholders
+    """Render a prompt template, rejecting unknown placeholders."""
     used = set(re.findall(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", template or ""))
     unknown = used - ALLOWED_PROMPT_VARS
     if unknown:
         raise RuntimeError(f"Unknown prompt variable(s) in category prompt: {sorted(unknown)}")
     return (template or "").format(title=title, category=category, sources_block=sources_block)
 
+
+# ---------------------------------------------------------------------------
+# HUMANIZE PROMPT
+# This is the most critical prompt for passing AI-detection tools.
+# ---------------------------------------------------------------------------
 def humanize_prompt(html: str) -> List[Dict[str, str]]:
     system = (
-        "You are a seasoned human tech journalist and editor with 15 years of experience writing for major publications. "
-        "Your job is to rewrite AI-generated articles so they read as if a real person wrote them from scratch.\n\n"
-        "STRICT RULES:\n"
-        "1. Preserve ALL facts, numbers, dates, quotes, specs, and source attributions exactly.\n"
-        "2. Preserve the HTML structure (h2, h3, h4, p, ul, ol, li, table, strong) — do NOT change tag types or remove sections.\n"
-        "3. The output must be the COMPLETE article — same length or slightly longer than the input. Do NOT truncate or shorten.\n"
-        "4. Output ONLY HTML. No markdown, no commentary, no preamble.\n\n"
-        "HUMANIZATION TECHNIQUES (apply all of these):\n"
-        "- Vary sentence length dramatically: mix short punchy sentences (5-8 words) with longer complex ones (20-30 words).\n"
-        "- Use contractions naturally (it's, doesn't, won't, that's, here's).\n"
-        "- Add occasional conversational transitions: 'Now,', 'Here's the thing:', 'Worth noting:', 'That said,', 'Look,', 'The big picture?'.\n"
-        "- Break up uniform paragraph lengths — some short (1-2 sentences), some longer (4-5 sentences).\n"
-        "- Replace generic AI phrases: instead of 'It is worth noting' say 'One detail that stands out'; instead of 'This represents a significant' say 'This marks a real'; instead of 'It remains to be seen' say 'We'll have to wait and see'.\n"
-        "- Avoid these AI giveaway patterns: 'In conclusion', 'Furthermore', 'Moreover', 'It is important to note', 'In the realm of', 'It's worth mentioning', 'landscape', 'paradigm', 'leverage', 'robust', 'comprehensive', 'delve'.\n"
-        "- Insert the occasional mild opinion or editorial color: 'which is frankly impressive', 'not exactly cheap', 'a smart move if it pans out'.\n"
-        "- Use em-dashes (—) and parenthetical asides occasionally for a natural writing rhythm.\n"
-        "- Start some sentences with 'And', 'But', 'So', or 'Or' — the way real writers do.\n"
-        "- Vary paragraph openers — don't start consecutive paragraphs with the same word or structure.\n"
+        "You are a veteran tech editor — 15 years at publications like The Verge, Ars Technica, and Wired. "
+        "A junior writer has drafted the article below. Your job: rewrite it so it reads like YOU wrote it from scratch. "
+        "The result must feel unmistakably human — the kind of writing no AI detector would flag.\n\n"
+
+        "ABSOLUTE RULES (break any of these and the rewrite is rejected):\n"
+        "1. Preserve EVERY fact, number, date, spec, quote, and source attribution exactly as given.\n"
+        "2. Keep the same HTML structure — same tags (h2, h3, p, ul, table, etc.), same number of sections. Do NOT add or remove sections.\n"
+        "3. Output the COMPLETE rewritten article. Same word count or longer. NEVER truncate, shorten, or summarize.\n"
+        "4. Output ONLY HTML. No markdown, no preamble like 'Here is the rewritten article', no closing remarks.\n\n"
+
+        "REWRITING TECHNIQUES — apply ALL of these throughout:\n\n"
+
+        "SENTENCE RHYTHM:\n"
+        "- Alternate between short sentences (5-8 words) and longer ones (20-30 words). This creates a natural reading pulse.\n"
+        "- Start some sentences with conjunctions: 'And', 'But', 'So', 'Or', 'Yet'. Real writers do this constantly.\n"
+        "- Use fragments occasionally for emphasis. 'Not cheap. Not even close.'\n\n"
+
+        "WORD CHOICE:\n"
+        "- Use contractions everywhere: it's, doesn't, won't, that's, here's, can't, isn't, there's, we're, they've.\n"
+        "- BANNED words and phrases (these are AI giveaways — replace every single one): "
+        "'Furthermore', 'Moreover', 'Additionally', 'In conclusion', 'It is worth noting', "
+        "'It is important to note', 'It remains to be seen', 'In the realm of', 'landscape', "
+        "'paradigm', 'leverage', 'robust', 'comprehensive', 'delve', 'tapestry', 'multifaceted', "
+        "'streamline', 'cutting-edge', 'game-changer', 'spearhead', 'underscores', 'pivotal', "
+        "'groundbreaking', 'notably'.\n"
+        "- Replace them with natural alternatives: 'That said', 'On top of that', 'Here's the thing', "
+        "'Still', 'Look', 'The short version?', 'What matters here is', 'The real question is'.\n\n"
+
+        "PARAGRAPH FLOW:\n"
+        "- Vary paragraph lengths: some just 1-2 sentences, others 4-5. Never make them all the same size.\n"
+        "- Never start two consecutive paragraphs with the same word or structure.\n"
+        "- Use em-dashes (—) for parenthetical asides and mid-sentence pivots.\n"
+        "- Use parenthetical remarks occasionally (like this) for conversational color.\n\n"
+
+        "EDITORIAL VOICE:\n"
+        "- Sprinkle in mild editorial opinions where appropriate: 'which is frankly impressive', "
+        "'not exactly pocket change', 'a smart bet if it pans out', 'that's a big deal'.\n"
+        "- Add conversational transitions between sections: 'Now, about the camera...', "
+        "'Here's where it gets interesting.', 'So what does this actually mean for buyers?'\n"
+        "- Occasionally address the reader: 'you', 'your'.\n"
+        "- Show personality — mild humor, slight skepticism where warranted, genuine enthusiasm where deserved.\n\n"
+
+        "STRUCTURE TWEAKS (within the same HTML tags):\n"
+        "- Restructure sentences — don't just swap synonyms. Change the order of clauses, merge or split sentences, "
+        "move modifiers around. The goal is that no sentence structure from the original survives intact.\n"
+        "- Vary how you open sections: a question, a bold statement, an anecdote, a statistic.\n"
     )
     user = (
-        "Rewrite this article using ALL the humanization techniques above. "
-        "The output must be the COMPLETE rewritten article in HTML — same number of sections, same length. "
-        "Do NOT stop early or truncate.\n\n"
+        "Rewrite the entire article below using ALL the techniques described. "
+        "Output the COMPLETE rewritten HTML article — every section, start to finish. "
+        "Same length or longer. Do NOT stop early.\n\n"
         f"{html}"
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
+
+# ---------------------------------------------------------------------------
+# SEO PROMPT
+# ---------------------------------------------------------------------------
 def seo_prompt(title: str, category_name: str, html: str) -> List[Dict[str, str]]:
-    system = "You are an SEO editor for a tech news site. Return STRICT JSON only."
+    system = (
+        "You are an SEO specialist for a tech news website. "
+        "Analyze the article and return ONLY a valid JSON object — no markdown, no explanation, no extra text."
+    )
     user = (
-        f"Given the article HTML, produce SEO metadata.\n"
-        f"Title: {title}\nCategory: {category_name}\n\n"
-        "Return a JSON object with keys:\n"
-        "- meta_title (max ~60 chars)\n"
-        "- meta_description (max ~155 chars)\n"
-        "- short_description (1-2 sentences)\n"
-        "- tags (array of 5-10 short tags)\n"
-        "- image_alt (short alt text)\n\n"
+        f"Article title: {title}\n"
+        f"Category: {category_name}\n\n"
+        "Analyze the HTML article below and return a JSON object with exactly these keys:\n\n"
+        "{\n"
+        '  "slug": "short-seo-url-slug, 3-5 words max, lowercase, hyphens only, include brand/product name, e.g. samsung-galaxy-s26-ultra-launch",\n'
+        '  "meta_title": "SEO-optimized page title, max 60 characters, include primary keyword",\n'
+        '  "meta_description": "Compelling meta description, max 155 characters, include primary keyword and CTA",\n'
+        '  "short_description": "1-2 sentence summary for article cards and previews",\n'
+        '  "tags": ["tag1", "tag2", ...],  // 5-8 lowercase tags: brand names, product names, tech terms\n'
+        '  "image_alt": "Descriptive alt text for the featured image, 8-15 words"\n'
+        "}\n\n"
+        "Slug rules:\n"
+        "- 3-5 words separated by hyphens. No stop words (the, a, an, of, for, in, on, with).\n"
+        "- Must include the brand or product name.\n"
+        "- Must be unique-sounding and SEO-friendly.\n"
+        "- Examples: 'iphone-17-pro-launch-price', 'pixel-10-camera-specs-leaked', 'oneplus-14-india-release'\n\n"
+        "Other guidelines:\n"
+        "- meta_title: Front-load the primary keyword. Use a pipe | or dash — to separate.\n"
+        "- meta_description: Write like a search result snippet that compels clicks.\n"
+        "- tags: Brand names, product models, tech categories. Lowercase only.\n"
+        "- image_alt: Describe what the image would show, not the article topic.\n\n"
         "Article HTML:\n"
         f"{html}\n"
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
+
+# ---------------------------------------------------------------------------
+# IMAGE PROMPT
+# ---------------------------------------------------------------------------
 def build_image_prompt(title: str, category_name: str) -> str:
     return (
-        f"High-quality realistic product-style hero image illustrating the tech topic: {title}. "
+        f"Professional editorial photograph for a tech news article about: {title}. "
         f"Category: {category_name}. "
-        "No people, no brand logos, no text. Studio lighting, clean background. Looks like a magazine illustration."
+        "Style: Clean, modern, magazine-quality product photography or conceptual tech illustration. "
+        "Soft studio lighting with subtle gradient background. Sharp focus on the subject. "
+        "Absolutely no text, no watermarks, no logos, no human faces, no hands. "
+        "Photorealistic quality, 4K detail, slight depth of field blur in background."
     )
 
+
+# ---------------------------------------------------------------------------
+# ARTICLE CREATION PIPELINE
+# ---------------------------------------------------------------------------
 def create_article_from_lead(
     title: str,
     category_name: str,
     source_url: str = "",
     category_prompt_generation: str = "",
 ) -> Dict[str, Any]:
+    # ── Step 1: Research ──
     pack = build_research_pack(title)
     extracted_img = pick_extracted_image(pack) if get_setting("prefer_extracted_image", "1") == "1" else None
 
-    # Draft (category prompt override if present, otherwise use DEFAULT_GENERATION_TEMPLATE)
+    # ── Step 2: Build generation prompt ──
     sources_block = _sources_block_from_pack(pack)
     custom_prompt = (category_prompt_generation or "").strip()
     template = custom_prompt or DEFAULT_GENERATION_TEMPLATE
+
     rendered = render_prompt_template_strict(
         template,
         title=title,
@@ -1151,72 +1172,57 @@ def create_article_from_lead(
         sources_block=sources_block,
     )
 
-    if custom_prompt:
-        # Custom category prompts may not include full system-level framing,
-        # so we add a short system message to set ground rules.
-        generation_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a professional tech journalist. Write accurate, reader-friendly articles grounded ONLY in the provided sources. "
-                    "Do not invent facts, numbers, dates, or quotes. If something is uncertain, say so.\n\n"
-                    "Return ONLY HTML (no markdown)."
-                ),
-            },
-            {"role": "user", "content": rendered},
-        ]
-    else:
-        # DEFAULT_GENERATION_TEMPLATE already contains full instructions,
-        # so no separate system message needed — avoids redundancy.
-        generation_messages = [
-            {"role": "user", "content": rendered},
-        ]
+    # Both custom Directus prompts and DEFAULT_GENERATION_TEMPLATE are self-contained
+    # with full persona + instructions. No separate system message needed.
+    generation_messages = [
+        {"role": "user", "content": rendered},
+    ]
 
+    # ── Step 3: Generate draft ──
     draft_html = chat_stage("generation", generation_messages)
     if not draft_html.strip():
         raise RuntimeError("Generation returned empty content.")
 
-    # Clean up: strip markdown fences if LLM wraps output in ```html ... ```
     draft_html = _strip_code_fences(draft_html)
 
-    # Validate generation completeness
+    # ── Step 3b: Completion check — retry if too short ──
     word_count = len(draft_html.split())
-    if word_count < 600:
-        LOG.warning("Generation too short (%d words). Retrying with explicit length instruction.", word_count)
-        # Retry once with stronger length instruction
-        retry_msg = generation_messages.copy()
-        retry_msg.append({
-            "role": "assistant",
-            "content": draft_html,
-        })
-        retry_msg.append({
-            "role": "user",
-            "content": (
-                "The article above is incomplete and too short. Please write the COMPLETE article with ALL sections "
-                "as specified in the instructions. Target 1000-1500 words minimum. Include all sections through Sources. "
-                "Output ONLY the complete HTML article."
-            ),
-        })
-        retry_html = chat_stage("generation", retry_msg)
+    if word_count < 700:
+        LOG.warning("Generation too short (%d words). Retrying with continuation prompt.", word_count)
+        retry_messages = generation_messages + [
+            {"role": "assistant", "content": draft_html},
+            {"role": "user", "content": (
+                "The article above is incomplete — it has only ~{wc} words. "
+                "I need the COMPLETE article with ALL sections (Highlights, Hook, 5 body sections, FAQ, "
+                "Final Thoughts, Sources). Target minimum 1200 words. "
+                "Please output the full article from the beginning as complete HTML."
+            ).format(wc=word_count)},
+        ]
+        retry_html = chat_stage("generation", retry_messages)
         retry_html = _strip_code_fences(retry_html)
         if len(retry_html.split()) > word_count:
             draft_html = retry_html
             LOG.info("Retry produced %d words (was %d).", len(retry_html.split()), word_count)
+        else:
+            LOG.warning("Retry did not improve length. Using original %d-word draft.", word_count)
 
-    # Humanize
+    # ── Step 4: Humanize ──
     human_html = chat_stage("humanize", humanize_prompt(draft_html))
     human_html = _strip_code_fences(human_html)
 
-    # If humanize truncated the content (less than 70% of draft), fall back to draft
-    if not human_html.strip() or len(human_html.split()) < len(draft_html.split()) * 0.7:
+    # Guard: if humanize truncated badly (less than 60% of draft), fall back
+    draft_words = len(draft_html.split())
+    human_words = len(human_html.split()) if human_html.strip() else 0
+    if human_words < draft_words * 0.6:
         LOG.warning(
-            "Humanize output too short (%d words vs draft %d). Using draft.",
-            len(human_html.split()), len(draft_html.split()),
+            "Humanize output too short (%d words vs draft %d). Falling back to draft.",
+            human_words, draft_words,
         )
         human_html = draft_html
 
-    # SEO
+    # ── Step 5: SEO metadata ──
     seo_out = chat_stage("seo", seo_prompt(title, category_name, human_html))
+    seo_out = _strip_code_fences(seo_out)
     seo = extract_json_object(seo_out) or {}
 
     meta_title = seo.get("meta_title") or title[:60]
@@ -1225,13 +1231,19 @@ def create_article_from_lead(
     tags = seo.get("tags") if isinstance(seo.get("tags"), list) else []
     image_alt = seo.get("image_alt") or f"{title} — {category_name}"
 
-    # Image selection
+    # Slug: prefer LLM-generated crisp slug, fall back to title-based
+    seo_slug = (seo.get("slug") or "").strip().lower()
+    seo_slug = re.sub(r"[^a-z0-9-]", "", seo_slug).strip("-")
+    if seo_slug and 5 < len(seo_slug) < 80:
+        slug = seo_slug
+    else:
+        slug = slugify(title)
+
+    # ── Step 6: Featured image ──
     img = extracted_img
     if not img:
-        gen_img = generate_image(build_image_prompt(title, category_name))
-        img = gen_img
+        img = generate_image(build_image_prompt(title, category_name))
 
-    # Import image into Directus files to get a UUID
     featured_image = ""
     caption = ""
     credit = ""
@@ -1245,14 +1257,15 @@ def create_article_from_lead(
         credit = img.get("credit") or ""
     featured_image_credit = f"{caption} | Credit: {credit}".strip(" |")
 
-    slug = slugify(title)
+    # ── Step 7: Assemble final payload ──
+    # slug was already set from SEO output (or fallback) above
+    unique_slug = f"{slug}-{hashlib.md5(title.encode('utf-8')).hexdigest()[:6]}"
     published_at = _now_iso()
 
     return {
         "title": title,
-        "slug": f"{slug}-{hashlib.md5(title.encode('utf-8')).hexdigest()[:6]}",
+        "slug": unique_slug,
         "status": "published",
-        # category id is set at publish time
         "short_description": short_description,
         "content": human_html,
         "featured_image": featured_image,

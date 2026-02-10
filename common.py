@@ -17,1271 +17,258 @@ import feedparser
 import redis
 
 from config import REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD
+from llm_manager import chat_stage, generate_image_logic, strip_code_fences
 
 LOG = logging.getLogger("technews")
-
-# Default fallback category UUID when no keyword match is found.
 DEFAULT_CATEGORY_UUID = "3229ec20-3076-4a32-9fa2-88b65dacfedf"
+HTTP_TIMEOUT = 60
+USER_AGENT = "Mozilla/5.0 (compatible; GadgeekBot/2.0; +[https://bot.gadgeek.in](https://bot.gadgeek.in))"
 
-# Static configuration constants
-HTTP_TIMEOUT = 60  # seconds
-USER_AGENT = "Mozilla/5.0 (compatible; GadgeekBot/2.0; +https://bot.gadgeek.in)"
-
-# -------------------------
-# Logging
-# -------------------------
-def setup_logging(level: str = "INFO") -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
-
-# -------------------------
-# Redis client (shared settings store)
-# -------------------------
+def setup_logging(level: str = "INFO"):
+    logging.basicConfig(level=getattr(logging, level.upper()), format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
 _REDIS_CLIENT = None
-
-def _get_redis() -> redis.Redis:
+def _get_redis():
     global _REDIS_CLIENT
     if _REDIS_CLIENT is None:
-        try:
-            _REDIS_CLIENT = redis.Redis(
-                host=REDIS_HOST,
-                port=REDIS_PORT,
-                db=REDIS_DB,
-                username=REDIS_USERNAME,
-                password=REDIS_PASSWORD,
-                decode_responses=True,
-                socket_connect_timeout=10,
-                socket_timeout=10,
-            )
-            # Test the connection
-            _REDIS_CLIENT.ping()
-            LOG.info(f"✅ Redis connected successfully to {REDIS_HOST}:{REDIS_PORT}")
-        except Exception as e:
-            LOG.error(f"❌ Redis connection failed: {e}")
-            LOG.error(f"Host: {REDIS_HOST}, Port: {REDIS_PORT}, Username: {REDIS_USERNAME}")
-            raise RuntimeError(f"Cannot connect to Redis at {REDIS_HOST}:{REDIS_PORT}: {e}") from e
+        _REDIS_CLIENT = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, username=REDIS_USERNAME, password=REDIS_PASSWORD, decode_responses=True)
     return _REDIS_CLIENT
 
+def get_redis_client(): return _get_redis()
 
-def get_redis_client() -> redis.Redis:
-    """Public wrapper for the shared Redis client."""
-    return _get_redis()
-
-DEFAULTS_SETTINGS: Dict[str, str] = {
-    # endpoints
-    "directus_url": "",
-    "directus_token": "",
-    "directus_leads_collection": "news_leads",
-    "directus_articles_collection": "Articles",
-    "directus_categories_collection": "categories",
-    # slack
-    "slack_bot_token": "",
-    "slack_signing_secret": "",
-    "slack_channel_id": "",
-    # api keys
-    "tavily_api_key": "",
-    "together_api_key": "",
-    "openrouter_api_key": "",
-    # runtime
-    "publish_interval_minutes": "20",
-    "scout_interval_minutes": "30",
-    # pipeline options
-    "prefer_extracted_image": "1",  # 1=true
+DEFAULTS_SETTINGS = {
+    "directus_url": "", "directus_token": "", "directus_leads_collection": "news_leads",
+    "directus_articles_collection": "Articles", "directus_categories_collection": "categories",
+    "slack_bot_token": "", "slack_signing_secret": "", "slack_channel_id": "",
+    "tavily_api_key": "", "together_api_key": "", "openrouter_api_key": "",
+    "publish_interval_minutes": "20", "scout_interval_minutes": "30", "prefer_extracted_image": "1"
 }
 
 DEFAULT_MODEL_ROUTES = {
-    "generation": {"provider": "together", "model": "deepseek-ai/DeepSeek-V3.1", "temperature": 0.6, "max_tokens": 2200},
-    "humanize":   {"provider": "together", "model": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo", "temperature": 0.7, "max_tokens": 2200},
+    "generation": {"provider": "together", "model": "deepseek-ai/DeepSeek-V3", "temperature": 0.6, "max_tokens": 2200},
+    "humanize":   {"provider": "together", "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo", "temperature": 0.8, "max_tokens": 2200},
     "seo":        {"provider": "together", "model": "meta-llama/Llama-3.2-3B-Instruct-Turbo", "temperature": 0.4, "max_tokens": 900},
     "image":      {"provider": "together", "model": "black-forest-labs/FLUX.1-schnell", "width": 1024, "height": 768},
 }
 
-def _now_iso() -> str:
-    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-def init_db() -> None:
-    """Initialize Redis with default settings and model routes"""
-    try:
-        r = _get_redis()
-        
-        # Initialize default settings if not present
-        for k, v in DEFAULTS_SETTINGS.items():
-            key = f"settings:{k}"
-            try:
-                if not r.exists(key):
-                    r.hset(key, mapping={"value": v, "updated_at": _now_iso()})
-            except Exception as e:
-                LOG.warning(f"Failed to initialize setting {k}: {e}")
-        
-        # Initialize default model routes if not present
-        for stage, cfg in DEFAULT_MODEL_ROUTES.items():
-            key = f"model_routes:{stage}"
-            try:
-                if not r.exists(key):
-                    data = {
-                        "provider": cfg["provider"],
-                        "model": cfg["model"],
-                        "updated_at": _now_iso()
-                    }
-                    if "temperature" in cfg:
-                        data["temperature"] = str(cfg["temperature"])
-                    if "max_tokens" in cfg:
-                        data["max_tokens"] = str(cfg["max_tokens"])
-                    if "width" in cfg:
-                        data["width"] = str(cfg["width"])
-                    if "height" in cfg:
-                        data["height"] = str(cfg["height"])
-                    r.hset(key, mapping=data)
-            except Exception as e:
-                LOG.warning(f"Failed to initialize model route {stage}: {e}")
-        
-        LOG.info("Redis initialized with default settings")
-    except Exception as e:
-        LOG.error(f"Failed to initialize Redis: {e}")
-        raise
-
-def get_setting(key: str, default: Optional[str] = None) -> str:
-    """Get a setting from Redis, returning default if empty or not found"""
+def init_db():
     r = _get_redis()
-    value = r.hget(f"settings:{key}", "value")
-    return value if value else (default or "")
+    for k, v in DEFAULTS_SETTINGS.items():
+        if not r.exists(f"settings:{k}"): r.hset(f"settings:{k}", mapping={"value": v, "updated_at": _dt.datetime.utcnow().isoformat() + "Z"})
+    for stage, cfg in DEFAULT_MODEL_ROUTES.items():
+        if not r.exists(f"model_routes:{stage}"): r.hset(f"model_routes:{stage}", mapping={**cfg, "updated_at": _dt.datetime.utcnow().isoformat() + "Z"})
 
-def set_setting(key: str, value: str) -> None:
-    """Set a setting in Redis"""
-    r = _get_redis()
-    r.hset(f"settings:{key}", mapping={"value": value, "updated_at": _now_iso()})
+def get_setting(key, default=""):
+    val = _get_redis().hget(f"settings:{key}", "value")
+    return val if val else default
 
-def list_settings() -> Dict[str, str]:
-    """List all settings from Redis"""
-    r = _get_redis()
-    result = {}
-    for redis_key in r.scan_iter(match="settings:*"):
-        key = redis_key.replace("settings:", "")
-        value = r.hget(redis_key, "value")
-        if value is not None:
-            result[key] = value
-    return result
+def set_setting(key, value): _get_redis().hset(f"settings:{key}", mapping={"value": value, "updated_at": _dt.datetime.utcnow().isoformat() + "Z"})
 
-# -------------------------
-# RSS Feeds (Redis-based)
-# -------------------------
+def list_settings():
+    r, res = _get_redis(), {}
+    for rk in r.scan_iter(match="settings:*"): res[rk.replace("settings:", "")] = r.hget(rk, "value")
+    return res
 
-def list_feeds() -> List[Dict[str, Any]]:
-    """List all RSS feeds from Redis"""
-    r = _get_redis()
-    feeds = []
-    for redis_key in r.scan_iter(match="feed:*"):
-        # Skip the counter key
-        if redis_key == "feed:next_id":
-            continue
-        data = r.hgetall(redis_key)
-        if data:
-            try:
-                feed_id = int(redis_key.replace("feed:", ""))
-            except ValueError:
-                # Skip non-numeric feed keys
-                continue
-            feeds.append({
-                "id": feed_id,
-                "url": data.get("url", ""),
-                "enabled": data.get("enabled", "1") == "1",
-                "category_hint": data.get("category_hint") or "",
-                "title_key": data.get("title_key") or "",
-                "description_key": data.get("description_key") or "",
-                "content_key": data.get("content_key") or "",
-                "category_key": data.get("category_key") or "",
-                "created_at": data.get("created_at", ""),
-                "updated_at": data.get("updated_at", ""),
-            })
-    # Sort by ID descending
-    feeds.sort(key=lambda x: x["id"], reverse=True)
-    return feeds
+def list_feeds():
+    r, feeds = _get_redis(), []
+    for rk in r.scan_iter(match="feed:*"):
+        if rk == "feed:next_id": continue
+        data = r.hgetall(rk)
+        if data: feeds.append({"id": int(rk.replace("feed:", "")), **data, "enabled": data.get("enabled") == "1"})
+    return sorted(feeds, key=lambda x: x["id"], reverse=True)
 
-def upsert_feed(feed: Dict[str, Any]) -> int:
-    """Create or update an RSS feed in Redis"""
-    r = _get_redis()
-    url = feed["url"]
-    
-    # Check if feed exists by URL
-    feed_id = None
-    for redis_key in r.scan_iter(match="feed:*"):
-        if redis_key == "feed:next_id":
-            continue
-        data = r.hgetall(redis_key)
-        if data.get("url") == url:
-            try:
-                feed_id = int(redis_key.replace("feed:", ""))
-                break
-            except ValueError:
-                continue
-    
-    now = _now_iso()
-    
-    if feed_id is None:
-        # Create new feed - get next ID
-        feed_id = r.incr("feed:next_id")
-        created_at = now
-    else:
-        # Update existing
-        existing = r.hgetall(f"feed:{feed_id}")
-        created_at = existing.get("created_at", now)
-    
-    # Store feed
-    feed_data = {
-        "url": url,
-        "enabled": "1" if feed.get("enabled", True) else "0",
-        "category_hint": feed.get("category_hint") or "",
-        "title_key": feed.get("title_key") or "",
-        "description_key": feed.get("description_key") or "",
-        "content_key": feed.get("content_key") or "",
-        "category_key": feed.get("category_key") or "",
-        "created_at": created_at,
-        "updated_at": now,
-    }
-    
-    r.hset(f"feed:{feed_id}", mapping=feed_data)
-    return feed_id
+def upsert_feed(feed):
+    r, url = _get_redis(), feed["url"]
+    fid = next((int(rk.replace("feed:", "")) for rk in r.scan_iter("feed:*") if rk != "feed:next_id" and r.hget(rk, "url") == url), None)
+    if fid is None: fid = r.incr("feed:next_id")
+    r.hset(f"feed:{fid}", mapping={**feed, "enabled": "1" if feed.get("enabled", True) else "0", "updated_at": _dt.datetime.utcnow().isoformat() + "Z"})
+    return fid
 
-def delete_feed(feed_id: int) -> None:
-    """Delete an RSS feed from Redis"""
-    r = _get_redis()
-    r.delete(f"feed:{feed_id}")
+def delete_feed(fid): _get_redis().delete(f"feed:{fid}")
 
-# -------------------------
-# Model Routes (Redis-based)
-# -------------------------
-
-def get_model_routes() -> Dict[str, Dict[str, Any]]:
-    """Get all model routing configurations"""
-    r = _get_redis()
-    routes = {}
-    for redis_key in r.scan_iter(match="model_routes:*"):
-        stage = redis_key.replace("model_routes:", "")
-        if not stage:  # Skip empty stage names
-            continue
-        data = r.hgetall(redis_key)
-        if data:
-            route = {
-                "provider": data.get("provider", ""),
-                "model": data.get("model", ""),
-            }
-            if "temperature" in data and data["temperature"]:
-                try:
-                    route["temperature"] = float(data["temperature"])
-                except (ValueError, TypeError):
-                    pass
-            if "max_tokens" in data and data["max_tokens"]:
-                try:
-                    route["max_tokens"] = int(data["max_tokens"])
-                except (ValueError, TypeError):
-                    pass
-            if "width" in data and data["width"]:
-                try:
-                    route["width"] = int(data["width"])
-                except (ValueError, TypeError):
-                    pass
-            if "height" in data and data["height"]:
-                try:
-                    route["height"] = int(data["height"])
-                except (ValueError, TypeError):
-                    pass
-            routes[stage] = route
+def get_model_routes():
+    r, routes = _get_redis(), {}
+    for rk in r.scan_iter("model_routes:*"):
+        stage, data = rk.replace("model_routes:", ""), r.hgetall(rk)
+        if data: routes[stage] = {k: (float(v) if k == "temperature" else int(v) if k in ["max_tokens", "width", "height"] else v) for k, v in data.items()}
     return routes
 
-def set_model_route(stage: str, provider: str, model: str, temperature: Optional[float] = None, 
-                    max_tokens: Optional[int] = None, width: Optional[int] = None, 
-                    height: Optional[int] = None) -> None:
-    """Set model routing for a specific stage"""
-    r = _get_redis()
-    data = {
-        "provider": provider,
-        "model": model,
-        "updated_at": _now_iso(),
-    }
-    if temperature is not None:
-        data["temperature"] = str(temperature)
-    if max_tokens is not None:
-        data["max_tokens"] = str(max_tokens)
-    if width is not None:
-        data["width"] = str(width)
-    if height is not None:
-        data["height"] = str(height)
-    
-    r.hset(f"model_routes:{stage}", mapping=data)
-
-# -------------------------
-# HTTP utilities
-# -------------------------
+def set_model_route(stage, provider, model, **kwargs):
+    data = {"provider": provider, "model": model, "updated_at": _dt.datetime.utcnow().isoformat() + "Z", **{k: str(v) for k, v in kwargs.items() if v is not None}}
+    _get_redis().hset(f"model_routes:{stage}", mapping=data)
 
 @dataclass
 class Response:
-    status_code: int
-    text: str
-    headers: Dict[str, str]
+    status_code: int; text: str; headers: Dict[str, str]
+    def json(self): return json.loads(self.text)
 
-    def json(self):
-        return json.loads(self.text)
-
-def request_with_retry(
-    method: str,
-    url: str,
-    headers: Optional[Dict[str, str]] = None,
-    json_body: Optional[Dict[str, Any]] = None,
-    timeout: int = HTTP_TIMEOUT,
-    max_attempts: int = 3,
-) -> Response:
-    hdrs = headers or {}
-    if "User-Agent" not in hdrs:
-        hdrs["User-Agent"] = USER_AGENT
-    
-    for attempt in range(1, max_attempts + 1):
+def request_with_retry(method, url, headers=None, json_body=None, timeout=HTTP_TIMEOUT, max_attempts=3):
+    hdrs = headers or {}; hdrs.setdefault("User-Agent", USER_AGENT)
+    for i in range(max_attempts):
         try:
-            resp = requests.request(method, url, headers=hdrs, json=json_body, timeout=timeout)
-            return Response(status_code=resp.status_code, text=resp.text, headers=dict(resp.headers))
-        except Exception as e:
-            LOG.warning("HTTP request attempt %d/%d failed: %s", attempt, max_attempts, e)
-            if attempt == max_attempts:
-                raise
-            time.sleep(min(2 ** attempt, 10))
-    raise RuntimeError("Unreachable")
-
-# -------------------------
-# Basic Auth
-# -------------------------
+            r = requests.request(method, url, headers=hdrs, json=json_body, timeout=timeout)
+            return Response(r.status_code, r.text, dict(r.headers))
+        except Exception:
+            if i == max_attempts - 1: raise
+            time.sleep(min(2**i, 10))
 
 def require_basic_auth(f):
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
-        from flask import request, Response as FlaskResponse
-        auth = request.authorization
-        if not auth or auth.username != "settings@gadgeek.in" or auth.password != "HelloGG@$44":
-            return FlaskResponse("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="Settings"'})
+        from flask import request, Response as FR
+        a = request.authorization
+        if not a or a.username != "settings@gadgeek.in" or a.password != "HelloGG@$44":
+            return FR("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="Settings"'})
         return f(*args, **kwargs)
     return wrapper
 
-# -------------------------
-# Directus
-# -------------------------
+def directus_api(method, path, data=None):
+    url = f"{get_setting('directus_url').rstrip('/')}{path}"
+    headers = {"Authorization": f"Bearer {get_setting('directus_token')}"}
+    r = request_with_retry(method, url, headers=headers, json_body=data)
+    if r.status_code >= 400: raise RuntimeError(f"Directus {method} {path} failed: {r.status_code}")
+    return r.json()
 
-def directus_url() -> str:
-    return get_setting("directus_url", "").rstrip("/")
-
-def directus_token() -> str:
-    return get_setting("directus_token", "")
-
-def leads_collection() -> str:
-    return get_setting("directus_leads_collection", "news_leads")
-
-def articles_collection() -> str:
-    return get_setting("directus_articles_collection", "Articles")
-
-def categories_collection() -> str:
-    return get_setting("directus_categories_collection", "categories")
-
-def directus_get(path: str) -> Dict[str, Any]:
-    url = f"{directus_url()}{path}"
-    headers = {"Authorization": f"Bearer {directus_token()}"}
-    resp = request_with_retry("GET", url, headers=headers)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Directus GET {path} failed: {resp.status_code} {resp.text}")
-    return resp.json()
-
-def directus_post(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{directus_url()}{path}"
-    headers = {"Authorization": f"Bearer {directus_token()}"}
-    resp = request_with_retry("POST", url, headers=headers, json_body=data)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Directus POST {path} failed: {resp.status_code} {resp.text}")
-    return resp.json()
-
-def directus_patch(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{directus_url()}{path}"
-    headers = {"Authorization": f"Bearer {directus_token()}"}
-    resp = request_with_retry("PATCH", url, headers=headers, json_body=data)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Directus PATCH {path} failed: {resp.status_code} {resp.text}")
-    return resp.json()
-
-
-def import_image_to_directus(image_url: str, title: str = "") -> Optional[str]:
-    """Import an image URL into Directus files and return the file UUID.
-
-    Uses Directus's /files/import endpoint to download the image from the URL
-    and store it in the Directus file library.
-    Returns the UUID string on success, or None on failure.
-    """
-    if not image_url or not image_url.startswith("http"):
-        return None
-
-    base = directus_url()
-    token = directus_token()
-    if not base or not token:
-        LOG.warning("Directus URL or token not configured; cannot import image.")
-        return None
-
-    import_url = f"{base}/files/import"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {
-        "url": image_url,
-        "data": {
-            "title": title[:255] if title else "Featured image",
-        },
-    }
-
+def import_image_to_directus(url, title=""):
+    if not url.startswith("http"): return None
     try:
-        resp = requests.post(import_url, headers=headers, json=payload, timeout=120)
-        if resp.status_code >= 400:
-            LOG.warning("Directus image import failed (%s): %s", resp.status_code, resp.text[:500])
-            return None
-        data = resp.json()
-        file_id = (data.get("data") or {}).get("id")
-        if file_id:
-            LOG.info("Image imported to Directus: %s -> %s", image_url[:80], file_id)
-            return str(file_id)
-        LOG.warning("Directus image import returned no file ID: %s", resp.text[:300])
-        return None
-    except Exception as e:
-        LOG.warning("Directus image import error: %s", e)
-        return None
+        res = requests.post(f"{get_setting('directus_url').rstrip('/')}/files/import", headers={"Authorization": f"Bearer {get_setting('directus_token')}"}, json={"url": url, "data": {"title": title[:255]}}, timeout=120)
+        return str(res.json().get("data", {}).get("id")) if res.status_code < 400 else None
+    except Exception: return None
 
-def get_categories() -> List[Dict[str, Any]]:
-    """Fetch enabled categories from Directus"""
-    col = categories_collection()
-    params = urlencode({"filter[enabled][_eq]": "true", "sort": "priority", "limit": "-1"})
-    data = directus_get(f"/items/{col}?{params}")
-    cats = data.get("data") or []
-    
-    if not cats:
-        LOG.warning("No categories found in Directus")
-        return []
-    
-    result = []
-    for c in cats:
-        try:
-            # Parse keywords
-            kw = c.get("keywords", [])
-            if isinstance(kw, str):
-                try:
-                    kw = json.loads(kw)
-                except Exception:
-                    kw = []
-            if not isinstance(kw, list):
-                kw = []
-            
-            # Safe int conversion helper
-            def safe_int(val, default):
-                if val in (None, "", "null"):
-                    return default
-                try:
-                    return int(float(val))
-                except (ValueError, TypeError):
-                    return default
-            
-            result.append({
-                "id": c.get("id"),
-                "slug": c.get("slug", ""),
-                "name": c.get("name", ""),
-                "priority": safe_int(c.get("priority"), 999),
-                "posts_per_scout": safe_int(c.get("posts_per_scout"), 0),
-                "keywords": kw,
-                "prompt_generation": c.get("prompt_generation") or "",
-            })
-        except Exception as e:
-            LOG.error(f"Failed to process category {c.get('slug', 'unknown')}: {e}")
-            continue
-    
-    return result
+def get_categories():
+    data = directus_api("GET", f"/items/{get_setting('directus_categories_collection')}?filter[enabled][_eq]=true&limit=-1")
+    return [{"id": c["id"], "slug": c["slug"], "name": c["name"], "keywords": json.loads(c["keywords"]) if isinstance(c.get("keywords"), str) else c.get("keywords", []), "prompt_generation": c.get("prompt_generation") or "", "priority": int(c.get("priority") or 999), "posts_per_scout": int(c.get("posts_per_scout") or 0)} for c in data.get("data", [])]
 
-def lead_exists_by_url(source_url: str) -> bool:
-    col = leads_collection()
-    params = urlencode({"filter[source_url][_eq]": source_url, "limit": "1"})
-    data = directus_get(f"/items/{col}?{params}")
-    items = data.get("data") or []
-    return len(items) > 0
+def lead_exists_by_url(url): return len(directus_api("GET", f"/items/{get_setting('directus_leads_collection')}?filter[source_url][_eq]={url}&limit=1").get("data", [])) > 0
 
-def create_lead(title: str, source_url: str, category_id: str) -> str:
-    col = leads_collection()
-    payload = {"title": title, "source_url": source_url, "category": category_id, "status": "pending"}
-    data = directus_post(f"/items/{col}", payload)
-    item = data.get("data") or {}
-    lead_id = item.get("id")
-    if not lead_id:
-        raise RuntimeError(f"Directus create_lead returned no id (response data: {item})")
-    return str(lead_id)
+def create_lead(title, source_url, cat_id): return str(directus_api("POST", f"/items/{get_setting('directus_leads_collection')}", {"title": title, "source_url": source_url, "category": cat_id, "status": "pending"}).get("data", {}).get("id"))
 
-def get_lead(lead_id: str) -> Dict[str, Any]:
-    col = leads_collection()
-    data = directus_get(f"/items/{col}/{lead_id}")
-    return data.get("data") or {}
+def get_lead(lid): return directus_api("GET", f"/items/{get_setting('directus_leads_collection')}/{lid}").get("data", {})
 
-def update_lead_status(lead_id: str, status: str) -> None:
-    col = leads_collection()
-    directus_patch(f"/items/{col}/{lead_id}", {"status": status})
+def update_lead_status(lid, status): directus_api("PATCH", f"/items/{get_setting('directus_leads_collection')}/{lid}", {"status": status})
 
-def list_one_approved_lead_newest(status: str = "approved") -> Optional[Dict[str, Any]]:
-    """Fetch one lead (newest) for a given status.
-
-    UUID ids are not sortable chronologically, so we sort by date_created.
-    """
-    col = leads_collection()
-    params = urlencode({"filter[status][_eq]": status, "sort": "-date_created", "limit": "1"})
-    data = directus_get(f"/items/{col}?{params}")
-    items = data.get("data") or []
+def list_one_approved_lead_newest(status="approved"):
+    items = directus_api("GET", f"/items/{get_setting('directus_leads_collection')}?filter[status][_eq]={status}&sort=-date_created&limit=1").get("data", [])
     return items[0] if items else None
 
-def get_category_by_id(category_id: str) -> Optional[Dict[str, Any]]:
-    for c in get_categories():
-        if str(c.get("id") or "") == str(category_id):
-            return c
-    return None
+def get_category_by_id(cid): return next((c for c in get_categories() if str(c["id"]) == str(cid)), None)
 
-# -------------------------
-# Slack
-# -------------------------
-
-def slack_token() -> str:
-    return get_setting("slack_bot_token", "")
-
-def slack_channel() -> str:
-    return get_setting("slack_channel_id", "")
-
-def slack_signing_secret() -> str:
-    return get_setting("slack_signing_secret", "")
-
-def verify_slack_signature(headers: Dict[str, str], body: bytes) -> bool:
-    secret = slack_signing_secret()
-    if not secret:
-        LOG.warning("Slack signing secret not set; skipping signature verification")
-        return True
-    sig = headers.get("X-Slack-Signature") or headers.get("x-slack-signature") or ""
-    ts = headers.get("X-Slack-Request-Timestamp") or headers.get("x-slack-request-timestamp") or ""
-    if not sig or not ts:
-        return False
-    base = f"v0:{ts}:{body.decode('utf-8')}"
-    expected = "v0=" + hmac.new(secret.encode(), base.encode(), hashlib.sha256).hexdigest()
+def verify_slack_signature(headers, body):
+    secret = get_setting("slack_signing_secret")
+    if not secret: return True
+    sig, ts = headers.get("X-Slack-Signature", ""), headers.get("X-Slack-Request-Timestamp", "")
+    if not sig or not ts: return False
+    expected = "v0=" + hmac.new(secret.encode(), f"v0:{ts}:{body.decode()}".encode(), hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig, expected)
 
-def slack_post_lead(title: str, category_name: str, lead_id: str) -> Dict[str, Any]:
-    token = slack_token()
-    channel = slack_channel()
-    if not token or not channel:
-        raise RuntimeError("Slack bot token or channel ID not configured")
-    
-    blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*\n_{category_name}_"}},
-        {
-            "type": "actions",
-            "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": "✅ Approve"}, "style": "primary", "action_id": "approve", "value": str(lead_id)},
-                {"type": "button", "text": {"type": "plain_text", "text": "🚀 Urgent"}, "style": "danger", "action_id": "urgent", "value": str(lead_id)},
-                {"type": "button", "text": {"type": "plain_text", "text": "❌ Reject"}, "action_id": "reject", "value": str(lead_id)},
-            ],
-        },
-    ]
-    
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"channel": channel, "text": title, "blocks": blocks}
-    resp = request_with_retry("POST", "https://slack.com/api/chat.postMessage", headers=headers, json_body=payload)
-    data = resp.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Slack post failed: {data.get('error')}")
-    return data
+def slack_post_lead(title, cat_name, lid):
+    token, channel = get_setting("slack_bot_token"), get_setting("slack_channel_id")
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*\n_{cat_name}_"}}, {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "✅ Approve"}, "style": "primary", "action_id": "approve", "value": str(lid)}, {"type": "button", "text": {"type": "plain_text", "text": "🚀 Urgent"}, "style": "danger", "action_id": "urgent", "value": str(lid)}, {"type": "button", "text": {"type": "plain_text", "text": "❌ Reject"}, "action_id": "reject", "value": str(lid)}]}]
+    return request_with_retry("POST", "[https://slack.com/api/chat.postMessage](https://slack.com/api/chat.postMessage)", headers={"Authorization": f"Bearer {token}"}, json_body={"channel": channel, "blocks": blocks}).json()
 
-def slack_update_published(channel: str, ts: str, title: str) -> None:
-    token = slack_token()
-    if not token:
-        return
-    
-    blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"✅ *Published:* {title}"}},
-    ]
-    
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"channel": channel, "ts": ts, "text": f"Published: {title}", "blocks": blocks}
-    request_with_retry("POST", "https://slack.com/api/chat.update", headers=headers, json_body=payload)
+def slack_update_published(ch, ts, title): request_with_retry("POST", "[https://slack.com/api/chat.update](https://slack.com/api/chat.update)", headers={"Authorization": f"Bearer {get_setting('slack_bot_token')}"}, json_body={"channel": ch, "ts": ts, "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": f"✅ *Published:* {title}"}}]})
 
-def slack_ephemeral(response_url: str, text: str) -> None:
-    if not response_url:
-        return
-    payload = {"text": text, "response_type": "ephemeral", "replace_original": False}
-    request_with_retry("POST", response_url, json_body=payload)
+def slack_ephemeral(url, text): request_with_retry("POST", url, json_body={"text": text, "response_type": "ephemeral"})
 
-# -------------------------
-# RSS feed parsing
-# -------------------------
+def parse_feed(url): return feedparser.parse(requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT).content)
 
-def parse_feed(url: str):
-    resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
-    return feedparser.parse(resp.content)
-
-def _nested_get(d: Any, key: str) -> Any:
-    if not key:
-        return None
-    parts = key.split(".")
-    for p in parts:
-        if isinstance(d, dict):
-            d = d.get(p)
-        elif isinstance(d, list):
-            try:
-                idx = int(p)
-                d = d[idx] if 0 <= idx < len(d) else None
-            except Exception:
-                return None
-        else:
-            return None
-        if d is None:
-            return None
+def _nested_get(d, key):
+    if not key: return None
+    for p in key.split("."):
+        try: d = d[int(p)] if isinstance(d, list) else d.get(p)
+        except: return None
+        if d is None: break
     return d
 
-def extract_entry_fields(entry: Any, selectors: Dict[str, Optional[str]]) -> Dict[str, str]:
-    title = _nested_get(entry, selectors.get("title_key") or "title") or getattr(entry, "title", "")
-    desc = _nested_get(entry, selectors.get("description_key") or "summary") or getattr(entry, "summary", "")
-    content_key = selectors.get("content_key")
-    content = ""
-    if content_key:
-        content = _nested_get(entry, content_key) or ""
-    else:
-        c = getattr(entry, "content", [])
-        if c and isinstance(c, list) and len(c) > 0:
-            content = c[0].get("value", "")
-    
-    link = getattr(entry, "link", "")
-    category_key = selectors.get("category_key")
-    category = ""
-    if category_key:
-        category = _nested_get(entry, category_key) or ""
-    else:
-        tags = getattr(entry, "tags", [])
-        if tags and isinstance(tags, list) and len(tags) > 0:
-            category = tags[0].get("term", "")
-    
-    return {"title": str(title), "link": str(link), "description": str(desc), "content": str(content), "category": str(category)}
-
-# -------------------------
-# LLM chat routing (Together / OpenRouter)
-# -------------------------
-
-TOGETHER_CHAT_URL = "https://api.together.xyz/v1/chat/completions"
-TOGETHER_IMAGES_URL = "https://api.together.xyz/v1/images/generations"
-OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-def chat_stage(stage: str, messages: List[Dict[str, str]]) -> str:
-    """Call LLM for a specific stage using configured routing"""
-    routes = get_model_routes()
-    route = routes.get(stage)
-    if not route:
-        raise RuntimeError(f"No model route configured for stage: {stage}")
-    
-    provider = route["provider"]
-    model = route["model"]
-    temperature = route.get("temperature", 0.7)
-    max_tokens = route.get("max_tokens", 2000)
-    
-    if provider == "together":
-        return _chat_together(model, messages, temperature, max_tokens)
-    elif provider == "openrouter":
-        return _chat_openrouter(model, messages, temperature, max_tokens)
-    else:
-        raise RuntimeError(f"Unknown provider: {provider}")
-
-def _chat_together(model: str, messages: List[Dict[str, str]], temperature: float, max_tokens: int) -> str:
-    key = get_setting("together_api_key")
-    if not key:
-        raise RuntimeError("Together API key not configured")
-    
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
+def extract_entry_fields(ent, sel):
+    return {
+        "title": str(_nested_get(ent, sel.get("title_key") or "title") or getattr(ent, "title", "")),
+        "link": str(getattr(ent, "link", "")),
+        "description": str(_nested_get(ent, sel.get("description_key") or "summary") or getattr(ent, "summary", "")),
+        "content": str(_nested_get(ent, sel.get("content_key")) or (ent.content[0].value if hasattr(ent, "content") else "")),
+        "category": str(_nested_get(ent, sel.get("category_key")) or (ent.tags[0].term if hasattr(ent, "tags") else ""))
     }
-    
-    resp = request_with_retry("POST", TOGETHER_CHAT_URL, headers=headers, json_body=payload, timeout=120, max_attempts=3)
-    data = resp.json()
-    
-    choices = data.get("choices") or []
-    if not choices:
-        raise RuntimeError(f"Together returned no choices: {data}")
-    
-    return (choices[0].get("message") or {}).get("content") or ""
 
-def _chat_openrouter(model: str, messages: List[Dict[str, str]], temperature: float, max_tokens: int) -> str:
-    key = get_setting("openrouter_api_key")
-    if not key:
-        raise RuntimeError("OpenRouter API key not configured")
-    
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://bot.gadgeek.in",
-        "X-Title": "Gadgeek Tech News",
-    }
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    
-    resp = request_with_retry("POST", OPENROUTER_CHAT_URL, headers=headers, json_body=payload, timeout=120, max_attempts=3)
-    data = resp.json()
-    
-    choices = data.get("choices") or []
-    if not choices:
-        raise RuntimeError(f"OpenRouter returned no choices: {data}")
-    
-    return (choices[0].get("message") or {}).get("content") or ""
+def keyword_score(text: str, keywords: List[str]) -> int:
+    """Robust Regex matching with word boundaries."""
+    t = (text or "").lower(); score = 0
+    for kw in (k.strip().lower() for k in keywords if k.strip()):
+        if re.search(rf'\b{re.escape(kw)}\b', t): score += 1
+    return score
 
-# -------------------------
-# Tavily research
-# -------------------------
-
-def build_research_pack(title: str) -> Dict[str, Any]:
+def build_research_pack(title):
     key = get_setting("tavily_api_key")
-    if not key:
-        LOG.warning("Tavily API key not set; skipping research.")
-        return {"extract": {"results": []}}
-    
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "api_key": key,
-        "query": title,
-        "search_depth": "advanced",
-        "max_results": 5,
-        "include_raw_content": True,
-        "include_images": True,
-    }
-    
+    if not key: return {"extract": {"results": []}}
     try:
-        resp = request_with_retry("POST", "https://api.tavily.com/search", headers=headers, json_body=payload, timeout=60, max_attempts=2)
-        data = resp.json()
-        return {"extract": data}
-    except Exception as e:
-        LOG.warning("Tavily research failed: %s", e)
-        return {"extract": {"results": []}}
+        r = request_with_retry("POST", "[https://api.tavily.com/search](https://api.tavily.com/search)", json_body={"api_key": key, "query": title, "search_depth": "advanced", "max_results": 5, "include_raw_content": True, "include_images": True})
+        return {"extract": r.json()}
+    except: return {"extract": {"results": []}}
 
-def pick_extracted_image(pack: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    results = (pack.get("extract") or {}).get("results") or []
-    images = (pack.get("extract") or {}).get("images") or []
-    
-    # Prefer images from results
-    for r in results:
-        img_url = r.get("image")
-        if img_url and img_url.startswith("http"):
-            return {"url": img_url, "credit": r.get("url", "Source"), "caption": "Featured image"}
-    
-    # Fallback to general images
-    if images and images[0].startswith("http"):
-        return {"url": images[0], "credit": "Web", "caption": "Featured image"}
-    
-    return None
+def _sources_block_from_pack(pack):
+    res = (pack.get("extract") or {}).get("results") or []
+    return "\n\n".join([f"SOURCE: {r['url']}\n{r.get('content', r.get('raw_content', ''))[:2000]}" for r in res[:6]]) or "No sources available."
 
-# -------------------------
-# Image generation (routing-based)
-# -------------------------
+def pick_extracted_image(pack):
+    res = (pack.get("extract") or {}).get("results") or []
+    for r in res:
+        if r.get("image") and r["image"].startswith("http"): return {"url": r["image"], "credit": r.get("url", "Source"), "caption": "Featured image"}
+    img = (pack.get("extract") or {}).get("images") or []
+    return {"url": img[0], "credit": "Web", "caption": "Featured image"} if img and img[0].startswith("http") else None
 
-def generate_image(prompt: str) -> Optional[Dict[str, str]]:
-    """Generate image using configured routing"""
-    routes = get_model_routes()
-    route = routes.get("image")
-    if not route:
-        LOG.warning("No image route configured; using default Together")
-        return generate_image_together(prompt, 1024, 768)
-    
-    provider = route["provider"]
-    model = route["model"]
-    width = route.get("width", 1024)
-    height = route.get("height", 768)
-    
-    if provider == "together":
-        return generate_image_together(prompt, width, height, model)
-    elif provider == "openrouter":
-        return generate_image_openrouter(prompt, width, height, model)
-    else:
-        raise RuntimeError(f"Unknown image provider: {provider}")
+def slugify(text):
+    text = re.sub(r"[^a-z0-9\s-]", "", text.lower())
+    return re.sub(r"\s+", "-", text).strip("-")[:80] or "tech-news"
 
-def generate_image_together(prompt: str, width: int = 1024, height: int = 768, model: Optional[str] = None) -> Optional[Dict[str, str]]:
-    """Generate image using Together AI"""
-    key = get_setting("together_api_key")
-    if not key:
-        LOG.warning("Together API key not set")
-        return None
-    
-    if model is None:
-        model = "black-forest-labs/FLUX.1-schnell"
-    
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "width": width,
-        "height": height,
-        "steps": 4,
-        "n": 1,
-        "response_format": "url",
-        "output_format": "jpeg",
-    }
-    
-    try:
-        resp = request_with_retry("POST", TOGETHER_IMAGES_URL, headers=headers, json_body=payload, timeout=120, max_attempts=3)
-        data = resp.json()
-        item = (data.get("data") or [{}])[0]
-        
-        if item.get("url"):
-            return {"url": item["url"], "credit": "AI-generated (Together)", "caption": "AI-generated illustration"}
-        if item.get("b64_json"):
-            return {"url": f"data:image/jpeg;base64,{item['b64_json']}", "credit": "AI-generated (Together)", "caption": "AI-generated illustration"}
-    except Exception as e:
-        LOG.warning("Together image generation failed: %s", e)
-    
-    return None
+def extract_json_object(text):
+    try: return json.loads(strip_code_fences(text))
+    except:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        try: return json.loads(m.group()) if m else None
+        except: return None
 
-def generate_image_openrouter(prompt: str, width: int = 1024, height: int = 768, model: str = "openai/dall-e-3") -> Optional[Dict[str, str]]:
-    """Generate image using OpenRouter (requires image-capable model)"""
-    key = get_setting("openrouter_api_key")
-    if not key:
-        LOG.warning("OpenRouter API key not set")
-        return None
-    
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://bot.gadgeek.in",
-        "X-Title": "Gadgeek Tech News",
-    }
-    
-    # OpenRouter uses chat completions format for DALL-E
-    messages = [{"role": "user", "content": prompt}]
-    payload = {
-        "model": model,
-        "messages": messages,
-    }
-    
-    try:
-        resp = request_with_retry("POST", OPENROUTER_CHAT_URL, headers=headers, json_body=payload, timeout=120, max_attempts=3)
-        data = resp.json()
-        
-        # Extract image URL from response
-        choices = data.get("choices") or []
-        if choices:
-            content = (choices[0].get("message") or {}).get("content") or ""
-            # Try to extract URL from content (format varies by model)
-            import re
-            urls = re.findall(r'https?://[^\s<>"]+', content)
-            if urls:
-                return {"url": urls[0], "credit": "AI-generated (OpenRouter)", "caption": "AI-generated illustration"}
-    except Exception as e:
-        LOG.warning("OpenRouter image generation failed: %s", e)
-    
-    return None
+DEFAULT_GENERATION_TEMPLATE = """You are a professional tech journalist writing for {category}.
+Article Title: {title}
 
-# -------------------------
-# Text utilities
-# -------------------------
-
-def _strip_code_fences(text: str) -> str:
-    """Remove markdown code fences (```html ... ```) that LLMs sometimes wrap output in."""
-    t = text.strip()
-    # Remove opening fence like ```html or ```
-    t = re.sub(r"^```(?:html|HTML)?\s*\n?", "", t)
-    # Remove closing fence
-    t = re.sub(r"\n?```\s*$", "", t)
-    return t.strip()
-
-def slugify(text: str, max_len: int = 80) -> str:
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9\s-]", "", text)
-    text = re.sub(r"\s+", "-", text).strip("-")
-    if len(text) > max_len:
-        text = text[:max_len].rstrip("-")
-    if not text:
-        text = "tech-news"
-    return text
-
-def _sanitize_json(s: str) -> str:
-    s = s.replace("\u201c", '"').replace("\u201d", '"').replace("\u2019", "'")
-    s = re.sub(r",(\s*[}\]])", r"\1", s)
-    return s
-
-def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    t = text.strip()
-    t = _sanitize_json(t)
-    try:
-        obj = json.loads(t)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-    
-    start = t.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    for i in range(start, len(t)):
-        ch = t[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                block = t[start:i+1]
-                block = _sanitize_json(block)
-                try:
-                    obj = json.loads(block)
-                    if isinstance(obj, dict):
-                        return obj
-                except Exception:
-                    return None
-    return None
-
-# -------------------------
-# Article pipeline
-# -------------------------
-
-def build_generation_prompt(title: str, category_name: str, pack: Dict[str, Any]) -> List[Dict[str, str]]:
-    extract_results = (pack.get("extract") or {}).get("results") or []
-    snippets = []
-    for r in extract_results[:5]:
-        url = r.get("url") or ""
-        content = (r.get("content") or r.get("raw_content") or "").strip()
-        if len(content) > 1500:
-            content = content[:1500] + "…"
-        snippets.append(f"SOURCE: {url}\n{content}")
-    sources_block = "\n\n".join(snippets) if snippets else "No extracted sources available."
-
-    system = (
-        "You are a professional tech journalist. Write accurate, reader-friendly articles grounded ONLY in the provided sources. "
-        "Do not invent facts, numbers, dates, or quotes. If something is uncertain, say so.\n\n"
-        "Return ONLY HTML (no markdown)."
-    )
-    user = (
-        f"Write a tech news article about: {title}\n"
-        f"Category: {category_name}\n\n"
-        "Required structure:\n"
-        "1) <h3>Article Highlights</h3> with 2-3 <li> bullets\n"
-        "2) <p>Hook</p> 120-150 words\n"
-        "3) 4-5 <h2> sections, each 100-200 words. Add <h3> subheadings when useful.\n"
-        "4) Use bullet lists or numbering where helpful\n"
-        "5) Include one simple HTML <table> when it helps (specs, timeline, comparison).\n"
-        "6) End with a <h3>Sources</h3> list of source URLs.\n\n"
-        "Sources (use as the only truth):\n"
-        f"{sources_block}\n"
-    )
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
-
-
-# -------------------------
-# Category prompt template (strict mode)
-# -------------------------
-
-ALLOWED_PROMPT_VARS = {"title", "category", "sources_block"}
-
-DEFAULT_GENERATION_TEMPLATE = """You are a professional tech journalist writing for a leading technology publication in the {category} section.
-
-ASSIGNMENT: Write a comprehensive tech news article about: {title}
-
-GROUND RULES:
-- Use ONLY the provided sources below. Never fabricate facts, statistics, dates, quotes, or specifications.
-- If information conflicts across sources or is uncertain, state this explicitly.
-- Cite sources when referencing key facts, prices, or specifications.
-- Output ONLY valid HTML using semantic tags (h2, h3, h4, p, ul, ol, li, table, thead, tbody, tr, th, td, strong). No inline styles, no CSS, no markdown, no code blocks.
-- Target length: 1000-1500 words. Prioritize quality over padding.
-
----
-
-ARTICLE STRUCTURE (follow this order):
-
-1. ARTICLE HIGHLIGHTS
-   <h3>Article Highlights</h3>
-   <ul> with exactly 2-3 <li> items — each a single sentence capturing a major takeaway. </ul>
-
-2. HOOK SENTENCE
-   One compelling opening sentence immediately after highlights. Grab attention and introduce the core topic. Do not wrap this in a heading — just a <p> tag.
-
-3. MAIN BODY — 5-6 sections using <h2> headings
-   - Each section: 150-250 words.
-   - Use <h3> or <h4> subheadings within sections when covering multiple subtopics.
-   - Choose section topics based on what the article naturally demands (features, pricing, impact, context, analysis, what's next, etc.). Do not force a fixed template.
-
-4. ENHANCED ELEMENTS (use where they genuinely aid clarity):
-
-   A) TABLES — for spec comparisons, pricing tiers, or feature breakdowns:
-   <table>
-     <thead><tr><th>Feature</th><th>Model A</th><th>Model B</th></tr></thead>
-     <tbody><tr><td>Display</td><td>6.7" AMOLED</td><td>6.5" OLED</td></tr></tbody>
-   </table>
-
-   B) LISTS — use <ul> or <ol> for features, pros/cons, or steps. Keep items concise but complete.
-
-   C) KEY STATS — use <strong> to emphasize critical numbers (prices, capacities, scores, dates).
-
-5. FAQ SECTION (optional — include only when the topic naturally raises common reader questions)
-   <h2>Frequently Asked Questions</h2>
-   3-5 FAQs maximum. Format: <h3>Question?</h3><p>Answer in 1-2 sentences.</p>
-   Focus on practical concerns readers would actually search for.
-
-6. CLOSING
-   <h3>Final Thoughts</h3> or <h3>Bottom Line</h3> or <h3>What This Means</h3>
-   2-3 sentences summarizing the key takeaway, ending with a forward-looking statement or recommendation.
-
-7. SOURCES
-   <h3>Sources</h3>
-   <ul> listing each source as a plain <li> with just the domain name (e.g., theverge.com, techcrunch.com). No links, no URLs — domain names only. </ul>
-
----
-
-WRITING STYLE:
-- Professional yet conversational. Write for tech-savvy readers but explain jargon when needed.
-- Use active voice, vary sentence length, and include smooth transitions between sections.
-- Be objective and balanced — mention both strengths and weaknesses honestly.
-- Ground claims in specific details from sources: concrete numbers, real specs, actual quotes.
-- Avoid hyperbole and marketing language. Label rumors and leaks as such.
-- Provide real-world context: why does this matter to the reader? How does it compare to what exists?
-
-SEO GUIDANCE:
-- Incorporate main topic keywords naturally in <h2> headings.
-- Use semantic keyword variations throughout the body.
-- Include brand names, model numbers, and technical terms where relevant.
-- Maintain a logical heading hierarchy (H2 → H3 → H4).
-
----
-
-SOURCES PROVIDED:
+Use ONLY these sources:
 {sources_block}
 
----
+Structure:
+1. <h3>Article Highlights</h3> (2-3 bullets)
+2. One compelling hook sentence (no heading).
+3. 5-6 sections using <h2> with 150-250 words each.
+4. Use <table> for specs or comparisons.
+5. <h3>Sources</h3> (domain names only).
 
-CRITICAL REMINDER: The article MUST be 1000-1500 words. Write ALL sections listed above including Sources. Do NOT stop early. Output the COMPLETE article as valid HTML.
-"""
+Output ONLY semantic HTML. No markdown."""
 
+def humanize_prompt(html):
+    return [{"role": "system", "content": "You are a senior tech editor. Rewrite this HTML to be human-grade. Use contractions, vary sentence length (burstiness), use first-person 'We', and insert professional skepticism. Avoid AI cliches. Return ONLY HTML."}, {"role": "user", "content": f"Humanize this article while preserving facts and HTML:\n\n{html}"}]
 
-def _sources_block_from_pack(pack: Dict[str, Any]) -> str:
-    extract_results = (pack.get("extract") or {}).get("results") or []
-    snippets: List[str] = []
-    for r in extract_results[:6]:
-        url = r.get("url") or ""
-        content = (r.get("content") or r.get("raw_content") or "").strip()
-        if len(content) > 2500:
-            content = content[:2500] + "…"
-        snippets.append(f"SOURCE: {url}\n{content}")
-    return "\n\n".join(snippets) if snippets else "No extracted sources available."
+def seo_prompt(title, cat, html):
+    return [{"role": "system", "content": "Return JSON: {meta_title, meta_description, short_description, tags: [], image_alt}"}, {"role": "user", "content": f"Produce SEO for: {title}\nCategory: {cat}\n\n{html}"}]
 
-
-def render_prompt_template_strict(template: str, *, title: str, category: str, sources_block: str) -> str:
-    # Strict: reject unknown placeholders
-    used = set(re.findall(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", template or ""))
-    unknown = used - ALLOWED_PROMPT_VARS
-    if unknown:
-        raise RuntimeError(f"Unknown prompt variable(s) in category prompt: {sorted(unknown)}")
-    return (template or "").format(title=title, category=category, sources_block=sources_block)
-
-def humanize_prompt(html: str) -> List[Dict[str, str]]:
-    system = (
-        "You are a seasoned human tech journalist and editor with 15 years of experience writing for major publications. "
-        "Your job is to rewrite AI-generated articles so they read as if a real person wrote them from scratch.\n\n"
-        "STRICT RULES:\n"
-        "1. Preserve ALL facts, numbers, dates, quotes, specs, and source attributions exactly.\n"
-        "2. Preserve the HTML structure (h2, h3, h4, p, ul, ol, li, table, strong) — do NOT change tag types or remove sections.\n"
-        "3. The output must be the COMPLETE article — same length or slightly longer than the input. Do NOT truncate or shorten.\n"
-        "4. Output ONLY HTML. No markdown, no commentary, no preamble.\n\n"
-        "HUMANIZATION TECHNIQUES (apply all of these):\n"
-        "- Vary sentence length dramatically: mix short punchy sentences (5-8 words) with longer complex ones (20-30 words).\n"
-        "- Use contractions naturally (it's, doesn't, won't, that's, here's).\n"
-        "- Add occasional conversational transitions: 'Now,', 'Here's the thing:', 'Worth noting:', 'That said,', 'Look,', 'The big picture?'.\n"
-        "- Break up uniform paragraph lengths — some short (1-2 sentences), some longer (4-5 sentences).\n"
-        "- Replace generic AI phrases: instead of 'It is worth noting' say 'One detail that stands out'; instead of 'This represents a significant' say 'This marks a real'; instead of 'It remains to be seen' say 'We'll have to wait and see'.\n"
-        "- Avoid these AI giveaway patterns: 'In conclusion', 'Furthermore', 'Moreover', 'It is important to note', 'In the realm of', 'It's worth mentioning', 'landscape', 'paradigm', 'leverage', 'robust', 'comprehensive', 'delve'.\n"
-        "- Insert the occasional mild opinion or editorial color: 'which is frankly impressive', 'not exactly cheap', 'a smart move if it pans out'.\n"
-        "- Use em-dashes (—) and parenthetical asides occasionally for a natural writing rhythm.\n"
-        "- Start some sentences with 'And', 'But', 'So', or 'Or' — the way real writers do.\n"
-        "- Vary paragraph openers — don't start consecutive paragraphs with the same word or structure.\n"
-    )
-    user = (
-        "Rewrite this article using ALL the humanization techniques above. "
-        "The output must be the COMPLETE rewritten article in HTML — same number of sections, same length. "
-        "Do NOT stop early or truncate.\n\n"
-        f"{html}"
-    )
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
-
-def seo_prompt(title: str, category_name: str, html: str) -> List[Dict[str, str]]:
-    system = "You are an SEO editor for a tech news site. Return STRICT JSON only."
-    user = (
-        f"Given the article HTML, produce SEO metadata.\n"
-        f"Title: {title}\nCategory: {category_name}\n\n"
-        "Return a JSON object with keys:\n"
-        "- meta_title (max ~60 chars)\n"
-        "- meta_description (max ~155 chars)\n"
-        "- short_description (1-2 sentences)\n"
-        "- tags (array of 5-10 short tags)\n"
-        "- image_alt (short alt text)\n\n"
-        "Article HTML:\n"
-        f"{html}\n"
-    )
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
-
-def build_image_prompt(title: str, category_name: str) -> str:
-    return (
-        f"High-quality realistic product-style hero image illustrating the tech topic: {title}. "
-        f"Category: {category_name}. "
-        "No people, no brand logos, no text. Studio lighting, clean background. Looks like a magazine illustration."
-    )
-
-def create_article_from_lead(
-    title: str,
-    category_name: str,
-    source_url: str = "",
-    category_prompt_generation: str = "",
-) -> Dict[str, Any]:
+def create_article_from_lead(title, cat_name, source_url="", cat_prompt=""):
     pack = build_research_pack(title)
-    extracted_img = pick_extracted_image(pack) if get_setting("prefer_extracted_image", "1") == "1" else None
-
-    # Draft (category prompt override if present, otherwise use DEFAULT_GENERATION_TEMPLATE)
-    sources_block = _sources_block_from_pack(pack)
-    custom_prompt = (category_prompt_generation or "").strip()
-    template = custom_prompt or DEFAULT_GENERATION_TEMPLATE
-    rendered = render_prompt_template_strict(
-        template,
-        title=title,
-        category=category_name,
-        sources_block=sources_block,
-    )
-
-    if custom_prompt:
-        # Custom category prompts may not include full system-level framing,
-        # so we add a short system message to set ground rules.
-        generation_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a professional tech journalist. Write accurate, reader-friendly articles grounded ONLY in the provided sources. "
-                    "Do not invent facts, numbers, dates, or quotes. If something is uncertain, say so.\n\n"
-                    "Return ONLY HTML (no markdown)."
-                ),
-            },
-            {"role": "user", "content": rendered},
-        ]
-    else:
-        # DEFAULT_GENERATION_TEMPLATE already contains full instructions,
-        # so no separate system message needed — avoids redundancy.
-        generation_messages = [
-            {"role": "user", "content": rendered},
-        ]
-
-    draft_html = chat_stage("generation", generation_messages)
-    if not draft_html.strip():
-        raise RuntimeError("Generation returned empty content.")
-
-    # Clean up: strip markdown fences if LLM wraps output in ```html ... ```
-    draft_html = _strip_code_fences(draft_html)
-
-    # Validate generation completeness
-    word_count = len(draft_html.split())
-    if word_count < 600:
-        LOG.warning("Generation too short (%d words). Retrying with explicit length instruction.", word_count)
-        # Retry once with stronger length instruction
-        retry_msg = generation_messages.copy()
-        retry_msg.append({
-            "role": "assistant",
-            "content": draft_html,
-        })
-        retry_msg.append({
-            "role": "user",
-            "content": (
-                "The article above is incomplete and too short. Please write the COMPLETE article with ALL sections "
-                "as specified in the instructions. Target 1000-1500 words minimum. Include all sections through Sources. "
-                "Output ONLY the complete HTML article."
-            ),
-        })
-        retry_html = chat_stage("generation", retry_msg)
-        retry_html = _strip_code_fences(retry_html)
-        if len(retry_html.split()) > word_count:
-            draft_html = retry_html
-            LOG.info("Retry produced %d words (was %d).", len(retry_html.split()), word_count)
-
-    # Humanize
-    human_html = chat_stage("humanize", humanize_prompt(draft_html))
-    human_html = _strip_code_fences(human_html)
-
-    # If humanize truncated the content (less than 70% of draft), fall back to draft
-    if not human_html.strip() or len(human_html.split()) < len(draft_html.split()) * 0.7:
-        LOG.warning(
-            "Humanize output too short (%d words vs draft %d). Using draft.",
-            len(human_html.split()), len(draft_html.split()),
-        )
-        human_html = draft_html
-
-    # SEO
-    seo_out = chat_stage("seo", seo_prompt(title, category_name, human_html))
-    seo = extract_json_object(seo_out) or {}
-
-    meta_title = seo.get("meta_title") or title[:60]
-    meta_description = seo.get("meta_description") or (seo.get("short_description") or "")[:155]
-    short_description = seo.get("short_description") or meta_description
-    tags = seo.get("tags") if isinstance(seo.get("tags"), list) else []
-    image_alt = seo.get("image_alt") or f"{title} — {category_name}"
-
-    # Image selection
-    img = extracted_img
-    if not img:
-        gen_img = generate_image(build_image_prompt(title, category_name))
-        img = gen_img
-
-    # Import image into Directus files to get a UUID
-    featured_image = ""
-    caption = ""
-    credit = ""
-    if img and img.get("url"):
-        file_uuid = import_image_to_directus(img["url"], title=title)
-        if file_uuid:
-            featured_image = file_uuid
-        else:
-            LOG.warning("Could not import image to Directus; article will have no featured image.")
-        caption = img.get("caption") or "Tech illustration"
-        credit = img.get("credit") or ""
-    featured_image_credit = f"{caption} | Credit: {credit}".strip(" |")
-
-    slug = slugify(title)
-    published_at = _now_iso()
+    sources = _sources_block_from_pack(pack)
+    rendered = (cat_prompt or DEFAULT_GENERATION_TEMPLATE).format(title=title, category=cat_name, sources_block=sources)
+    
+    draft = strip_code_fences(chat_stage("generation", [{"role": "system", "content": "Professional tech journalist. ONLY HTML."}, {"role": "user", "content": rendered}]))
+    human = strip_code_fences(chat_stage("humanize", humanize_prompt(draft)))
+    if len(human.split()) < len(draft.split()) * 0.7: human = draft
+    
+    seo = extract_json_object(chat_stage("seo", seo_prompt(title, cat_name, human))) or {}
+    img = pick_extracted_image(pack) or generate_image_logic(f"High-quality tech hero image: {title}")
+    f_img = import_image_to_directus(img["url"], title=title) if img else ""
 
     return {
-        "title": title,
-        "slug": f"{slug}-{hashlib.md5(title.encode('utf-8')).hexdigest()[:6]}",
-        "status": "published",
-        # category id is set at publish time
-        "short_description": short_description,
-        "content": human_html,
-        "featured_image": featured_image,
-        "featured_image_credit": featured_image_credit,
-        "featured_image_alt": image_alt,
-        "meta_title": meta_title,
-        "meta_description": meta_description,
-        "tags": tags,
-        "published_at": published_at,
+        "title": title, "slug": f"{slugify(title)}-{hashlib.md5(title.encode()).hexdigest()[:6]}",
+        "status": "published", "content": human, "short_description": seo.get("short_description", title),
+        "featured_image": f_img, "featured_image_credit": f"{img.get('caption', 'AI')} | {img.get('credit', 'Source')}" if img else "",
+        "featured_image_alt": seo.get("image_alt", title), "meta_title": seo.get("meta_title", title[:60]),
+        "meta_description": seo.get("meta_description", ""), "tags": seo.get("tags", []), "published_at": _dt.datetime.utcnow().isoformat() + "Z"
     }
 
-def publish_article_to_directus(article: Dict[str, Any], category_id: str) -> Dict[str, Any]:
-    col = articles_collection()
-    payload = dict(article)
-    payload["category"] = category_id
-    
-    required = {"title", "slug", "status", "category", "content"}
-    clean = {}
-    for k, v in payload.items():
-        if k in required:
-            clean[k] = v
-            continue
-        if v is None:
-            continue
-        if isinstance(v, str) and not v.strip():
-            continue
-        if isinstance(v, list) and len(v) == 0:
-            continue
-        clean[k] = v
-    
-    data = directus_post(f"/items/{col}", clean)
-    return data.get("data") or {}
+def publish_article_to_directus(art, cid):
+    art["category"] = cid
+    return directus_api("POST", f"/items/{get_setting('directus_articles_collection')}", art).get("data", {})

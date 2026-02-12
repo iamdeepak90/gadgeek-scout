@@ -798,10 +798,12 @@ def build_research_pack(title: str) -> Dict[str, Any]:
     payload = {
         "api_key": key,
         "query": title,
-        "search_depth": "advanced",
-        "max_results": 5,
+        "search_depth": "basic",
+        "max_results": 7,
+        "time_range": "week",
         "include_raw_content": True,
         "include_images": True,
+        "include_answer": False,
     }
     
     try:

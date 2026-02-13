@@ -657,20 +657,27 @@ def slack_ephemeral(response_url: str, text: str) -> None:
     payload = {"text": text, "response_type": "ephemeral", "replace_original": False}
     request_with_retry("POST", response_url, json_body=payload)
 
-def delete_slack_message(channel_id, message_ts):
+def delete_slack_message(channel_id: str, message_ts: str) -> bool:
     """Delete a Slack message after action"""
-    from slack_sdk import WebClient
-    from config import SLACK_BOT_TOKEN
+    token = slack_token()
+    if not token:
+        LOG.warning("Slack token not configured")
+        return False
     
-    slack_client = WebClient(token=SLACK_BOT_TOKEN)
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {"channel": channel_id, "ts": message_ts}
     
     try:
-        slack_client.chat_delete(
-            channel=channel_id,
-            ts=message_ts
-        )
-        print(f"   ✅ Deleted Slack message", flush=True)
-        return True
+        resp = request_with_retry("POST", "https://slack.com/api/chat.delete", headers=headers, json_body=payload)
+        data = resp.json()
+        
+        if data.get("ok"):
+            print(f"   ✅ Deleted Slack message", flush=True)
+            return True
+        else:
+            print(f"   ⚠️ Failed to delete: {data.get('error')}", flush=True)
+            return False
+            
     except Exception as e:
         print(f"   ⚠️ Failed to delete message: {e}", flush=True)
         return False

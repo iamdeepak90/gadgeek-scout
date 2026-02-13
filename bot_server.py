@@ -341,27 +341,27 @@ def slack_interactions():
             return jsonify({"ok": True})
 
         try:
+            lead = get_lead(lead_id)
+            status = (lead.get("status") or "").strip().lower()
+            real_title = (lead.get("title") or title or lead_id).strip()
+
             if action_id == "approve":
                 update_lead_status(lead_id, "approved")
                 # optional ephemeral ack
                 if response_url:
-                    slack_ephemeral(response_url, "✅ Approved.")
+                    slack_ephemeral(response_url, f"✅ Approved: *{real_title}*")
                 delete_slack_message(channel_id, message_ts)
                 return jsonify({"ok": True})
 
             if action_id == "reject":
                 update_lead_status(lead_id, "rejected")
                 if response_url:
-                    slack_ephemeral(response_url, "❌ Rejected.")
+                    slack_ephemeral(response_url, f"❌ Rejected: *{real_title}*")
                 delete_slack_message(channel_id, message_ts)
                 return jsonify({"ok": True})
 
             if action_id == "urgent":
                 # Queue urgent publish (Option B): publish sequentially in background worker
-                lead = get_lead(lead_id)
-                status = (lead.get("status") or "").strip().lower()
-                real_title = (lead.get("title") or title or lead_id).strip()
-
                 if status == "processed":
                     if response_url:
                         slack_ephemeral(response_url, f"ℹ️ Already published: *{real_title}*")

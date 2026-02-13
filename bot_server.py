@@ -19,6 +19,7 @@ from common import (
     verify_slack_signature,
     update_lead_status,
     slack_ephemeral,
+    delete_slack_message,
     get_lead,
     get_redis_client,
 )
@@ -372,7 +373,7 @@ def slack_interactions():
                 _start_urgent_worker()
                 if response_url:
                     slack_ephemeral(response_url, f"🚀 Urgent queued: *{real_title}*")
-                    
+
                 delete_slack_message(channel_id, message_ts)
                 return jsonify({"ok": True})
 

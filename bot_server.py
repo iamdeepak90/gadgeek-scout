@@ -345,12 +345,14 @@ def slack_interactions():
                 # optional ephemeral ack
                 if response_url:
                     slack_ephemeral(response_url, "✅ Approved.")
+                delete_slack_message(channel_id, message_ts)
                 return jsonify({"ok": True})
 
             if action_id == "reject":
                 update_lead_status(lead_id, "rejected")
                 if response_url:
                     slack_ephemeral(response_url, "❌ Rejected.")
+                delete_slack_message(channel_id, message_ts)
                 return jsonify({"ok": True})
 
             if action_id == "urgent":
@@ -370,6 +372,8 @@ def slack_interactions():
                 _start_urgent_worker()
                 if response_url:
                     slack_ephemeral(response_url, f"🚀 Urgent queued: *{real_title}*")
+                    
+                delete_slack_message(channel_id, message_ts)
                 return jsonify({"ok": True})
 
         except Exception as e:

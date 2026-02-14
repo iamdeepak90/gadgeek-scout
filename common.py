@@ -1113,6 +1113,63 @@ def render_prompt_template_strict(template: str, *, title: str, category: str, s
         raise RuntimeError(f"Unknown prompt variable(s) in category prompt: {sorted(unknown)}")
     return (template or "").format(title=title, category=category, sources_block=sources_block)
 
+def _strip_document_wrapper(html: str) -> str:
+    """
+    Remove full HTML document tags and inline styles that slip
+    through the humanization prompt despite instructions.
+    """
+    import re
+
+    # Remove everything before first content tag
+    # (strips <!DOCTYPE>, <html>, <head>...</head>, <body> openers)
+    html = re.sub(
+        r'^.*?(?=<(?:h[1-6]|p|ul|ol|table|blockquote|hr|strong|em)\b)',
+        '', html, flags=re.DOTALL | re.IGNORECASE
+    )
+
+    # Remove closing document tags at the end
+    html = re.sub(
+        r'</?(html|head|body|header|footer|nav|section|article|div|span)'
+        r'(\s[^>]*)?>',
+        '', html, flags=re.IGNORECASE
+    )
+
+    # Remove inline style attributes
+    html = re.sub(r'\s+style=["\'][^"\']*["\']', '', html, flags=re.IGNORECASE)
+
+    # Remove <title>, <script>, <style> blocks entirely with content
+    html = re.sub(
+        r'<(title|script|style)\b[^>]*>.*?</\1>',
+        '', html, flags=re.DOTALL | re.IGNORECASE
+    )
+
+    return html.strip()
+
+
+def _resolve_article_title(seo: dict, raw_title: str) -> str:
+    """
+    Pick the best article title from SEO output.
+    Priority: article_title → meta_title → raw_title (truncated).
+    Always returns 60-90 characters.
+    """
+    # Try dedicated article_title field first (added to seo_prompt below)
+    candidate = (seo.get("article_title") or "").strip().strip('"').strip("'")
+
+    # Fall back to meta_title if article_title missing
+    if not candidate:
+        candidate = (seo.get("meta_title") or "").strip().strip('"').strip("'")
+
+    # Fall back to raw title if both missing
+    if not candidate:
+        candidate = raw_title
+
+    # Enforce 90 character hard limit at word boundary
+    if len(candidate) > 90:
+        candidate = candidate[:87].rsplit(" ", 1)[0].rstrip(".,;:-") + "..."
+
+    # Enforce minimum — if somehow empty, use raw
+    return candidate if len(candidate) >= 10 else raw_title
+
 
 # ---------------------------------------------------------------------------
 # HUMANIZE PROMPT
@@ -1120,96 +1177,118 @@ def render_prompt_template_strict(template: str, *, title: str, category: str, s
 # ---------------------------------------------------------------------------
 def humanize_prompt(html: str) -> List[Dict[str, str]]:
     system = (
-        "You are a veteran tech editor — 15 years at publications like The Verge, Ars Technica, and Wired. "
-        "A junior writer has drafted the article below. Your job: rewrite it so it reads like YOU wrote it from scratch. "
-        "The result must feel unmistakably human — the kind of writing no AI detector would flag.\n\n"
+        "You are a senior tech journalist rewriting a draft article. "
+        "Your goal: make it read like a real human wrote it — not an AI.\n\n"
 
-        "ABSOLUTE RULES (break any of these and the rewrite is rejected):\n"
-        "1. Preserve EVERY fact, number, date, spec, quote, and source attribution exactly as given.\n"
-        "2. Keep the same HTML structure — same tags (h2, h3, p, ul, table, etc.), same number of sections. Do NOT add or remove sections.\n"
-        "3. Output the COMPLETE rewritten article. Same word count or longer. NEVER truncate, shorten, or summarize.\n"
-        "4. Output ONLY HTML. No markdown, no preamble like 'Here is the rewritten article', no closing remarks.\n\n"
+        "PRESERVE (never change):\n"
+        "- Every fact, number, spec, price, date, and source\n"
+        "- HTML structure, tags, sections, and tables\n"
+        "- Article length — same or longer, never shorter\n\n"
 
-        "REWRITING TECHNIQUES — apply ALL of these throughout:\n\n"
+        "BANNED CHARACTERS (zero exceptions):\n"
+        "- Em-dash (—), en-dash (–), ellipsis (… or ...)\n"
+        "- Use commas, periods, or parentheses instead\n\n"
 
-        "SENTENCE RHYTHM:\n"
-        "- Alternate between short sentences (5-8 words) and longer ones (20-30 words). This creates a natural reading pulse.\n"
-        "- Start some sentences with conjunctions: 'And', 'But', 'So', 'Or', 'Yet'. Real writers do this constantly.\n"
-        "- Use fragments occasionally for emphasis. 'Not cheap. Not even close.'\n\n"
+        "BANNED WORDS (replace every instance):\n"
+        "Furthermore, Moreover, Additionally, However (sentence-start), "
+        "In conclusion, It is worth noting, It is important to note, "
+        "That being said, Having said that, At the end of the day, "
+        "landscape, paradigm, leverage, robust, comprehensive, delve, "
+        "seamlessly, cutting-edge, game-changer, groundbreaking, pivotal, "
+        "notably, impressive, significant, powerful, ultimately, essentially, "
+        "overall, indeed, certainly, absolutely, exciting, streamline.\n\n"
 
-        "WORD CHOICE:\n"
-        "- Use contractions everywhere: it's, doesn't, won't, that's, here's, can't, isn't, there's, we're, they've.\n"
-        "- BANNED words and phrases (these are AI giveaways — replace every single one): "
-        "'Furthermore', 'Moreover', 'Additionally', 'In conclusion', 'It is worth noting', "
-        "'It is important to note', 'It remains to be seen', 'In the realm of', 'landscape', "
-        "'paradigm', 'leverage', 'robust', 'comprehensive', 'delve', 'tapestry', 'multifaceted', "
-        "'streamline', 'cutting-edge', 'game-changer', 'spearhead', 'underscores', 'pivotal', "
-        "'groundbreaking', 'notably'.\n"
-        "- Replace them with natural alternatives: 'That said', 'On top of that', 'Here's the thing', "
-        "'Still', 'Look', 'The short version?', 'What matters here is', 'The real question is'.\n\n"
+        "WRITE LIKE A HUMAN:\n"
+        "- Contractions always: it's, doesn't, won't, can't, isn't, here's, that's\n"
+        "- Mix short and long sentences. Use fragments for punch.\n"
+        "- Start sentences with: And, But, So, Or — real writers do this\n"
+        "- Vary paragraph length: one sentence to four, never uniform\n"
+        "- Restructure sentences — change clause order, merge, split\n"
+        "- Add brief opinions: 'which is fair at this price', 'that matters'\n"
+        "- Talk to the reader: use 'you' and 'your'\n"
+        "- Zero identical phrases of 4+ words from the original\n\n"
 
-        "PARAGRAPH FLOW:\n"
-        "- Vary paragraph lengths: some just 1-2 sentences, others 4-5. Never make them all the same size.\n"
-        "- Never start two consecutive paragraphs with the same word or structure.\n"
-        "- Use em-dashes (—) for parenthetical asides and mid-sentence pivots.\n"
-        "- Use parenthetical remarks occasionally (like this) for conversational color.\n\n"
-
-        "EDITORIAL VOICE:\n"
-        "- Sprinkle in mild editorial opinions where appropriate: 'which is frankly impressive', "
-        "'not exactly pocket change', 'a smart bet if it pans out', 'that's a big deal'.\n"
-        "- Add conversational transitions between sections: 'Now, about the camera...', "
-        "'Here's where it gets interesting.', 'So what does this actually mean for buyers?'\n"
-        "- Occasionally address the reader: 'you', 'your'.\n"
-        "- Show personality — mild humor, slight skepticism where warranted, genuine enthusiasm where deserved.\n\n"
-
-        "STRUCTURE TWEAKS (within the same HTML tags):\n"
-        "- Restructure sentences — don't just swap synonyms. Change the order of clauses, merge or split sentences, "
-        "move modifiers around. The goal is that no sentence structure from the original survives intact.\n"
-        "- Vary how you open sections: a question, a bold statement, an anecdote, a statistic.\n"
+        "OUTPUT RULES (strictly enforced):\n"
+        "- Start output directly with the first article tag. Nothing before it.\n"
+        "- End output at the last closing tag. Nothing after it.\n"
+        "- ALLOWED TAGS ONLY: h2, h3, h4, p, ul, ol, li, table, thead, tbody, "
+        "  tr, th, td, strong, em, a, blockquote, hr\n"
+        "- BANNED TAGS (never use, not even once): html, head, body, title, "
+        "  header, footer, nav, section, article, div, span, script, style\n"
+        "- BANNED ATTRIBUTES: style='...' or style=\"...\" on any tag. "
+        "  No inline CSS whatsoever. Not even style='color:red' or style='font-weight:bold'.\n"
+        "- No markdown. No preamble. No closing remarks."
     )
+
     user = (
-        "Rewrite the entire article below using ALL the techniques described. "
-        "Output the COMPLETE rewritten HTML article — every section, start to finish. "
-        "Same length or longer. Do NOT stop early.\n\n"
+        "Rewrite the full article below. No em-dashes. No banned words. "
+        "Contractions throughout. Genuine restructuring, not synonym swapping. "
+        "Complete HTML output, start to finish — do not stop early.\n\n"
         f"{html}"
     )
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
 
 
-# ---------------------------------------------------------------------------
-# SEO PROMPT
-# ---------------------------------------------------------------------------
 def seo_prompt(title: str, category_name: str, html: str) -> List[Dict[str, str]]:
     system = (
         "You are an SEO specialist for a tech news website. "
-        "Analyze the article and return ONLY a valid JSON object — no markdown, no explanation, no extra text."
+        "Return ONLY a valid JSON object. No markdown, no explanation, no extra text. "
+        "Character limits are hard limits — count before you output."
     )
+
     user = (
         f"Article title: {title}\n"
         f"Category: {category_name}\n\n"
-        "Analyze the HTML article below and return a JSON object with exactly these keys:\n\n"
+
+        "Return a JSON object with exactly these keys:\n\n"
+
         "{\n"
-        '  "slug": "short-seo-url-slug, 3-6 words max, lowercase, hyphens only, include brand/product name, e.g. samsung-galaxy-s26-ultra-launch",\n'
-        '  "meta_title": "SEO-optimized page title, max 60 characters, include primary keyword",\n'
-        '  "meta_description": "Compelling meta description, max 155 characters, include primary keyword and CTA",\n'
-        '  "short_description": "1-2 sentence summary for article cards and previews",\n'
-        '  "tags": ["tag1", "tag2", ...],  // 5-8 lowercase tags: brand names, product names, tech terms\n'
-        '  "image_alt": "Descriptive alt text for the featured image, 8-15 words"\n'
+        '  "article_title": "HARD LIMIT: 60 to 90 characters. '
+        'The published article headline. Brand + product + key fact. '
+        'No em-dashes. No ellipsis. Count every character.",\n'
+        '  "slug": "3-6 words, lowercase, hyphens, brand or product name required",\n'
+        '  "meta_title": "HARD LIMIT: 60 characters maximum. Count them. Front-load keyword.",\n'
+        '  "meta_description": "HARD LIMIT: 155 characters maximum. Keyword + click reason.",\n'
+        '  "short_description": "1-2 sentences for article cards and previews.",\n'
+        '  "tags": ["5 to 8 tags", "lowercase", "brand names", "product models", "tech terms"],\n'
+        '  "image_alt": "8-15 words describing the featured image"\n'
         "}\n\n"
-        "Slug rules:\n"
-        "- 3-6 words separated by hyphens. No stop words (the, a, an, of, for, in, on, with).\n"
-        "- Must include the brand or product name.\n"
-        "- Must be unique-sounding and SEO-friendly.\n"
-        "- Examples: 'iphone-17-pro-launch-price', 'pixel-10-camera-specs-leaked', 'oneplus-14-india-release'\n\n"
-        "Other guidelines:\n"
-        "- meta_title: Front-load the primary keyword. Use a pipe | or dash — to separate.\n"
-        "- meta_description: Write like a search result snippet that compels clicks.\n"
-        "- tags: Brand names, product models, tech categories. Lowercase only.\n"
-        "- image_alt: Describe what the image would show, not the article topic.\n\n"
+
+        "FIELD RULES:\n\n"
+
+        "article_title — 60 to 90 characters, this is the H1 shown on the article page:\n"
+        "  GOOD (58 chars): 'Samsung Galaxy S25 Ultra Launched With 200MP Camera in India'\n"
+        "  GOOD (64 chars): 'iOS 18.3 Brings Critical Security Fix and Home Screen Updates'\n"
+        "  BAD  (93 chars): 'Samsung Officially Announces the Galaxy S25 Ultra With a New "
+        "200MP Camera and Snapdragon 8 Elite'\n"
+        "  Rule: Brand name first. One key fact. Drop filler words.\n\n"
+
+        "meta_title — 60 characters MAX, shown in browser tab and Google results:\n"
+        "  GOOD (53 chars): 'Samsung Galaxy S25 Ultra Review: Best Camera Yet?'\n"
+        "  BAD  (72 chars): 'Samsung Galaxy S25 Ultra Full Review With Camera And Battery Test'\n"
+        "  Rule: Front-load keyword. Cut everything that doesn't fit.\n\n"
+
+        "meta_description — 155 characters MAX:\n"
+        "  Include the primary keyword. End with a reason to click.\n\n"
+
+        "slug — 3 to 6 words, no stop words (the, a, an, of, in, for, on, with):\n"
+        "  Good: 'samsung-galaxy-s25-ultra-review'\n"
+        "  Bad:  'a-full-review-of-the-samsung-galaxy-s25-ultra'\n\n"
+
+        "tags — 5 to 8 items, all lowercase, no duplicates.\n\n"
+
         "Article HTML:\n"
         f"{html}\n"
     )
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1235,11 +1314,16 @@ def create_article_from_lead(
     source_url: str = "",
     category_prompt_generation: str = "",
 ) -> Dict[str, Any]:
-    # ── Step 1: Research ──
-    pack = build_research_pack(title)
-    extracted_img = pick_extracted_image(pack) if get_setting("prefer_extracted_image", "1") == "1" else None
 
-    # ── Step 2: Build generation prompt ──
+    # ── Step 1: Research ─────────────────────────────────────────────────────
+    pack = build_research_pack(title)
+    extracted_img = (
+        pick_extracted_image(pack)
+        if get_setting("prefer_extracted_image", "1") == "1"
+        else None
+    )
+
+    # ── Step 2: Build generation prompt ──────────────────────────────────────
     sources_block = _sources_block_from_pack(pack)
     custom_prompt = (category_prompt_generation or "").strip()
     template = custom_prompt or DEFAULT_GENERATION_TEMPLATE
@@ -1251,131 +1335,121 @@ def create_article_from_lead(
         sources_block=sources_block,
     )
 
-    # Both custom Directus prompts and DEFAULT_GENERATION_TEMPLATE are self-contained
-    # with full persona + instructions. No separate system message needed.
     generation_messages = [
         {"role": "user", "content": rendered},
     ]
 
-    # ── Step 3: Generate draft ──
+    # ── Step 3: Generate draft ────────────────────────────────────────────────
     draft_html = chat_stage("generation", generation_messages)
     if not draft_html.strip():
         raise RuntimeError("Generation returned empty content.")
 
     draft_html = _strip_code_fences(draft_html)
 
-    # ── Step 3b: Completion check — retry if too short ──
+    # ── Step 3b: Retry if too short ───────────────────────────────────────────
     word_count = len(draft_html.split())
     if word_count < 700:
-        LOG.warning("Generation too short (%d words). Retrying with continuation prompt.", word_count)
+        LOG.warning(
+            "Generation too short (%d words). Retrying with continuation prompt.",
+            word_count,
+        )
         retry_messages = generation_messages + [
             {"role": "assistant", "content": draft_html},
-            {"role": "user", "content": (
-                "The article above is incomplete — it has only ~{wc} words. "
-                "I need the COMPLETE article with ALL sections (Highlights, Hook, 5 body sections, FAQ, "
-                "Final Thoughts, Sources). Target minimum 1200 words. "
-                "Please output the full article from the beginning as complete HTML."
-            ).format(wc=word_count)},
+            {
+                "role": "user",
+                "content": (
+                    "The article above is incomplete — it has only ~{wc} words. "
+                    "I need the COMPLETE article with ALL sections (Highlights, Hook, "
+                    "5 body sections, FAQ, Final Thoughts, Sources). "
+                    "Target minimum 1200 words. "
+                    "Please output the full article from the beginning as complete HTML."
+                ).format(wc=word_count),
+            },
         ]
         retry_html = chat_stage("generation", retry_messages)
         retry_html = _strip_code_fences(retry_html)
         if len(retry_html.split()) > word_count:
             draft_html = retry_html
-            LOG.info("Retry produced %d words (was %d).", len(retry_html.split()), word_count)
+            LOG.info(
+                "Retry produced %d words (was %d).",
+                len(retry_html.split()),
+                word_count,
+            )
         else:
-            LOG.warning("Retry did not improve length. Using original %d-word draft.", word_count)
+            LOG.warning(
+                "Retry did not improve length. Using original %d-word draft.",
+                word_count,
+            )
 
-    # ── Step 4: Humanize ──
+    # ── Step 4: Humanize ─────────────────────────────────────────────────────
     human_html = chat_stage("humanize", humanize_prompt(draft_html))
     human_html = _strip_code_fences(human_html)
+    human_html = _strip_document_wrapper(human_html)
 
-    # Guard: if humanize truncated badly (less than 60% of draft), fall back
+    # Guard: fall back to draft if humanize truncated badly
     draft_words = len(draft_html.split())
     human_words = len(human_html.split()) if human_html.strip() else 0
     if human_words < draft_words * 0.6:
         LOG.warning(
             "Humanize output too short (%d words vs draft %d). Falling back to draft.",
-            human_words, draft_words,
+            human_words,
+            draft_words,
         )
         human_html = draft_html
 
-    # ── Step 5: SEO metadata ──
+    # ── Step 5: SEO metadata + article title ─────────────────────────────────
     seo_out = chat_stage("seo", seo_prompt(title, category_name, human_html))
     seo_out = _strip_code_fences(seo_out)
     seo = extract_json_object(seo_out) or {}
 
-    meta_title = seo.get("meta_title") or title[:60]
-    meta_description = seo.get("meta_description") or (seo.get("short_description") or "")[:155]
-    short_description = seo.get("short_description") or meta_description
-    tags = seo.get("tags") if isinstance(seo.get("tags"), list) else []
-    image_alt = seo.get("image_alt") or f"{title} — {category_name}"
+    # ── Article title: use SEO-generated, fall back to raw title ─────────────
+    article_title = _resolve_article_title(seo, title)
 
-    # Slug: prefer LLM-generated crisp slug, fall back to title-based
+    # ── SEO fields ────────────────────────────────────────────────────────────
+    meta_title       = seo.get("meta_title") or article_title[:60]
+    meta_description = (seo.get("meta_description") or seo.get("short_description") or "")[:155]
+    short_description = seo.get("short_description") or meta_description
+    tags             = seo.get("tags") if isinstance(seo.get("tags"), list) else []
+    image_alt        = seo.get("image_alt") or f"{article_title} - {category_name}"
+
+    # ── Slug: prefer LLM slug, fall back to title-based ──────────────────────
     seo_slug = (seo.get("slug") or "").strip().lower()
     seo_slug = re.sub(r"[^a-z0-9-]", "", seo_slug).strip("-")
-    if seo_slug and 5 < len(seo_slug) < 80:
-        slug = seo_slug
-    else:
-        slug = slugify(title)
+    slug = seo_slug if (5 < len(seo_slug) < 80) else slugify(article_title)
+    unique_slug = f"{slug}-{hashlib.md5(title.encode('utf-8')).hexdigest()[:6]}"
 
-    # ── Step 6: Featured image ──
-    featured_image = ""
-    caption = ""
-    credit = ""
+    # ── Step 6: Featured image ────────────────────────────────────────────────
+    featured_image       = ""
+    caption              = ""
+    credit               = ""
 
-    # Try extracted image first (from Tavily)
     if extracted_img and extracted_img.get("url"):
         LOG.info("Attempting to import extracted image: %s", extracted_img["url"][:80])
-        file_uuid = import_image_to_directus(extracted_img["url"], title=title)
+        file_uuid = import_image_to_directus(extracted_img["url"], title=article_title)
         if file_uuid:
             featured_image = file_uuid
-            caption = extracted_img.get("caption") or "Featured image"
-            credit = extracted_img.get("credit") or ""
+            caption        = extracted_img.get("caption") or "Featured image"
+            credit         = extracted_img.get("credit") or ""
             LOG.info("Extracted image imported successfully: %s", file_uuid)
         else:
-            LOG.warning("Extracted image failed to import to Directus. Will try AI generation.")
-            extracted_img = None  # Clear so we fall through to AI generation
-
-    # Fallback: AI-generated image
-    if not featured_image:
-        LOG.info("Generating AI image for: %s", title[:60])
-        gen_img = generate_image(build_image_prompt(title, category_name))
-        if gen_img and gen_img.get("url"):
-            LOG.info("AI image generated. Importing to Directus...")
-            file_uuid = import_image_to_directus(gen_img["url"], title=title)
-            if file_uuid:
-                featured_image = file_uuid
-                caption = gen_img.get("caption") or "AI-generated illustration"
-                credit = gen_img.get("credit") or ""
-                LOG.info("AI image imported successfully: %s", file_uuid)
-            else:
-                LOG.warning("AI image failed to import to Directus.")
-        else:
-            LOG.warning("AI image generation returned nothing.")
-
-    if not featured_image:
-        LOG.warning("No featured image available for article: %s", title[:60])
+            LOG.warning("Extracted image failed to import.")
 
     featured_image_credit = f"{caption} | Credit: {credit}".strip(" |")
 
-    # ── Step 7: Assemble final payload ──
-    # slug was already set from SEO output (or fallback) above
-    unique_slug = f"{slug}-{hashlib.md5(title.encode('utf-8')).hexdigest()[:6]}"
-    published_at = _now_iso()
-
+    # ── Step 7: Assemble final payload ────────────────────────────────────────
     return {
-        "title": title,
-        "slug": unique_slug,
-        "status": "published",
-        "short_description": short_description,
-        "content": human_html,
-        "featured_image": featured_image,
+        "title":                 article_title,
+        "slug":                  unique_slug,
+        "status":                "published",
+        "short_description":     short_description,
+        "content":               human_html,
+        "featured_image":        featured_image,
         "featured_image_credit": featured_image_credit,
-        "featured_image_alt": image_alt,
-        "meta_title": meta_title,
-        "meta_description": meta_description,
-        "tags": tags,
-        "published_at": published_at,
+        "featured_image_alt":    image_alt,
+        "meta_title":            meta_title,
+        "meta_description":      meta_description,
+        "tags":                  tags,
+        "published_at":          _now_iso(),
     }
 
 def publish_article_to_directus(article: Dict[str, Any], category_id: str) -> Dict[str, Any]:

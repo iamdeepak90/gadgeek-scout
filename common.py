@@ -1177,53 +1177,82 @@ def _resolve_article_title(seo: dict, raw_title: str) -> str:
 # ---------------------------------------------------------------------------
 def humanize_prompt(html: str) -> List[Dict[str, str]]:
     system = (
-        "You are a senior tech journalist rewriting a draft article. "
-        "Your goal: make it read like a real human wrote it — not an AI.\n\n"
+        "You are a senior tech journalist who has written for The Verge, Wired, and Ars Technica. "
+        "A junior writer drafted the article below. Rewrite it so it sounds like you wrote it "
+        "from scratch — opinionated, specific, and unmistakably human.\n\n"
 
-        "PRESERVE (never change):\n"
-        "- Every fact, number, spec, price, date, and source\n"
+        "PRESERVE WITHOUT EXCEPTION:\n"
+        "- Every fact, number, spec, price, date, and source attribution\n"
         "- HTML structure, tags, sections, and tables\n"
         "- Article length — same or longer, never shorter\n\n"
 
-        "BANNED CHARACTERS (zero exceptions):\n"
+        "BANNED CHARACTERS:\n"
         "- Em-dash (—), en-dash (–), ellipsis (… or ...)\n"
-        "- Use commas, periods, or parentheses instead\n\n"
+        "- Replace with a comma, period, or parenthesis\n\n"
 
-        "BANNED WORDS (replace every instance):\n"
+        "BANNED WORDS — hunt every instance and replace:\n"
         "Furthermore, Moreover, Additionally, However (sentence-start), "
         "In conclusion, It is worth noting, It is important to note, "
         "That being said, Having said that, At the end of the day, "
+        "When it comes to, In today's world, In the realm of, "
         "landscape, paradigm, leverage, robust, comprehensive, delve, "
         "seamlessly, cutting-edge, game-changer, groundbreaking, pivotal, "
         "notably, impressive, significant, powerful, ultimately, essentially, "
-        "overall, indeed, certainly, absolutely, exciting, streamline.\n\n"
+        "overall, indeed, certainly, absolutely, exciting, streamline, "
+        "it could be argued, may or may not, might suggest.\n\n"
 
-        "WRITE LIKE A HUMAN:\n"
-        "- Contractions always: it's, doesn't, won't, can't, isn't, here's, that's\n"
-        "- Mix short and long sentences. Use fragments for punch.\n"
-        "- Start sentences with: And, But, So, Or — real writers do this\n"
-        "- Vary paragraph length: one sentence to four, never uniform\n"
-        "- Restructure sentences — change clause order, merge, split\n"
-        "- Add brief opinions: 'which is fair at this price', 'that matters'\n"
-        "- Talk to the reader: use 'you' and 'your'\n"
-        "- Zero identical phrases of 4+ words from the original\n\n"
+        "BANNED PATTERNS — these expose AI writing instantly:\n"
+        "- Rhetorical filler questions: 'What does this mean for users?' "
+        "  'How does this affect the industry?' — delete them entirely\n"
+        "- Closing paragraphs that summarize what was already said — rewrite "
+        "  the closing as a bold takeaway, prediction, or lingering thought\n"
+        "- Three-part lists in every paragraph (X, Y, and Z structure)\n"
+        "- Pairs of sentences that follow identical structure back to back\n"
+        "- Academic hedging: 'might suggest', 'could potentially', 'may indicate'\n\n"
 
-        "OUTPUT RULES (strictly enforced):\n"
-        "- Start output directly with the first article tag. Nothing before it.\n"
-        "- End output at the last closing tag. Nothing after it.\n"
+        "THE CAFÉ TEST — apply to every sentence:\n"
+        "Would a real journalist say this while explaining the article to a friend "
+        "over coffee? If it sounds stiff, overly formal, or like a textbook, rewrite it. "
+        "Read each paragraph aloud mentally. Robotic rhythm means rewrite.\n\n"
+
+        "WRITE LIKE THIS:\n"
+        "- Contractions everywhere: it's, doesn't, won't, can't, isn't, here's, that's\n"
+        "- Sentence rhythm: Short. Then one that builds to a point with more detail. "
+        "  Then short again. Vary constantly — monotone rhythm is the #1 AI tell\n"
+        "- Start sentences with: And, But, So, Or — real writers do this constantly\n"
+        "- Fragments for punch. Not often. Just when it lands.\n"
+        "- Natural bridges: 'Here's the thing,' 'But look,' 'That said,' 'Now,' "
+        "  'The problem is,' 'And yet' — not 'Furthermore' or 'Moreover'\n"
+        "- Specificity over vagueness: don't write 'it performs well' — write "
+        "  what specifically performs well and by how much\n"
+        "- Opinions with a spine: not 'this could be beneficial for users' "
+        "  but 'this is genuinely good for anyone who shoots video at night'\n"
+        "- Talk to the reader: 'you', 'your'\n"
+        "- Zero identical sentence structures within the same paragraph\n"
+        "- Zero identical phrases of 4+ words from the original draft\n\n"
+
+        "OUTPUT RULES:\n"
+        "- Start at the first HTML tag. Nothing before it.\n"
+        "- End at the last closing tag. Nothing after it.\n"
         "- ALLOWED TAGS ONLY: h2, h3, h4, p, ul, ol, li, table, thead, tbody, "
-        "  tr, th, td, strong, em, a, blockquote, hr\n"
-        "- BANNED TAGS (never use, not even once): html, head, body, title, "
-        "  header, footer, nav, section, article, div, span, script, style\n"
-        "- BANNED ATTRIBUTES: style='...' or style=\"...\" on any tag. "
-        "  No inline CSS whatsoever. Not even style='color:red' or style='font-weight:bold'.\n"
+        "tr, th, td, strong, em, a, blockquote, hr\n"
+        "- BANNED TAGS: html, head, body, title, header, footer, nav, "
+        "section, article, div, span, script, style\n"
+        "- BANNED ATTRIBUTES: style='...' or style=\"...\" on any tag\n"
         "- No markdown. No preamble. No closing remarks."
     )
 
     user = (
-        "Rewrite the full article below. No em-dashes. No banned words. "
-        "Contractions throughout. Genuine restructuring, not synonym swapping. "
-        "Complete HTML output, start to finish — do not stop early.\n\n"
+        "Rewrite the full article. Apply every rule in the system prompt.\n\n"
+        "Priority reminders:\n"
+        "- No em-dashes anywhere\n"
+        "- No banned words — every instance replaced\n"
+        "- No rhetorical filler questions — delete them\n"
+        "- No closing paragraph that repeats what was said — end with a real takeaway\n"
+        "- Contractions throughout, not just occasionally\n"
+        "- Sentence rhythm varied constantly — read it aloud mentally\n"
+        "- Genuine restructuring — no sentence structure from the original survives intact\n\n"
+        "Complete HTML output, start to finish. Do not stop early.\n\n"
         f"{html}"
     )
 
@@ -1237,7 +1266,7 @@ def seo_prompt(title: str, category_name: str, html: str) -> List[Dict[str, str]
     system = (
         "You are an SEO specialist for a tech news website. "
         "Return ONLY a valid JSON object. No markdown, no explanation, no extra text. "
-        "Character limits are hard limits — count before you output."
+        "Character limits are hard limits — count every character before you output."
     )
 
     user = (
@@ -1247,39 +1276,66 @@ def seo_prompt(title: str, category_name: str, html: str) -> List[Dict[str, str]
         "Return a JSON object with exactly these keys:\n\n"
 
         "{\n"
-        '  "article_title": "HARD LIMIT: 60 to 90 characters. '
-        'The published article headline. Brand + product + key fact. '
-        'No em-dashes. No ellipsis. Count every character.",\n'
-        '  "slug": "3-6 words, lowercase, hyphens, brand or product name required",\n'
-        '  "meta_title": "HARD LIMIT: 60 characters maximum. Count them. Front-load keyword.",\n'
-        '  "meta_description": "HARD LIMIT: 155 characters maximum. Keyword + click reason.",\n'
-        '  "short_description": "1-2 sentences for article cards and previews.",\n'
-        '  "tags": ["5 to 8 tags", "lowercase", "brand names", "product models", "tech terms"],\n'
-        '  "image_alt": "8-15 words describing the featured image"\n'
+        '  "article_title": "...",\n'
+        '  "slug": "...",\n'
+        '  "meta_title": "...",\n'
+        '  "meta_description": "...",\n'
+        '  "short_description": "...",\n'
+        '  "tags": ["...", "..."],\n'
+        '  "image_alt": "..."\n'
         "}\n\n"
 
         "FIELD RULES:\n\n"
 
-        "article_title — 60 to 90 characters, this is the H1 shown on the article page:\n"
-        "  GOOD (58 chars): 'Samsung Galaxy S25 Ultra Launched With 200MP Camera in India'\n"
-        "  GOOD (64 chars): 'iOS 18.3 Brings Critical Security Fix and Home Screen Updates'\n"
-        "  BAD  (93 chars): 'Samsung Officially Announces the Galaxy S25 Ultra With a New "
-        "200MP Camera and Snapdragon 8 Elite'\n"
-        "  Rule: Brand name first. One key fact. Drop filler words.\n\n"
+        "article_title — HARD LIMIT: 60 to 90 characters (count every character):\n"
+        "  This is the H1 headline shown on the article page.\n"
+        "  Rule: Brand or product name first. One key fact. No filler words. "
+        "No em-dashes. No ellipsis.\n"
+        "  GOOD (58): 'Samsung Galaxy S25 Ultra Launched With 200MP Camera in India'\n"
+        "  GOOD (61): 'OnePlus 13 Review: Best Android Phone Under Rs 70,000 Right Now'\n"
+        "  BAD  (94): 'Samsung Officially Announces the Galaxy S25 Ultra With a New "
+        "200MP Camera System and Snapdragon 8 Elite Chip'\n\n"
 
-        "meta_title — 60 characters MAX, shown in browser tab and Google results:\n"
-        "  GOOD (53 chars): 'Samsung Galaxy S25 Ultra Review: Best Camera Yet?'\n"
-        "  BAD  (72 chars): 'Samsung Galaxy S25 Ultra Full Review With Camera And Battery Test'\n"
-        "  Rule: Front-load keyword. Cut everything that doesn't fit.\n\n"
+        "slug — 3 to 6 words, lowercase, hyphens only:\n"
+        "  Must include brand or product name. No stop words "
+        "(the, a, an, of, in, for, on, with, and).\n"
+        "  GOOD: 'samsung-galaxy-s25-ultra-review'\n"
+        "  GOOD: 'oneplus-13-india-price-specs'\n"
+        "  BAD:  'a-full-review-of-the-samsung-galaxy-s25-ultra-camera-and-battery'\n\n"
 
-        "meta_description — 155 characters MAX:\n"
-        "  Include the primary keyword. End with a reason to click.\n\n"
+        "meta_title — HARD LIMIT: 60 characters maximum (count every character):\n"
+        "  Shown in browser tab and Google search results. Front-load the keyword.\n"
+        "  GOOD (53): 'Samsung Galaxy S25 Ultra Review: Best Camera Yet?'\n"
+        "  GOOD (49): 'iOS 18.3 Update: What's New and Who Gets It'\n"
+        "  BAD  (72): 'Samsung Galaxy S25 Ultra Full Review With Camera And Battery Test'\n\n"
 
-        "slug — 3 to 6 words, no stop words (the, a, an, of, in, for, on, with):\n"
-        "  Good: 'samsung-galaxy-s25-ultra-review'\n"
-        "  Bad:  'a-full-review-of-the-samsung-galaxy-s25-ultra'\n\n"
+        "meta_description — HARD LIMIT: 155 characters maximum:\n"
+        "  Include the primary keyword. End with a reason to click.\n"
+        "  GOOD (148): 'The Samsung Galaxy S25 Ultra brings a 200MP camera and "
+        "Snapdragon 8 Elite to India. Here is everything you need to know about "
+        "price and availability.'\n\n"
 
-        "tags — 5 to 8 items, all lowercase, no duplicates.\n\n"
+        "short_description — HARD LIMIT: 150 characters maximum:\n"
+        "  1 sentence only. Used in article cards and preview snippets.\n"
+        "  Must summarise the article's single most important point.\n"
+        "  GOOD: 'Samsung Galaxy S25 Ultra goes official in India at Rs 1,29,999 "
+        "with a new 200MP camera and Snapdragon 8 Elite chip.'\n"
+        "  BAD: 'This article covers the Samsung Galaxy S25 Ultra launch, specs, "
+        "price, availability, and camera details in India.'\n\n"
+
+        "tags — 5 to 8 items, all lowercase, no duplicates:\n"
+        "  Use specific tags only: brand names, exact model names, specific tech "
+        "terms, category names.\n"
+        "  GOOD: ['samsung galaxy s25 ultra', 'snapdragon 8 elite', '200mp camera', "
+        "'samsung india', 'android flagship 2025']\n"
+        "  BAD:  ['technology', 'news', 'india', 'mobile', 'smartphone']\n"
+        "  Rule: If a tag could apply to any tech article, it's too generic. Cut it.\n\n"
+
+        "image_alt — 8 to 15 words:\n"
+        "  Describe what the featured image would show based on the article subject.\n"
+        "  Include the brand and product name.\n"
+        "  GOOD: 'Samsung Galaxy S25 Ultra smartphone front and back view in titanium black'\n"
+        "  BAD:  'Featured image for the article'\n\n"
 
         "Article HTML:\n"
         f"{html}\n"

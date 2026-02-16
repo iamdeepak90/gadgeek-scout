@@ -1,5 +1,5 @@
 """
-image_backfill.py
+image.py
 ─────────────────────────────────────────────────────────────────────────────
 Runs every hour. Finds Articles in Directus where featured_image is null,
 generates an AI image using the existing generate_image() pipeline, uploads
@@ -10,7 +10,7 @@ env vars, no separate config. Everything flows through your existing Redis
 settings (directus_url, directus_token, together_api_key, openrouter_api_key).
 
 Run:
-    python image_backfill.py
+    python image.py
 
 Dependencies (already in your requirements.txt):
     requests, schedule, redis
@@ -18,6 +18,7 @@ Dependencies (already in your requirements.txt):
 
 import logging
 import time
+import traceback
 
 import schedule
 
@@ -37,7 +38,6 @@ from urllib.parse import urlencode
 LOG = logging.getLogger("image_backfill")
 
 # How many articles to process per hourly run.
-# Keep low to avoid hammering Together/OpenRouter image APIs.
 BATCH_SIZE = 10
 
 
@@ -48,41 +48,63 @@ BATCH_SIZE = 10
 def fetch_articles_without_image(limit: int = BATCH_SIZE) -> list:
     """
     Fetch articles where featured_image is null.
-    Returns list of dicts with at minimum: id, title.
-    Uses existing directus_get() from common.py.
+    Includes category_name via relational field for image prompt.
+    Returns list of dicts: id, title, category.name
     """
     col = articles_collection()
     params = urlencode({
         "filter[featured_image][_null]": "true",
-        "fields":                        "id,title",
-        "limit":                         limit,
-        "sort":                          "-date_created",
+        "fields": "id,title,category.name",
+        "limit": limit,
+        "sort": "-date_created",
     })
     try:
-        data = directus_get(f"/items/{col}?{params}")
+        url = f"/items/{col}?{params}"
+        LOG.debug("Fetching articles: %s", url)
+        data = directus_get(url)
+
+        if data is None:
+            LOG.error("directus_get returned None. Check directus_url and directus_token.")
+            return []
+
         articles = data.get("data") or []
         LOG.info("Found %d article(s) without featured_image.", len(articles))
         return articles
+
     except Exception as exc:
         LOG.error("Failed to fetch articles from Directus: %s", exc)
+        LOG.debug(traceback.format_exc())
         return []
+
+
+def extract_category_name(article: dict) -> str:
+    """
+    Safely extract category name from nested Directus response.
+    Handles both dict (relational) and None cases.
+    """
+    category = article.get("category")
+    if isinstance(category, dict):
+        return (category.get("name") or "").strip()
+    if isinstance(category, str):
+        return category.strip()
+    return ""
 
 
 def patch_article_image(article_id: str, file_id: str, alt_text: str) -> bool:
     """
     Patch featured_image and featured_image_alt on the article.
-    Uses existing directus_patch() from common.py.
     """
     col = articles_collection()
     try:
         directus_patch(f"/items/{col}/{article_id}", {
-            "featured_image":     file_id,
+            "featured_image": file_id,
             "featured_image_alt": alt_text,
         })
         LOG.info("Article %s updated with image %s.", article_id, file_id)
         return True
     except Exception as exc:
         LOG.error("Failed to patch article %s: %s", article_id, exc)
+        LOG.debug(traceback.format_exc())
         return False
 
 
@@ -93,19 +115,26 @@ def patch_article_image(article_id: str, file_id: str, alt_text: str) -> bool:
 def backfill_images() -> None:
     """
     Hourly job:
-      1. Fetch articles without featured_image
-      2. Generate image via existing generate_image() — uses your model route
-         settings (Together or OpenRouter, whatever is configured in Redis)
+      1. Fetch articles without featured_image (including category name)
+      2. Generate image via existing generate_image()
       3. Import image via existing import_image_to_directus()
       4. Patch article with file UUID
     """
     LOG.info("=" * 60)
     LOG.info("Image backfill job starting...")
 
-    # Sanity check — Directus must be configured
-    if not get_setting("directus_url") or not get_setting("directus_token"):
-        LOG.error("directus_url or directus_token not set in settings. Skipping run.")
+    # Sanity checks
+    directus_url = get_setting("directus_url")
+    directus_token = get_setting("directus_token")
+
+    if not directus_url:
+        LOG.error("directus_url not set in settings. Skipping run.")
         return
+    if not directus_token:
+        LOG.error("directus_token not set in settings. Skipping run.")
+        return
+
+    LOG.info("Directus URL: %s", directus_url)
 
     articles = fetch_articles_without_image(limit=BATCH_SIZE)
 
@@ -115,44 +144,75 @@ def backfill_images() -> None:
         return
 
     success_count = 0
-    fail_count    = 0
+    fail_count = 0
 
-    for article in articles:
+    for idx, article in enumerate(articles, 1):
         article_id = str(article.get("id", ""))
-        title      = (article.get("title") or "").strip() or f"Article {article_id}"
+        title = (article.get("title") or "").strip() or f"Article {article_id}"
+        category_name = extract_category_name(article)
 
-        LOG.info("Processing [%s] %s", article_id, title[:70])
+        LOG.info(
+            "[%d/%d] Processing article %s: %.70s (category: %s)",
+            idx, len(articles), article_id, title,
+            category_name or "uncategorized",
+        )
 
-        # ── Step 1: Build prompt using existing helper ────────────────────────
-        # build_image_prompt() is already in common.py.
-        # It takes (title, category_name). We pass empty string for category
-        # since we only fetched id + title to keep the query light.
-        prompt = build_image_prompt(title, "")
+        # ── Step 1: Build prompt with actual category name ────────────────
+        try:
+            prompt = build_image_prompt(title, category_name)
+            LOG.debug("Image prompt: %s", prompt)
+        except Exception as exc:
+            LOG.error("build_image_prompt failed for article %s: %s", article_id, exc)
+            fail_count += 1
+            continue
 
-        # ── Step 2: Generate image via existing routing ───────────────────────
-        # generate_image() reads model_routes:image from Redis, so it uses
-        # whatever provider + model you've configured in your Settings UI
-        # (Together FLUX.1-schnell by default).
-        gen = generate_image(prompt)
-
-        if not gen or not gen.get("url"):
-            LOG.warning("Image generation returned nothing for article %s. Skipping.", article_id)
+        # ── Step 2: Generate image ────────────────────────────────────────
+        try:
+            gen = generate_image(prompt)
+        except Exception as exc:
+            LOG.error("generate_image raised exception for article %s: %s", article_id, exc)
+            LOG.debug(traceback.format_exc())
             fail_count += 1
             time.sleep(2)
             continue
 
-        # ── Step 3: Import image to Directus file library ─────────────────────
-        # import_image_to_directus() handles both HTTP URLs and base64 data URIs,
-        # so it works regardless of whether Together returns url or b64_json.
-        file_id = import_image_to_directus(gen["url"], title=title)
+        if not gen:
+            LOG.warning("generate_image returned None/empty for article %s. Skipping.", article_id)
+            fail_count += 1
+            time.sleep(2)
+            continue
+
+        image_url = gen.get("url") or gen.get("b64_json") or gen.get("data")
+        if not image_url:
+            LOG.warning(
+                "No usable image URL/data in response for article %s. Keys returned: %s",
+                article_id, list(gen.keys()),
+            )
+            fail_count += 1
+            time.sleep(2)
+            continue
+
+        LOG.info("Image generated successfully for article %s.", article_id)
+
+        # ── Step 3: Import image to Directus ──────────────────────────────
+        try:
+            file_id = import_image_to_directus(image_url, title=title)
+        except Exception as exc:
+            LOG.error("import_image_to_directus raised exception for article %s: %s", article_id, exc)
+            LOG.debug(traceback.format_exc())
+            fail_count += 1
+            time.sleep(2)
+            continue
 
         if not file_id:
-            LOG.warning("Directus import failed for article %s. Skipping.", article_id)
+            LOG.warning("Directus import returned no file_id for article %s. Skipping.", article_id)
             fail_count += 1
             time.sleep(2)
             continue
 
-        # ── Step 4: Patch the article ─────────────────────────────────────────
+        LOG.info("Image imported to Directus — file_id: %s", file_id)
+
+        # ── Step 4: Patch the article ─────────────────────────────────────
         alt_text = f"{title} featured image"
         ok = patch_article_image(article_id, file_id, alt_text)
 
@@ -161,7 +221,7 @@ def backfill_images() -> None:
         else:
             fail_count += 1
 
-        # Polite delay — avoids hammering Together/OpenRouter rate limits
+        # Polite delay between articles
         time.sleep(3)
 
     LOG.info(
@@ -180,8 +240,8 @@ if __name__ == "__main__":
     init_db()
 
     LOG.info("Image backfill worker starting...")
-    LOG.info("Batch size    : %d articles per run", BATCH_SIZE)
-    LOG.info("Image model   : configured via Settings UI → model_routes:image")
+    LOG.info("Batch size: %d articles per run", BATCH_SIZE)
+    LOG.info("Image model: configured via Settings UI -> model_routes:image")
 
     # Run immediately on startup, then every hour
     backfill_images()

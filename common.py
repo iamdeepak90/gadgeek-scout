@@ -1340,12 +1340,12 @@ def seo_prompt(title: str, category_name: str, html: str) -> List[Dict[str, str]
 # ---------------------------------------------------------------------------
 def build_image_prompt(title: str, category_name: str) -> str:
     return (
-        f"Professional editorial photograph for a tech news article about: {title}. "
+        f"Editorial photo for a tech news article: {title}. "
         f"Category: {category_name}. "
-        "Style: Clean, modern, magazine-quality product photography or conceptual tech illustration. "
-        "Soft studio lighting with subtle gradient background. Sharp focus on the subject. "
-        "Absolutely no text, no watermarks, no logos, no human faces, no hands. "
-        "Photorealistic quality, 4K detail, slight depth of field blur in background."
+        "Clean modern product photography or conceptual tech illustration. "
+        "Soft studio lighting, subtle gradient background, shallow depth of field. "
+        "Minimalist composition, centered subject, vibrant but natural colors. "
+        "No text, no watermarks, no logos, no faces, no hands, no fingers."
     )
 
 

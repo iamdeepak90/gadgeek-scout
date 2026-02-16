@@ -120,7 +120,6 @@ async function loadFeeds(){
       <td>${f.id}</td>
       <td><a href="${f.url}" target="_blank" rel="noreferrer">${f.url}</a></td>
       <td>${f.enabled ? "✅" : "–"}</td>
-      <td>${f.category_hint || ""}</td>
       <td>${keys}</td>
       <td><button data-del="${f.id}">Delete</button></td>
     </tr>`;
@@ -142,7 +141,6 @@ async function saveFeed(){
   const payload = {
     url: $("feed_url").value.trim(),
     enabled: $("feed_enabled").value === "1",
-    category_hint: $("feed_category_hint").value.trim(),
     title_key: $("feed_title_key").value.trim(),
     description_key: $("feed_description_key").value.trim(),
     content_key: $("feed_content_key").value.trim(),

@@ -188,7 +188,6 @@ def list_feeds() -> List[Dict[str, Any]]:
                 "id": feed_id,
                 "url": data.get("url", ""),
                 "enabled": data.get("enabled", "1") == "1",
-                "category_hint": data.get("category_hint") or "",
                 "title_key": data.get("title_key") or "",
                 "description_key": data.get("description_key") or "",
                 "content_key": data.get("content_key") or "",
@@ -233,7 +232,6 @@ def upsert_feed(feed: Dict[str, Any]) -> int:
     feed_data = {
         "url": url,
         "enabled": "1" if feed.get("enabled", True) else "0",
-        "category_hint": feed.get("category_hint") or "",
         "title_key": feed.get("title_key") or "",
         "description_key": feed.get("description_key") or "",
         "content_key": feed.get("content_key") or "",
@@ -509,15 +507,6 @@ def get_categories() -> List[Dict[str, Any]]:
     result = []
     for c in cats:
         try:
-            # Parse keywords
-            kw = c.get("keywords", [])
-            if isinstance(kw, str):
-                try:
-                    kw = json.loads(kw)
-                except Exception:
-                    kw = []
-            if not isinstance(kw, list):
-                kw = []
             
             # Safe int conversion helper
             def safe_int(val, default):
@@ -534,7 +523,6 @@ def get_categories() -> List[Dict[str, Any]]:
                 "name": c.get("name", ""),
                 "priority": safe_int(c.get("priority"), 999),
                 "posts_per_scout": safe_int(c.get("posts_per_scout"), 0),
-                "keywords": kw,
                 "prompt_generation": c.get("prompt_generation") or "",
             })
         except Exception as e:

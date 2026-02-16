@@ -727,6 +727,7 @@ def extract_entry_fields(entry: Any, selectors: Dict[str, Optional[str]]) -> Dic
 TOGETHER_CHAT_URL = "https://api.together.xyz/v1/chat/completions"
 TOGETHER_IMAGES_URL = "https://api.together.xyz/v1/images/generations"
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_IMAGES_URL = "https://openrouter.ai/api/v1/images/generations"
 
 def chat_stage(stage: str, messages: List[Dict[str, str]]) -> str:
     """Call LLM for a specific stage using configured routing"""
@@ -850,15 +851,22 @@ def generate_image(prompt: str) -> Optional[Dict[str, str]]:
     """Generate image using configured routing"""
     routes = get_model_routes()
     route = routes.get("image")
+
     if not route:
-        LOG.warning("No image route configured; using default Together")
-        return generate_image_together(prompt, 1024, 768)
-    
+        LOG.warning("No image route configured; trying OpenRouter then Together fallback")
+        # Try OpenRouter first (user's preferred provider)
+        result = generate_image_openrouter(prompt, 832, 448)
+        if result:
+            return result
+        # Fallback to Together
+        LOG.info("OpenRouter image failed, falling back to Together")
+        return generate_image_together(prompt, 832, 448)
+
     provider = route["provider"]
     model = route["model"]
-    width = route.get("width", 1024)
-    height = route.get("height", 768)
-    
+    width = route.get("width", 832)
+    height = route.get("height", 448)
+
     if provider == "together":
         return generate_image_together(prompt, width, height, model)
     elif provider == "openrouter":
@@ -866,16 +874,22 @@ def generate_image(prompt: str) -> Optional[Dict[str, str]]:
     else:
         raise RuntimeError(f"Unknown image provider: {provider}")
 
-def generate_image_together(prompt: str, width: int = 1024, height: int = 768, model: Optional[str] = None) -> Optional[Dict[str, str]]:
+
+def generate_image_together(
+    prompt: str,
+    width: int = 832,
+    height: int = 448,
+    model: Optional[str] = None,
+) -> Optional[Dict[str, str]]:
     """Generate image using Together AI"""
     key = get_setting("together_api_key")
     if not key:
-        LOG.warning("Together API key not set")
+        LOG.warning("Together API key not set — skipping Together image generation")
         return None
-    
+
     if model is None:
         model = "black-forest-labs/FLUX.1-schnell"
-    
+
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     payload = {
         "model": model,
@@ -887,58 +901,107 @@ def generate_image_together(prompt: str, width: int = 1024, height: int = 768, m
         "response_format": "url",
         "output_format": "jpeg",
     }
-    
+
+    LOG.info("Together image request — model: %s, size: %dx%d", model, width, height)
+
     try:
-        resp = request_with_retry("POST", TOGETHER_IMAGES_URL, headers=headers, json_body=payload, timeout=120, max_attempts=3)
+        resp = request_with_retry(
+            "POST", TOGETHER_IMAGES_URL,
+            headers=headers, json_body=payload,
+            timeout=120, max_attempts=3,
+        )
         data = resp.json()
+        LOG.debug("Together raw response keys: %s", list(data.keys()))
+
         item = (data.get("data") or [{}])[0]
-        
+
         if item.get("url"):
+            LOG.info("Together image generated successfully (url)")
             return {"url": item["url"], "credit": "AI-generated (Together)", "caption": "AI-generated illustration"}
         if item.get("b64_json"):
+            LOG.info("Together image generated successfully (base64)")
             return {"url": f"data:image/jpeg;base64,{item['b64_json']}", "credit": "AI-generated (Together)", "caption": "AI-generated illustration"}
+
+        LOG.warning("Together response had no url or b64_json. Item keys: %s", list(item.keys()))
     except Exception as e:
         LOG.warning("Together image generation failed: %s", e)
-    
+
     return None
 
-def generate_image_openrouter(prompt: str, width: int = 1024, height: int = 768, model: str = "openai/dall-e-3") -> Optional[Dict[str, str]]:
-    """Generate image using OpenRouter (requires image-capable model)"""
+
+def generate_image_openrouter(
+    prompt: str,
+    width: int = 832,
+    height: int = 448,
+    model: str = "black-forest-labs/flux-1.1-pro",
+) -> Optional[Dict[str, str]]:
+    """Generate image using OpenRouter's images endpoint (OpenAI-compatible)"""
     key = get_setting("openrouter_api_key")
     if not key:
-        LOG.warning("OpenRouter API key not set")
+        LOG.warning("OpenRouter API key not set — skipping OpenRouter image generation")
         return None
-    
+
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://bot.gadgeek.in",
         "X-Title": "Gadgeek Tech News",
     }
-    
-    # OpenRouter uses chat completions format for DALL-E
-    messages = [{"role": "user", "content": prompt}]
+
     payload = {
         "model": model,
-        "messages": messages,
+        "prompt": prompt,
+        "n": 1,
+        "size": f"{width}x{height}",
     }
-    
+
+    LOG.info("OpenRouter image request — model: %s, size: %dx%d", model, width, height)
+
     try:
-        resp = request_with_retry("POST", OPENROUTER_CHAT_URL, headers=headers, json_body=payload, timeout=120, max_attempts=3)
+        resp = request_with_retry(
+            "POST", OPENROUTER_IMAGES_URL,
+            headers=headers, json_body=payload,
+            timeout=120, max_attempts=3,
+        )
+
+        # Check for HTTP errors
+        if resp.status_code != 200:
+            LOG.warning(
+                "OpenRouter image returned HTTP %d: %s",
+                resp.status_code, resp.text[:500],
+            )
+            return None
+
         data = resp.json()
-        
-        # Extract image URL from response
-        choices = data.get("choices") or []
-        if choices:
-            content = (choices[0].get("message") or {}).get("content") or ""
-            # Try to extract URL from content (format varies by model)
-            import re
-            urls = re.findall(r'https?://[^\s<>"]+', content)
-            if urls:
-                return {"url": urls[0], "credit": "AI-generated (OpenRouter)", "caption": "AI-generated illustration"}
+        LOG.debug("OpenRouter raw response keys: %s", list(data.keys()))
+
+        # Check for API-level errors
+        if data.get("error"):
+            LOG.warning("OpenRouter image API error: %s", data["error"])
+            return None
+
+        # Standard OpenAI images response format: {"data": [{"url": "..."} or {"b64_json": "..."}]}
+        items = data.get("data") or []
+        if not items:
+            LOG.warning("OpenRouter image response had empty data array. Full response: %s", str(data)[:500])
+            return None
+
+        item = items[0]
+
+        if item.get("url"):
+            LOG.info("OpenRouter image generated successfully (url)")
+            return {"url": item["url"], "credit": "AI-generated (OpenRouter)", "caption": "AI-generated illustration"}
+        if item.get("b64_json"):
+            LOG.info("OpenRouter image generated successfully (base64)")
+            return {"url": f"data:image/png;base64,{item['b64_json']}", "credit": "AI-generated (OpenRouter)", "caption": "AI-generated illustration"}
+
+        LOG.warning("OpenRouter item had no url or b64_json. Item keys: %s", list(item.keys()))
+
     except Exception as e:
         LOG.warning("OpenRouter image generation failed: %s", e)
-    
+        import traceback
+        LOG.debug(traceback.format_exc())
+
     return None
 
 # -------------------------

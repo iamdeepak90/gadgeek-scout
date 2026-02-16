@@ -165,8 +165,21 @@ def backfill_images() -> None:
             continue
 
         # ── Step 2: Generate image ────────────────────────────────────────
+        # Debug: Check if image generation is properly configured
+        image_model_route = get_setting("model_routes:image")
+        together_key = get_setting("together_api_key")
+        openrouter_key = get_setting("openrouter_api_key")
+
+        LOG.info(
+            "Image config — model_route: %s | together_key: %s | openrouter_key: %s",
+            image_model_route or "NOT SET",
+            "set" if together_key else "NOT SET",
+            "set" if openrouter_key else "NOT SET",
+        )
+
         try:
             gen = generate_image(prompt)
+            LOG.info("generate_image raw response: %s", gen)
         except Exception as exc:
             LOG.error("generate_image raised exception for article %s: %s", article_id, exc)
             LOG.debug(traceback.format_exc())

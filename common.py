@@ -935,7 +935,12 @@ def generate_image_openrouter(
     height: int = 448,
     model: str = "black-forest-labs/flux-1.1-pro",
 ) -> Optional[Dict[str, str]]:
-    """Generate image using OpenRouter's images endpoint (OpenAI-compatible)"""
+    """
+    Generate image using OpenRouter's chat completions endpoint
+    with modalities=["image"] per OpenRouter docs.
+    
+    Response contains images in: choices[0].message.images[].image_url.url
+    """
     key = get_setting("openrouter_api_key")
     if not key:
         LOG.warning("OpenRouter API key not set — skipping OpenRouter image generation")
@@ -950,21 +955,29 @@ def generate_image_openrouter(
 
     payload = {
         "model": model,
-        "prompt": prompt,
-        "n": 1,
-        "size": f"{width}x{height}",
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "modalities": ["image"],       # image-only for FLUX models
+        "image_config": {
+            "aspect_ratio": "16:9",     # closest to 800x450
+            "image_size": "1K",
+        },
+        "stream": False,
     }
 
-    LOG.info("OpenRouter image request — model: %s, size: %dx%d", model, width, height)
+    LOG.info("OpenRouter image request — model: %s, aspect: 16:9, size: 1K", model)
 
     try:
         resp = request_with_retry(
-            "POST", OPENROUTER_IMAGES_URL,
+            "POST", OPENROUTER_CHAT_URL,   # uses /api/v1/chat/completions
             headers=headers, json_body=payload,
             timeout=120, max_attempts=3,
         )
 
-        # Check for HTTP errors
         if resp.status_code != 200:
             LOG.warning(
                 "OpenRouter image returned HTTP %d: %s",
@@ -973,29 +986,53 @@ def generate_image_openrouter(
             return None
 
         data = resp.json()
-        LOG.debug("OpenRouter raw response keys: %s", list(data.keys()))
+        LOG.debug("OpenRouter response keys: %s", list(data.keys()))
 
-        # Check for API-level errors
+        # Check for API errors
         if data.get("error"):
-            LOG.warning("OpenRouter image API error: %s", data["error"])
+            LOG.warning("OpenRouter API error: %s", data["error"])
             return None
 
-        # Standard OpenAI images response format: {"data": [{"url": "..."} or {"b64_json": "..."}]}
-        items = data.get("data") or []
-        if not items:
-            LOG.warning("OpenRouter image response had empty data array. Full response: %s", str(data)[:500])
+        # Response format per docs:
+        # choices[0].message.images[].image_url.url → base64 data URL
+        choices = data.get("choices") or []
+        if not choices:
+            LOG.warning("OpenRouter response had no choices. Response: %s", str(data)[:500])
             return None
 
-        item = items[0]
+        message = choices[0].get("message") or {}
+        images = message.get("images") or []
 
-        if item.get("url"):
-            LOG.info("OpenRouter image generated successfully (url)")
-            return {"url": item["url"], "credit": "AI-generated (OpenRouter)", "caption": "AI-generated illustration"}
-        if item.get("b64_json"):
-            LOG.info("OpenRouter image generated successfully (base64)")
-            return {"url": f"data:image/png;base64,{item['b64_json']}", "credit": "AI-generated (OpenRouter)", "caption": "AI-generated illustration"}
+        if images:
+            # Each image: {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+            first_image = images[0]
+            image_url_obj = first_image.get("image_url") or {}
+            image_url = image_url_obj.get("url") or ""
 
-        LOG.warning("OpenRouter item had no url or b64_json. Item keys: %s", list(item.keys()))
+            if image_url:
+                LOG.info("OpenRouter image generated successfully (base64 data URL)")
+                return {
+                    "url": image_url,
+                    "credit": "AI-generated (OpenRouter)",
+                    "caption": "AI-generated illustration",
+                }
+
+            LOG.warning("OpenRouter image object had no url. Image keys: %s", list(first_image.keys()))
+        else:
+            # Some models might return image data in content instead
+            content = message.get("content") or ""
+            if content.startswith("data:image"):
+                LOG.info("OpenRouter image found in message content (data URL)")
+                return {
+                    "url": content,
+                    "credit": "AI-generated (OpenRouter)",
+                    "caption": "AI-generated illustration",
+                }
+
+            LOG.warning(
+                "OpenRouter response had no images array. Message keys: %s, content preview: %s",
+                list(message.keys()), content[:200] if content else "empty",
+            )
 
     except Exception as e:
         LOG.warning("OpenRouter image generation failed: %s", e)

@@ -20,8 +20,6 @@ import logging
 import time
 import traceback
 
-import schedule
-
 from common import (
     setup_logging,
     init_db,
@@ -243,12 +241,14 @@ if __name__ == "__main__":
     LOG.info("Batch size: %d articles per run", BATCH_SIZE)
     LOG.info("Image model: configured via Settings UI -> model_routes:image")
 
-    # Run immediately on startup, then every hour
-    backfill_images()
-
-    schedule.every(1).hours.do(backfill_images)
-    LOG.info("Scheduler running. Next run in 1 hour. Ctrl+C to stop.")
+    RUN_INTERVAL = 3600  # 1 hour in seconds
 
     while True:
-        schedule.run_pending()
-        time.sleep(30)
+        try:
+            backfill_images()
+        except Exception as exc:
+            LOG.error("Backfill job crashed: %s", exc)
+            LOG.debug(traceback.format_exc())
+
+        LOG.info("Next run in %d seconds. Ctrl+C to stop.", RUN_INTERVAL)
+        time.sleep(RUN_INTERVAL)

@@ -22,8 +22,8 @@ from common import (
 # MODELS
 # ─────────────────────────────────────────────────────────────────────────────
 # Kept same as your original code to avoid bigger changes.
-LLM_PRIMARY_MODEL  = "meta-llama/llama-3.3-70b-instruct:free"
-LLM_FALLBACK_MODEL = "google/gemma-3-27b-it:free"
+LLM_PRIMARY_MODEL  = "meta-llama/llama-3.2-3b-instruct"
+LLM_FALLBACK_MODEL = "google/gemma-3-4b-it"
 
 # Batch size for category classification (hardcoded to keep config minimal)
 _BATCH_SIZE = 20

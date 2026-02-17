@@ -1184,7 +1184,7 @@ FINAL REMINDER: The article MUST contain all 6 structural sections listed above.
 def _sources_block_from_pack(pack: Dict[str, Any]) -> str:
     extract_results = (pack.get("extract") or {}).get("results") or []
     snippets: List[str] = []
-    for r in extract_results[:6]:
+    for r in extract_results[:7]:
         url = r.get("url") or ""
         content = (r.get("content") or r.get("raw_content") or "").strip()
         if len(content) > 2500:

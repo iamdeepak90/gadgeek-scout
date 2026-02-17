@@ -23,8 +23,8 @@ from common import (
 # MODELS
 # ─────────────────────────────────────────────────────────────────────────────
 
-LLM_PRIMARY_MODEL  = "meta-llama/llama-3.1-8b-instruct"
-LLM_FALLBACK_MODEL = "meta-llama/llama-3.2-3b-instruct"
+LLM_PRIMARY_MODEL  = "meta-llama/llama-3.3-70b-instruct:free"
+LLM_FALLBACK_MODEL = "google/gemma-3-27b-it:free"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -46,12 +46,6 @@ def _build_category_list(categories: List[Dict[str, Any]]) -> str:
 
 
 def _build_article_snippet(fields: Dict[str, str]) -> str:
-    """
-    Build article context for LLM.
-    Always sends title + description.
-    Adds first 500 chars of content if description is missing or under 50 chars.
-    Includes RSS category tag if present.
-    """
     title       = (fields.get("title") or "").strip()
     description = (fields.get("description") or "").strip()
     content     = (fields.get("content") or "").strip()
@@ -62,15 +56,17 @@ def _build_article_snippet(fields: Dict[str, str]) -> str:
     if title:
         parts.append(f"Title: {title}")
 
+    # CAP BOTH at 200 chars — this is the fix
     if len(description) >= 50:
-        parts.append(f"Description: {description}")
+        parts.append(f"Description: {description[:200]}")   # ← was no cap
     elif content:
-        parts.append(f"Content: {content[:500]}")
+        parts.append(f"Content: {content[:200]}")
     elif description:
-        parts.append(f"Description: {description}")
+        parts.append(f"Description: {description[:200]}")   # ← was no cap
 
+    # RSS category is short, no cap needed
     if rss_cat:
-        parts.append(f"RSS category: {rss_cat}")
+        parts.append(f"RSS category: {rss_cat[:60]}")
 
     return "\n".join(parts)
 

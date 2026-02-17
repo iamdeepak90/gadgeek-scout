@@ -1,6 +1,24 @@
+"""
+Robust RSS news scout
+
+Key changes vs old scout.py:
+- Only 2 LLM calls per run:
+  1) semantic dedup + quality ranking (across all candidates)
+  2) category mapping (batched) for shortlisted candidates
+- No per-entry category LLM calls during collection.
+- Batched Directus URL duplication checks (news_leads + articles) over last N hours.
+- Candidate collection limited per feed (default 25) with in-run URL/title dedup.
+- Minimal, readable logs (phase summaries + errors). Use DEBUG for deep troubleshooting.
+
+This file depends on the project's `common.py` helpers.
+"""
+
 import sys
 import re
-from typing import Any, Dict, List, Optional, Tuple
+import json
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 
 from common import (
@@ -10,7 +28,6 @@ from common import (
     list_feeds,
     parse_feed,
     extract_entry_fields,
-    lead_exists_by_url,
     create_lead,
     slack_post_lead,
     get_categories,
@@ -23,211 +40,29 @@ from common import (
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODELS
+# CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Models (OpenRouter)
+LLM_FILTER_MODEL = "meta-llama/llama-4-scout"
 LLM_CATMATCH_MODEL = "meta-llama/llama-3.1-8b-instruct"
 LLM_CATMATCH_FALLBACK = "deepseek/deepseek-r1-distill-llama-70b"
-LLM_SCOUT_DUPLI_MODEL = "meta-llama/llama-4-scout"
-GLOBAL_SCOUT_CAP = 25
 
+# Limits
+ENTRIES_PER_FEED = 25                 # how many items to read from each feed per run
+GLOBAL_SCOUT_CAP = 40                 # max posts per run (Slack/Directus)
+LLM_CANDIDATE_LIMIT = 220             # cap candidates sent to the LLM filter prompt
+LLM_RANK_RETURN_LIMIT = 120           # ask LLM to return up to this many ranked picks
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LLM CATEGORY MATCHING
-# ─────────────────────────────────────────────────────────────────────────────
+# "Duplicate memory" windows
+DIRECTUS_URL_DUP_HOURS = 168          # URL duplication check in Directus (7 days)
+TITLE_DUP_HOURS = 168                 # titles loaded for semantic dedup (7 days)
 
-def _build_category_list(categories: List[Dict[str, Any]]) -> str:
-    """
-    Build category reference for LLM prompt.
-    Format: slug | name  (one per line)
-    """
-    lines = []
-    for c in categories:
-        slug = (c.get("slug") or "").strip()
-        name = (c.get("name") or "").strip()
-        if slug and name:
-            lines.append(f"{slug} | {name}")
-    return "\n".join(lines)
+# Prompt shaping
+EXISTING_TITLE_LIMIT = 140            # number of existing titles to include in prompt
+CANDIDATE_DESC_CHARS = 140            # how much description/snippet to include per candidate in LLM prompts
 
-
-def _build_article_snippet(fields: Dict[str, str]) -> str:
-    title       = (fields.get("title") or "").strip()
-    description = (fields.get("description") or "").strip()
-    content     = (fields.get("content") or "").strip()
-    rss_cat     = (fields.get("category") or "").strip()
-
-    parts = []
-
-    if title:
-        parts.append(f"Title: {title}")
-
-    # CAP BOTH at 200 chars — this is the fix
-    if len(description) >= 50:
-        parts.append(f"Description: {description[:200]}")   # ← was no cap
-    elif content:
-        parts.append(f"Content: {content[:200]}")
-    elif description:
-        parts.append(f"Description: {description[:200]}")   # ← was no cap
-
-    # RSS category is short, no cap needed
-    if rss_cat:
-        parts.append(f"RSS category: {rss_cat[:60]}")
-
-    return "\n".join(parts)
-
-
-def _call_llm(article_snippet: str, category_list: str, model: str) -> str:
-    """
-    Single LLM call to OpenRouter. Returns raw text response.
-    Raises on failure — caller handles retry and fallback.
-    """
-    key = get_setting("openrouter_api_key")
-    if not key:
-        raise RuntimeError("OpenRouter API key not configured.")
-
-    system = (
-        "You are a content classification assistant for a tech news website. "
-        "Your only job: pick the single best matching category for the article "
-        "from the provided list.\n\n"
-        "Rules:\n"
-        "- Return ONLY the slug. Nothing else.\n"
-        "- No explanation. No punctuation. No quotes.\n"
-        "- The slug must exactly match one from the list.\n"
-        "- If nothing fits well, return the slug of the most general category."
-    )
-
-    user = (
-        f"ARTICLE:\n{article_snippet}\n\n"
-        f"AVAILABLE CATEGORIES (slug | name):\n{category_list}\n\n"
-        "Return only the slug of the best matching category:"
-    )
-
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://bot.gadgeek.in",
-        "X-Title": "Gadgeek Tech News",
-    }
-    payload = {
-        "model":       model,
-        "messages":    [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ],
-        "temperature": 0.0,
-        "max_tokens":  20,
-    }
-
-    resp = request_with_retry(
-        "POST", OPENROUTER_CHAT_URL,
-        headers=headers,
-        json_body=payload,
-        timeout=30,
-        max_attempts=2,
-    )
-    data    = resp.json()
-    choices = data.get("choices") or []
-    if not choices:
-        raise RuntimeError(f"OpenRouter returned no choices: {data}")
-
-    return ((choices[0].get("message") or {}).get("content") or "").strip()
-
-
-def _resolve_slug(raw: str, categories: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Clean LLM response and match to a known category.
-    Strips quotes, punctuation, whitespace the model might add.
-    Returns matched category dict or None.
-    """
-    slug = raw.strip().strip('"').strip("'").strip(".").lower()
-    slug = re.sub(r"[^a-z0-9-]", "", slug)
-
-    if not slug:
-        return None
-
-    for c in categories:
-        if (c.get("slug") or "").strip().lower() == slug:
-            return c
-
-    return None
-
-
-def llm_match_category(
-    fields: Dict[str, str],
-    categories: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-    """
-    Classify article into best Directus category using LLM.
-
-    Flow:
-      1. Try Llama 3.1 8B (primary)
-      2. Unknown slug or failure → try Llama 3.2 3B (fallback)
-      3. Both fail → return None (caller uses DEFAULT_CATEGORY_UUID)
-    """
-    article_snippet = _build_article_snippet(fields)
-    category_list   = _build_category_list(categories)
-
-    if not article_snippet.strip():
-        LOG.warning("LLM match skipped — article snippet is empty.")
-        return None
-
-    for model in (LLM_CATMATCH_MODEL, LLM_CATMATCH_FALLBACK):
-        try:
-            raw = _call_llm(article_snippet, category_list, model)
-            LOG.debug("LLM [%s] raw response: %r", model, raw)
-
-            matched = _resolve_slug(raw, categories)
-            if matched:
-                LOG.info(
-                    "LLM matched '%s' (slug: %s) via %s",
-                    matched.get("name"), matched.get("slug"), model,
-                )
-                return matched
-
-            LOG.warning(
-                "LLM [%s] returned unknown slug %r — trying next model.", model, raw,
-            )
-
-        except Exception as exc:
-            LOG.warning("LLM [%s] failed: %s — trying next model.", model, exc)
-
-    LOG.warning("All LLM models failed. Will use default category.")
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CATEGORY RESOLVER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def resolve_category(
-    fields: Dict[str, str],
-    categories: List[Dict[str, Any]],
-) -> Tuple[str, str]:
-    """
-    Resolve best category for an article.
-
-    Chain:
-      1. LLM (Llama 3.1 8B → Llama 3.2 3B fallback)
-      2. DEFAULT_CATEGORY_UUID if both LLM models fail
-
-    Returns (category_id, category_name).
-    """
-    matched = llm_match_category(fields, categories)
-    if matched:
-        return str(matched.get("id") or ""), matched.get("name") or ""
-
-    # Both LLM models failed — use default
-    for c in categories:
-        if str(c.get("id") or "") == DEFAULT_CATEGORY_UUID:
-            return DEFAULT_CATEGORY_UUID, c.get("name") or "General"
-
-    return DEFAULT_CATEGORY_UUID, "General"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# URL NORMALIZATION
-# ─────────────────────────────────────────────────────────────────────────────
-
+# URL normalization
 STRIP_PARAMS = {
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
     "utm_id", "fbclid", "gclid", "ref", "source", "ncid", "ocid",
@@ -235,8 +70,26 @@ STRIP_PARAMS = {
 }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA MODEL
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Candidate:
+    title: str
+    link: str
+    norm_url: str
+    feed_name: str
+    description: str = ""
+    rss_category: str = ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS: NORMALIZATION
+# ─────────────────────────────────────────────────────────────────────────────
+
 def normalize_url(url: str) -> str:
-    """Normalize URL: lowercase, strip tracking params, www, trailing slash, fragment."""
+    """Normalize URL: lowercase host, strip tracking params, www, trailing slash, fragment."""
     try:
         parsed = urlparse(url.strip())
         scheme = parsed.scheme.lower() or "https"
@@ -252,253 +105,432 @@ def normalize_url(url: str) -> str:
         return url.strip().rstrip("/")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LAYER 1: URL DEDUP (checks both news_leads AND articles)
-# ─────────────────────────────────────────────────────────────────────────────
+_title_key_re = re.compile(r"[^a-z0-9]+")
 
-def url_exists_in_leads(url: str) -> bool:
-    """Check if URL exists in news_leads table (raw + normalized)."""
-    norm = normalize_url(url)
-    urls_to_check = [url, norm] if norm != url else [url]
-
-    for check_url in urls_to_check:
-        try:
-            params = urlencode({
-                "filter[source_url][_eq]": check_url,
-                "fields": "id",
-                "limit": 1,
-            })
-            data = directus_get(f"/items/news_leads?{params}")
-            if data and (data.get("data") or []):
-                return True
-        except Exception as e:
-            LOG.debug("Lead URL check failed for %s: %s", check_url, e)
-
-    return False
+def title_key(title: str) -> str:
+    """Cheap title fingerprint for in-run dedup."""
+    t = (title or "").strip().lower()
+    t = _title_key_re.sub(" ", t)
+    return re.sub(r"\s+", " ", t).strip()
 
 
-def url_exists_in_articles(url: str) -> bool:
-    """Check if URL exists in articles table (raw + normalized)."""
-    col = articles_collection()
-    norm = normalize_url(url)
-    urls_to_check = [url, norm] if norm != url else [url]
-
-    for check_url in urls_to_check:
-        try:
-            params = urlencode({
-                "filter[source_url][_eq]": check_url,
-                "fields": "id",
-                "limit": 1,
-            })
-            data = directus_get(f"/items/{col}?{params}")
-            if data and (data.get("data") or []):
-                return True
-        except Exception as e:
-            LOG.debug("Article URL check failed for %s: %s", check_url, e)
-
-    return False
-
-
-def url_exists_anywhere(url: str) -> bool:
-    """Check if URL exists in either news_leads OR articles."""
-    if url_exists_in_leads(url):
-        LOG.debug("URL found in news_leads: %s", url[:80])
-        return True
-    if url_exists_in_articles(url):
-        LOG.debug("URL found in articles: %s", url[:80])
-        return True
-    return False
+def _cap(s: str, n: int) -> str:
+    s = (s or "").strip()
+    return s[:n] if len(s) > n else s
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LAYER 2: LLM SEMANTIC DEDUP + QUALITY FILTER
+# DIRECTUS: BATCH URL DEDUP (7 days)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_recent_titles(hours: int = 168) -> list:
+def _utc_cutoff_iso(hours: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _chunks(seq: Sequence[str], size: int) -> Iterable[List[str]]:
+    for i in range(0, len(seq), size):
+        yield list(seq[i:i+size])
+
+
+def _fetch_existing_urls_for_collection(
+    collection: str,
+    urls_to_check: Sequence[str],
+    cutoff_iso: str,
+    chunk_size: int = 25,
+) -> List[str]:
     """
-    Fetch titles from BOTH news_leads AND articles from last N hours.
-    Default: 168 hours = 7 days.
+    Query Directus for source_url in urls_to_check within date_created >= cutoff_iso.
+    Returns list of matching source_url values.
     """
-    from datetime import datetime, timedelta, timezone
+    found: List[str] = []
+    if not urls_to_check:
+        return found
 
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S")
-    titles = []
+    for chunk in _chunks(list(urls_to_check), chunk_size):
+        # Directus supports _in as comma-separated list.
+        # Values are URL-decoded server-side, so urlencode is safe.
+        params = urlencode(
+            {
+                "filter[date_created][_gte]": cutoff_iso,
+                "filter[source_url][_in]": ",".join(chunk),
+                "fields": "source_url",
+                "limit": 500,
+            }
+        )
+        try:
+            data = directus_get(f"/items/{collection}?{params}")
+            for item in (data.get("data") or []):
+                u = (item.get("source_url") or "").strip()
+                if u:
+                    found.append(u)
+        except Exception as exc:
+            LOG.warning("Directus URL check failed for %s: %s", collection, exc)
 
-    # ── From news_leads ─────────────────────────────────────────────
+    return found
+
+
+def fetch_existing_norm_urls(
+    candidates: Sequence[Candidate],
+    hours: int = DIRECTUS_URL_DUP_HOURS,
+) -> set:
+    """
+    Batched URL dedup across news_leads and articles within last N hours.
+    Returns a set of *normalized* URLs that already exist.
+    """
+    cutoff_iso = _utc_cutoff_iso(hours)
+
+    raw_urls: List[str] = []
+    norm_urls: List[str] = []
+    for c in candidates:
+        if c.link:
+            raw_urls.append(c.link)
+        if c.norm_url and c.norm_url != c.link:
+            norm_urls.append(c.norm_url)
+
+    urls_to_check = list(dict.fromkeys(raw_urls + norm_urls))  # preserve order, unique
+
+    leads_urls = _fetch_existing_urls_for_collection("news_leads", urls_to_check, cutoff_iso)
+    art_col = articles_collection()
+    articles_urls = _fetch_existing_urls_for_collection(art_col, urls_to_check, cutoff_iso)
+
+    found_norm = set()
+    for u in leads_urls + articles_urls:
+        found_norm.add(normalize_url(u))
+
+    return found_norm
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DIRECTUS: RECENT TITLES (7 days)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_recent_titles(hours: int = TITLE_DUP_HOURS) -> List[str]:
+    """Fetch titles from BOTH news_leads AND articles from last N hours."""
+    cutoff = _utc_cutoff_iso(hours)
+    titles: List[str] = []
+
+    # news_leads
     try:
-        params = urlencode({
-            "filter[date_created][_gte]": cutoff,
-            "fields": "title",
-            "limit": 300,
-            "sort": "-date_created",
-        })
+        params = urlencode(
+            {
+                "filter[date_created][_gte]": cutoff,
+                "fields": "title",
+                "limit": 300,
+                "sort": "-date_created",
+            }
+        )
         data = directus_get(f"/items/news_leads?{params}")
         for item in (data.get("data") or []):
             t = (item.get("title") or "").strip()
             if t:
                 titles.append(t)
-        LOG.info("Loaded %d titles from news_leads (last %d hours).", len(titles), hours)
-    except Exception as e:
-        LOG.warning("Failed to fetch recent lead titles: %s", e)
+    except Exception as exc:
+        LOG.warning("Failed to fetch recent titles from news_leads: %s", exc)
 
-    # ── From articles ───────────────────────────────────────────────
-    article_count = 0
+    # articles
     try:
         col = articles_collection()
-        params = urlencode({
-            "filter[date_created][_gte]": cutoff,
-            "fields": "title",
-            "limit": 300,
-            "sort": "-date_created",
-        })
+        params = urlencode(
+            {
+                "filter[date_created][_gte]": cutoff,
+                "fields": "title",
+                "limit": 300,
+                "sort": "-date_created",
+            }
+        )
         data = directus_get(f"/items/{col}?{params}")
         for item in (data.get("data") or []):
             t = (item.get("title") or "").strip()
             if t:
                 titles.append(t)
-                article_count += 1
-        LOG.info("Loaded %d titles from articles (last %d hours).", article_count, hours)
-    except Exception as e:
-        LOG.warning("Failed to fetch recent article titles: %s", e)
+    except Exception as exc:
+        LOG.warning("Failed to fetch recent titles from articles: %s", exc)
 
-    # ── Deduplicate titles ──────────────────────────────────────────
+    # de-dupe titles (case-insensitive)
     seen = set()
-    unique_titles = []
+    unique: List[str] = []
     for t in titles:
-        t_lower = t.lower().strip()
-        if t_lower not in seen:
-            seen.add(t_lower)
-            unique_titles.append(t)
+        k = t.strip().lower()
+        if k and k not in seen:
+            seen.add(k)
+            unique.append(t)
 
-    LOG.info("Total unique existing titles for dedup: %d", len(unique_titles))
-    return unique_titles
+    return unique
 
 
-def llm_filter_leads(candidates: list, existing_titles: list, max_picks: int = 15) -> list:
+# ─────────────────────────────────────────────────────────────────────────────
+# OPENROUTER: BASIC CHAT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def openrouter_chat(
+    messages: List[Dict[str, str]],
+    model: str,
+    *,
+    max_tokens: int,
+    temperature: float,
+    timeout: int = 60,
+    attempts: int = 2,
+) -> str:
+    api_key = get_setting("openrouter_api_key")
+    if not api_key:
+        raise RuntimeError("OpenRouter API key not configured.")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://bot.gadgeek.in",
+        "X-Title": "Gadgeek Tech News",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+
+    resp = request_with_retry(
+        "POST",
+        OPENROUTER_CHAT_URL,
+        headers=headers,
+        json_body=payload,
+        timeout=timeout,
+        max_attempts=attempts,
+    )
+    data = resp.json()
+    if data.get("error"):
+        raise RuntimeError(str(data["error"]))
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"OpenRouter returned no choices: {data}")
+    return ((choices[0].get("message") or {}).get("content") or "").strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM #1: SEMANTIC DEDUP + QUALITY RANKING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def llm_rank_candidates(
+    candidates: List[Candidate],
+    existing_titles: List[str],
+    *,
+    max_return: int,
+) -> List[int]:
     """
-    Single LLM call that does BOTH:
-    1. Semantic dedup against existing titles (news_leads + articles)
-    2. Quality/relevance filtering
+    One LLM call: rank candidates best→worst, skipping semantic duplicates.
+    Returns list of 0-based indices into `candidates`, in ranked order.
 
-    Uses free model. Falls back gracefully if LLM is unavailable.
+    If LLM is unavailable, returns indices in original order.
     """
     if not candidates:
         return []
 
     api_key = get_setting("openrouter_api_key")
     if not api_key:
-        LOG.warning("No OpenRouter key — skipping LLM filter, returning first %d", max_picks)
-        return candidates[:max_picks]
+        LOG.info("No OpenRouter key set — skipping LLM ranking.")
+        return list(range(len(candidates)))
 
-    # ── Build the prompt ────────────────────────────────────────────
-    existing_section = ""
+    existing_block = ""
     if existing_titles:
-        existing_list = "\n".join(f"  {i+1}. {t}" for i, t in enumerate(existing_titles[:150]))
-        existing_section = (
-            f"SECTION A — ALREADY PUBLISHED/SCOUTED ({len(existing_titles[:150])} titles from last 7 days):\n"
-            f"{existing_list}\n\n"
-        )
+        ex = existing_titles[:EXISTING_TITLE_LIMIT]
+        existing_block = "SECTION A — ALREADY SCOUTED/PUBLISHED (last 7 days):\n"
+        existing_block += "\n".join(f"- {t}" for t in ex)
+        existing_block += "\n\n"
 
-    candidates_list = "\n".join(
-        f"  {i+1}. [{c['cat_name']}] {c['title']}"
-        for i, c in enumerate(candidates)
+    # Candidate lines
+    lines = []
+    for i, c in enumerate(candidates, start=1):
+        desc = _cap(c.description, CANDIDATE_DESC_CHARS)
+        feed = _cap(c.feed_name, 30)
+        extra = f" — {desc}" if desc else ""
+        lines.append(f"{i}. [{feed}] {c.title}{extra}")
+
+    candidates_block = "SECTION B — NEW CANDIDATES:\n" + "\n".join(lines)
+
+    system = (
+        "You are an editor for a technology news website.\n"
+        "You will rank new RSS articles, remove duplicates, and keep only high-value news.\n"
+        "You must be strict about duplicates and fluff."
     )
 
-    prompt = f"""You are an editor for an Indian technology news website called Gadgeek.
-
-    {existing_section}SECTION B — NEW CANDIDATES FROM RSS FEEDS ({len(candidates)} articles):
-    {candidates_list}
-
-    YOUR TASK:
-    From Section B, pick up to {max_picks} articles to publish. Return ONLY their numbers as comma-separated values.
-
-    DUPLICATE RULES (very important):
-    - DUPLICATE (skip): Same news EVENT reported by different sources.
-    Example: "iPhone 17e Launched at ₹49,999" and "Apple iPhone 17e India Price ₹49,999" = SAME event → keep only the better title
-    - NOT DUPLICATE (keep both): Same PRODUCT but different news event.
-    Example: "iPhone 17e Specs Leaked" and "iPhone 17e Officially Launched" = DIFFERENT events → keep both
-    - NOT DUPLICATE (keep both): Follow-up stories.
-    Example: "iPhone 17e Launched" and "iPhone 17e First Sale: 100K Units Sold" = follow-up → keep both
-
-    CHECK AGAINST SECTION A:
-    - If a candidate covers the SAME news event as any title in Section A → SKIP it (already covered)
-    - If a candidate covers the same product but a NEW angle/event → KEEP it
-
-    QUALITY RULES:
-    - Prioritize: breaking news, product launches, major updates, Indian market relevance
-    - Skip: PR fluff, generic listicles, sponsored content, outdated news
-    - Skip: Vague opinion pieces with no new information
-
-    OUTPUT FORMAT:
-    Return ONLY comma-separated numbers from Section B. Example: 2,5,8,11,14
-    Do not explain. Do not add any other text."""
+    user = (
+        f"{existing_block}{candidates_block}\n\n"
+        f"TASK:\n"
+        f"1) From SECTION B, remove semantic duplicates and low-value items.\n"
+        f"2) Return up to {max_return} remaining items in BEST→WORST order.\n\n"
+        "DUPLICATE RULES:\n"
+        "- Duplicate = the SAME news event reported by different sources.\n"
+        "- Not duplicate = same product but a different event/angle (launch vs leak vs sale vs update).\n"
+        "- If a candidate matches the SAME event as any title in SECTION A, treat as duplicate and remove.\n\n"
+        "QUALITY RULES (prefer): launches, major updates, breaking news, India relevance, meaningful specs/pricing.\n"
+        "Skip: PR fluff, listicles, generic tips, outdated items.\n\n"
+        "OUTPUT FORMAT (strict):\n"
+        "Return ONLY the numbers from SECTION B, comma-separated, in BEST→WORST order.\n"
+        "Example: 7,2,19,4\n"
+        "Do not add any other text."
+    )
 
     try:
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": LLM_SCOUT_DUPLI_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 200,
-            "temperature": 0.1,
-        }
-
-        LOG.info(
-            "LLM filter: %d candidates, %d existing titles, model: %s",
-            len(candidates), len(existing_titles[:150]), LLM_SCOUT_DUPLI_MODEL,
+        content = openrouter_chat(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            LLM_FILTER_MODEL,
+            max_tokens=240,
+            temperature=0.1,
+            timeout=75,
+            attempts=2,
         )
+        # Keep order as returned
+        nums = [int(x) for x in re.findall(r"\d+", content)]
+        ranked: List[int] = []
+        seen = set()
+        for n in nums:
+            if 1 <= n <= len(candidates) and n not in seen:
+                ranked.append(n - 1)
+                seen.add(n)
+            if len(ranked) >= max_return:
+                break
 
-        resp = request_with_retry(
-            "POST", OPENROUTER_CHAT_URL,
-            headers=headers, json_body=payload,
-            timeout=60, max_attempts=2,
-        )
-        data = resp.json()
+        if ranked:
+            return ranked
 
-        if data.get("error"):
-            LOG.warning("LLM filter API error: %s", data["error"])
-            return candidates[:max_picks]
+        LOG.warning("LLM ranking returned no valid indices. Falling back to original order.")
+        return list(range(len(candidates)))
 
-        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-        LOG.info("LLM filter response: %s", content[:300])
+    except Exception as exc:
+        LOG.warning("LLM ranking failed (%s). Falling back to original order.", exc)
+        return list(range(len(candidates)))
 
-        # Parse numbers
-        picked_nums = set()
-        for token in re.findall(r'\d+', content):
-            num = int(token)
-            if 1 <= num <= len(candidates):
-                picked_nums.add(num)
 
-        if picked_nums:
-            filtered = [candidates[n - 1] for n in sorted(picked_nums)]
-            LOG.info(
-                "LLM filter: picked %d/%d — %s",
-                len(filtered), len(candidates),
-                [c["title"][:50] for c in filtered],
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM #2: CATEGORY MAPPING (BATCHED)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_category_reference(categories: List[Dict[str, Any]]) -> str:
+    lines = []
+    for c in categories:
+        cid = str(c.get("id") or "").strip()
+        slug = (c.get("slug") or "").strip()
+        name = (c.get("name") or "").strip()
+        if cid and name:
+            # Include slug if present (helps model), but ID is authoritative.
+            if slug:
+                lines.append(f"{cid} | {slug} | {name}")
+            else:
+                lines.append(f"{cid} | {name}")
+    return "\n".join(lines)
+
+
+def llm_map_categories(
+    items: List[Candidate],
+    categories: List[Dict[str, Any]],
+) -> Dict[int, str]:
+    """
+    One batched LLM call to map each item to a Directus category UUID.
+    Returns dict {item_index (0-based within `items`): category_uuid}.
+
+    If LLM fails, all items map to DEFAULT_CATEGORY_UUID.
+    """
+    if not items:
+        return {}
+
+    api_key = get_setting("openrouter_api_key")
+    if not api_key:
+        LOG.info("No OpenRouter key set — using default category for all picks.")
+        return {i: DEFAULT_CATEGORY_UUID for i in range(len(items))}
+
+    valid_ids = {str(c.get("id") or "") for c in categories if c.get("id")}
+    cat_ref = _build_category_reference(categories)
+
+    # Article snippets
+    art_lines = []
+    for i, c in enumerate(items, start=1):
+        desc = _cap(c.description, CANDIDATE_DESC_CHARS)
+        rss = _cap(c.rss_category, 60)
+        feed = _cap(c.feed_name, 30)
+        parts = [f"Title: {c.title}"]
+        if desc:
+            parts.append(f"Description: {desc}")
+        if rss:
+            parts.append(f"RSS category: {rss}")
+        parts.append(f"Source: {feed}")
+        snippet = " | ".join(parts)
+        art_lines.append(f"{i}. {snippet}")
+
+    system = (
+        "You are a content classification assistant.\n"
+        "Assign the single best category from the provided list to each article.\n"
+        "You must output only JSON."
+    )
+
+    user = (
+        "CATEGORIES (Directus UUID | slug | name):\n"
+        f"{cat_ref}\n\n"
+        "ARTICLES:\n"
+        f"{chr(10).join(art_lines)}\n\n"
+        "TASK:\n"
+        "For each article number, choose exactly ONE category UUID from the list.\n"
+        "If nothing fits well, use the most general category.\n\n"
+        "OUTPUT JSON ONLY in this exact shape:\n"
+        '[{"n": 1, "category_id": "UUID"}, {"n": 2, "category_id": "UUID"}]\n'
+        "No extra keys. No markdown. No explanation."
+    )
+
+    last_exc: Optional[Exception] = None
+    for model in (LLM_CATMATCH_MODEL, LLM_CATMATCH_FALLBACK):
+        try:
+            content = openrouter_chat(
+                [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                model,
+                max_tokens=900,
+                temperature=0.0,
+                timeout=75,
+                attempts=2,
             )
-            return filtered
-        else:
-            LOG.warning("LLM returned no valid picks. Raw: %s", content[:300])
-            return candidates[:max_picks]
 
-    except Exception as e:
-        LOG.warning("LLM filter failed: %s — returning first %d", e, max_picks)
-        return candidates[:max_picks]
+            # Extract JSON array robustly
+            json_text = content.strip()
+            # Sometimes models wrap in code fences; strip them.
+            if json_text.startswith("```"):
+                json_text = re.sub(r"^```[a-zA-Z]*\s*", "", json_text)
+                json_text = re.sub(r"\s*```$", "", json_text).strip()
+
+            data = json.loads(json_text)
+            if not isinstance(data, list):
+                raise ValueError("Category map output is not a JSON list")
+
+            mapping: Dict[int, str] = {}
+            for obj in data:
+                if not isinstance(obj, dict):
+                    continue
+                n = obj.get("n")
+                cid = str(obj.get("category_id") or "").strip()
+                if isinstance(n, int) and 1 <= n <= len(items) and cid in valid_ids:
+                    mapping[n - 1] = cid
+
+            if mapping:
+                return mapping
+
+            LOG.warning("LLM category mapping returned empty/invalid mapping with model %s.", model)
+
+        except Exception as exc:
+            last_exc = exc
+            LOG.warning("LLM category mapping failed with model %s (%s).", model, exc)
+
+    # Fallback: default category for all
+    if last_exc:
+        LOG.warning("Category mapping failed; using default category for all picks.")
+    return {i: DEFAULT_CATEGORY_UUID for i in range(len(items))}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN SCOUT FUNCTION
+# MAIN SCOUT
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 def scout_once() -> int:
     init_db()
 
     feeds = [f for f in list_feeds() if f.get("enabled")]
     if not feeds:
-        LOG.error("No RSS feeds configured. Go to /settings -> RSS Feeds.")
+        LOG.error("No RSS feeds configured/enabled.")
         return 0
 
     categories = get_categories()
@@ -506,146 +538,192 @@ def scout_once() -> int:
         LOG.error("No enabled categories found in Directus.")
         return 0
 
-    if not get_setting("openrouter_api_key"):
-        LOG.warning("OpenRouter API key not set. LLM filter will be skipped.")
+    per_cat_cap = {str(c.get("id") or ""): int(c.get("posts_per_scout", 0) or 0) for c in categories}
 
-    per_cat_cap = {
-        str(c.get("id") or ""): int(c.get("posts_per_scout", 0))
-        for c in categories
+    LOG.info("Scout started: feeds=%d, entries_per_feed=%d, directus_url_dup=%dh, title_dup=%dh",
+             len(feeds), ENTRIES_PER_FEED, DIRECTUS_URL_DUP_HOURS, TITLE_DUP_HOURS)
+
+    # Phase 1: collect candidates (cheap)
+    candidates: List[Candidate] = []
+    seen_norm_urls = set()
+    seen_title_keys = set()
+
+    skipped = {
+        "parse_fail": 0,
+        "missing_title_or_link": 0,
+        "dup_in_run_url": 0,
+        "dup_in_run_title": 0,
     }
 
-    # ── Phase 1: Collect candidates (URL dedup only) ────────────────────
-    LOG.info("=" * 60)
-    LOG.info("PHASE 1: Collecting candidates from %d feeds...", len(feeds))
-
-    candidates = []
-    seen_urls = set()
-    skip_stats = {"no_title_link": 0, "url_mem": 0, "url_leads": 0, "url_articles": 0, "no_cap": 0}
-
     for feed_cfg in feeds:
-        url = feed_cfg["url"]
+        feed_url = feed_cfg.get("url") or ""
+        feed_name = (feed_cfg.get("name") or feed_cfg.get("title") or feed_url).strip() or "feed"
         try:
-            parsed = parse_feed(url)
-        except Exception as e:
-            LOG.warning("Failed to parse feed %s: %s", url, e)
+            parsed = parse_feed(feed_url)
+        except Exception:
+            skipped["parse_fail"] += 1
             continue
 
         entries = parsed.entries or []
-
-        for ent in entries[:30]:
+        for ent in entries[:ENTRIES_PER_FEED]:
             fields = extract_entry_fields(ent, feed_cfg)
-            title = fields.get("title") or ""
-            link = fields.get("link") or ""
-
+            title = (fields.get("title") or "").strip()
+            link = (fields.get("link") or "").strip()
             if not title or not link:
-                skip_stats["no_title_link"] += 1
+                skipped["missing_title_or_link"] += 1
                 continue
 
-            # ── URL dedup: in-memory (this run) ─────────────────────
-            norm_url = normalize_url(link)
-            if norm_url in seen_urls:
-                skip_stats["url_mem"] += 1
+            norm = normalize_url(link)
+            if norm in seen_norm_urls:
+                skipped["dup_in_run_url"] += 1
                 continue
 
-            # ── URL dedup: news_leads table (all time) ──────────────
-            if url_exists_in_leads(link):
-                skip_stats["url_leads"] += 1
-                seen_urls.add(norm_url)
+            tk = title_key(title)
+            if tk and tk in seen_title_keys:
+                skipped["dup_in_run_title"] += 1
+                seen_norm_urls.add(norm)
                 continue
 
-            # ── URL dedup: articles table (all time) ────────────────
-            if url_exists_in_articles(link):
-                skip_stats["url_articles"] += 1
-                seen_urls.add(norm_url)
-                continue
+            desc = (fields.get("description") or fields.get("content") or "").strip()
+            rss_cat = (fields.get("category") or "").strip()
 
-            # ── Category check ──────────────────────────────────────
-            cat_id, cat_name = resolve_category(fields, categories)
-            if per_cat_cap.get(cat_id, 0) <= 0:
-                skip_stats["no_cap"] += 1
-                continue
-
-            # ── Passed URL dedup → add to candidates ────────────────
-            candidates.append({
-                "title": title,
-                "link": link,
-                "norm_url": norm_url,
-                "cat_id": cat_id,
-                "cat_name": cat_name,
-            })
-            seen_urls.add(norm_url)
-
-    LOG.info(
-        "Phase 1 complete: %d candidates. Skipped — no_title_link: %d, "
-        "url_mem: %d, url_leads: %d, url_articles: %d, no_cap: %d",
-        len(candidates),
-        skip_stats["no_title_link"], skip_stats["url_mem"],
-        skip_stats["url_leads"], skip_stats["url_articles"],
-        skip_stats["no_cap"],
-    )
+            candidates.append(
+                Candidate(
+                    title=title,
+                    link=link,
+                    norm_url=norm,
+                    feed_name=feed_name,
+                    description=_cap(desc, 500),
+                    rss_category=rss_cat,
+                )
+            )
+            seen_norm_urls.add(norm)
+            if tk:
+                seen_title_keys.add(tk)
 
     if not candidates:
-        LOG.info("No new candidates found. Scout complete.")
-        LOG.info("=" * 60)
+        LOG.info("No candidates collected. Skipped: %s", skipped)
         return 0
 
-    # ── Phase 2: LLM semantic dedup + quality filter ────────────────────
-    LOG.info("PHASE 2: LLM semantic dedup + quality filter...")
+    LOG.info("Phase 1: collected=%d candidates. Skipped=%s", len(candidates), skipped)
 
-    existing_titles = get_recent_titles(hours=168)  # 7 days
-    filtered = llm_filter_leads(candidates, existing_titles, max_picks=GLOBAL_SCOUT_CAP)
+    # Phase 2: batched URL duplication check in Directus (7 days)
+    existing_norm_urls = fetch_existing_norm_urls(candidates, hours=DIRECTUS_URL_DUP_HOURS)
+    before = len(candidates)
+    candidates = [c for c in candidates if c.norm_url not in existing_norm_urls]
+    LOG.info("Phase 2: directus URL dedup removed=%d, remaining=%d", before - len(candidates), len(candidates))
 
-    LOG.info("Phase 2 complete: %d candidates after LLM filter.", len(filtered))
+    if not candidates:
+        LOG.info("No candidates left after Directus URL dedup.")
+        return 0
 
-    # ── Phase 3: Create leads with caps ─────────────────────────────────
-    LOG.info("PHASE 3: Creating leads and posting to Slack...")
+    # Limit LLM input size (avoid huge prompts) with a balanced per-feed sample
+    if len(candidates) > LLM_CANDIDATE_LIMIT:
+        per_feed = max(1, LLM_CANDIDATE_LIMIT // max(1, len(feeds)))
+        buckets: Dict[str, List[Candidate]] = {}
+        for c in candidates:
+            buckets.setdefault(c.feed_name, []).append(c)
 
-    picked_per_cat = {str(c.get("id") or ""): 0 for c in categories}
+        sampled: List[Candidate] = []
+        # First pass: take up to `per_feed` from each feed
+        for fname in sorted(buckets.keys()):
+            sampled.extend(buckets[fname][:per_feed])
+
+        # Second pass: fill remaining slots with the earliest remaining items overall
+        if len(sampled) < LLM_CANDIDATE_LIMIT:
+            remainder: List[Candidate] = []
+            for fname in sorted(buckets.keys()):
+                remainder.extend(buckets[fname][per_feed:])
+            sampled.extend(remainder[: max(0, LLM_CANDIDATE_LIMIT - len(sampled))])
+
+        candidates_for_llm = sampled[:LLM_CANDIDATE_LIMIT]
+        LOG.info("Trimming candidates for LLM ranking: %d → %d (per_feed=%d)", len(candidates), len(candidates_for_llm), per_feed)
+    else:
+        candidates_for_llm = candidates
+
+    # Phase 3: LLM ranking (semantic dedup + quality)
+    existing_titles = get_recent_titles(hours=TITLE_DUP_HOURS)
+    ranked_idx = llm_rank_candidates(
+        candidates_for_llm,
+        existing_titles,
+        max_return=min(LLM_RANK_RETURN_LIMIT, len(candidates_for_llm)),
+    )
+    ranked = [candidates_for_llm[i] for i in ranked_idx] if ranked_idx else candidates_for_llm
+    LOG.info("Phase 3: ranked=%d (from %d candidates sent to LLM)", len(ranked), len(candidates_for_llm))
+
+    # We will try to fill up to GLOBAL_SCOUT_CAP after category caps.
+    # To reduce dropped slots, categorize more than GLOBAL_SCOUT_CAP if available.
+    categorize_n = min(len(ranked), max(GLOBAL_SCOUT_CAP * 3, GLOBAL_SCOUT_CAP))
+    to_categorize = ranked[:categorize_n]
+
+    # Phase 4: Category mapping (batched)
+    cat_map = llm_map_categories(to_categorize, categories)
+
+    # Ensure per-category caps are applied and category id is valid
+    valid_cat_ids = {str(c.get("id") or "") for c in categories if c.get("id")}
+    default_cat_name = next((c.get("name") for c in categories if str(c.get("id") or "") == DEFAULT_CATEGORY_UUID), "General")
+
+    # Build id -> name map
+    cat_name_by_id = {str(c.get("id") or ""): (c.get("name") or "") for c in categories}
+
+    # Phase 5: Create leads + post Slack (apply caps)
+    picked_per_cat = {cid: 0 for cid in valid_cat_ids}
     created = 0
+    created_by_cat: Dict[str, int] = {}
 
-    for cand in filtered:
-        cat_id = cand["cat_id"]
-
-        # Per-category cap
-        if picked_per_cat.get(cat_id, 0) >= per_cat_cap.get(cat_id, 0):
-            LOG.debug("Category cap reached for %s. Skipping: %s", cand["cat_name"], cand["title"][:60])
-            continue
-
-        # Global cap
+    for i, cand in enumerate(ranked):
         if created >= GLOBAL_SCOUT_CAP:
-            LOG.info("Global cap (%d) reached. Stopping.", GLOBAL_SCOUT_CAP)
             break
 
-        # Create lead in Directus
-        try:
-            lead_id = create_lead(title=cand["title"], source_url=cand["link"], category_id=cat_id)
-        except Exception as e:
-            LOG.error("Failed to create lead: %s", e)
+        # category for this candidate (only for those we categorized; rest default)
+        cid = cat_map.get(i, DEFAULT_CATEGORY_UUID)
+        if cid not in valid_cat_ids:
+            cid = DEFAULT_CATEGORY_UUID
+
+        cap = int(per_cat_cap.get(cid, 0) or 0)
+        if cap <= 0:
+            # category not intended for scouting
+            continue
+        if picked_per_cat.get(cid, 0) >= cap:
             continue
 
-        # Post to Slack
+        # Create lead
         try:
-            slack_post_lead(title=cand["title"], category_name=cand["cat_name"], lead_id=lead_id)
-        except Exception as e:
-            LOG.error("Failed to post lead %s to Slack: %s", lead_id, e)
+            lead_id = create_lead(title=cand.title, source_url=cand.link, category_id=cid)
+        except Exception as exc:
+            LOG.error("Create lead failed: %s", exc)
+            continue
 
-        picked_per_cat[cat_id] = picked_per_cat.get(cat_id, 0) + 1
+        # Slack post
+        cat_name = cat_name_by_id.get(cid) or default_cat_name
+        try:
+            slack_post_lead(title=cand.title, category_name=cat_name, lead_id=lead_id)
+        except Exception as exc:
+            LOG.error("Slack post failed (lead_id=%s): %s", lead_id, exc)
+
+        picked_per_cat[cid] = picked_per_cat.get(cid, 0) + 1
+        created_by_cat[cid] = created_by_cat.get(cid, 0) + 1
         created += 1
 
-    LOG.info(
-        "Phase 3 complete. Created %d leads (from %d filtered, %d total candidates).",
-        created, len(filtered), len(candidates),
-    )
-    LOG.info("=" * 60)
+    # Summary
+    if created_by_cat:
+        summary_bits = []
+        for cid, cnt in sorted(created_by_cat.items(), key=lambda x: -x[1]):
+            summary_bits.append(f"{cat_name_by_id.get(cid, cid) or cid}: {cnt}")
+        per_cat_summary = "; ".join(summary_bits)
+    else:
+        per_cat_summary = "none"
+
+    LOG.info("Scout complete: created=%d (cap=%d). Per-category: %s", created, GLOBAL_SCOUT_CAP, per_cat_summary)
     return created
 
 
-def main():
+def main() -> None:
     setup_logging()
     try:
         scout_once()
-    except Exception as e:
-        LOG.exception("Scout failed: %s", e)
+    except Exception as exc:
+        LOG.exception("Scout failed: %s", exc)
         sys.exit(1)
 
 

@@ -17,7 +17,6 @@ from common import (
     get_setting,
     articles_collection,
     directus_get,
-    get_model_routes,
     request_with_retry,
     DEFAULT_CATEGORY_UUID,
     OPENROUTER_CHAT_URL,
@@ -27,8 +26,10 @@ from common import (
 # MODELS
 # ─────────────────────────────────────────────────────────────────────────────
 
-LLM_PRIMARY_MODEL  = "meta-llama/llama-3.3-70b-instruct:free"
-LLM_FALLBACK_MODEL = "google/gemma-3-27b-it:free"
+LLM_CATMATCH_MODEL = "meta-llama/llama-3.1-8b-instruct"
+LLM_CATMATCH_FALLBACK = "deepseek/deepseek-r1-distill-llama-70b"
+LLM_SCOUT_DUPLI_MODEL = "meta-llama/llama-4-scout"
+GLOBAL_SCOUT_CAP = 25
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,7 +171,7 @@ def llm_match_category(
         LOG.warning("LLM match skipped — article snippet is empty.")
         return None
 
-    for model in (LLM_PRIMARY_MODEL, LLM_FALLBACK_MODEL):
+    for model in (LLM_CATMATCH_MODEL, LLM_CATMATCH_FALLBACK):
         try:
             raw = _call_llm(article_snippet, category_list, model)
             LOG.debug("LLM [%s] raw response: %r", model, raw)
@@ -432,19 +433,13 @@ def llm_filter_leads(candidates: list, existing_titles: list, max_picks: int = 1
     Return ONLY comma-separated numbers from Section B. Example: 2,5,8,11,14
     Do not explain. Do not add any other text."""
 
-    FREE_MODEL = "meta-llama/llama-4-scout"
-
     try:
-        routes = get_model_routes()
-        scout_route = routes.get("scout_filter") or {}
-        model = scout_route.get("model") or FREE_MODEL
-
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
         payload = {
-            "model": model,
+            "model": LLM_SCOUT_DUPLI_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 200,
             "temperature": 0.1,
@@ -452,7 +447,7 @@ def llm_filter_leads(candidates: list, existing_titles: list, max_picks: int = 1
 
         LOG.info(
             "LLM filter: %d candidates, %d existing titles, model: %s",
-            len(candidates), len(existing_titles[:150]), model,
+            len(candidates), len(existing_titles[:150]), LLM_SCOUT_DUPLI_MODEL,
         )
 
         resp = request_with_retry(
@@ -496,8 +491,6 @@ def llm_filter_leads(candidates: list, existing_titles: list, max_picks: int = 1
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN SCOUT FUNCTION
 # ─────────────────────────────────────────────────────────────────────────────
-
-GLOBAL_SCOUT_CAP = 25
 
 
 def scout_once() -> int:

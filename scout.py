@@ -15,6 +15,7 @@ from common import (
     slack_post_lead,
     get_categories,
     get_setting,
+    articles_collection,
     request_with_retry,
     DEFAULT_CATEGORY_UUID,
     OPENROUTER_CHAT_URL,

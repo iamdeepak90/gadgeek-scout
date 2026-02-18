@@ -1,5 +1,6 @@
 import sys
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from common import (
@@ -21,13 +22,14 @@ from common import (
 # ─────────────────────────────────────────────────────────────────────────────
 # MODELS
 # ─────────────────────────────────────────────────────────────────────────────
-# Kept same as your original code to avoid bigger changes.
 LLM_PRIMARY_MODEL  = "meta-llama/llama-3.2-3b-instruct"
 LLM_FALLBACK_MODEL = "google/gemma-3-4b-it"
 
-# Batch size for category classification (hardcoded to keep config minimal)
+# Batch size for category classification
 _BATCH_SIZE = 20
 
+# Latest entries per feed
+ENTRIES_PER_FEED = 25
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LLM CATEGORY MATCHING (BATCHED)
@@ -153,14 +155,12 @@ def llm_match_categories_batch(
     snippets = [_build_article_snippet(f) for f in fields_list]
     articles_block = "\n\n".join(f"{i+1}. {snip}" for i, snip in enumerate(snippets))
 
-    last_exc: Optional[Exception] = None
     raw_out: Optional[str] = None
     for model in (LLM_PRIMARY_MODEL, LLM_FALLBACK_MODEL):
         try:
             raw_out = _call_llm_batch(articles_block, category_list, model)
             break
         except Exception as exc:
-            last_exc = exc
             LOG.warning("LLM batch [%s] failed: %s — trying next model.", model, exc)
 
     if raw_out is None:
@@ -194,7 +194,7 @@ def llm_match_categories_batch(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCOUT (MINIMAL CHANGES)
+# SCOUT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _process_batch(
@@ -204,19 +204,12 @@ def _process_batch(
     per_cat_cap: Dict[str, int],
     picked_per_cat: Dict[str, int],
 ) -> int:
-    """
-    Process one batch:
-    - Run LLM category match in one call
-    - If LLM returns no valid category => SKIP (requested)
-    - Apply category caps (existing behavior)
-    - Create lead + post to Slack
-    """
     matched_list = llm_match_categories_batch(fields_batch, categories)
     created = 0
 
     for (title, link), matched in zip(meta_batch, matched_list):
         if not matched:
-            continue  # ← skip if LLM didn't return a valid category
+            continue  # skip if LLM didn't return a valid category
 
         cat_id = str(matched.get("id") or "")
         cat_name = matched.get("name") or ""
@@ -244,8 +237,6 @@ def _process_batch(
 
 
 def scout_once() -> int:
-    init_db()
-
     feeds = [f for f in list_feeds() if f.get("enabled")]
     if not feeds:
         LOG.error("No RSS feeds configured. Go to /settings -> RSS Feeds.")
@@ -276,11 +267,10 @@ def scout_once() -> int:
 
         entries = parsed.entries or []
 
-        # Collect NOT-in-Directus items, then classify in batch
         pending_fields: List[Dict[str, str]] = []
         pending_meta: List[Tuple[str, str]] = []
 
-        for ent in entries[:50]:
+        for ent in entries[:ENTRIES_PER_FEED]:
             fields = extract_entry_fields(ent, feed_cfg)
             title  = (fields.get("title") or "").strip()
             link   = (fields.get("link") or "").strip()
@@ -288,7 +278,6 @@ def scout_once() -> int:
             if not title or not link:
                 continue
 
-            # Dedup FIRST (as requested)
             try:
                 if lead_exists_by_url(link):
                     continue
@@ -307,17 +296,37 @@ def scout_once() -> int:
         if pending_fields:
             created += _process_batch(pending_fields, pending_meta, categories, per_cat_cap, picked_per_cat)
 
-    LOG.info("Scout completed. Created %d leads.", created)
+    LOG.info("Scout run completed. Created %d leads.", created)
     return created
 
 
-def main():
-    setup_logging()
+def _parse_interval_minutes() -> int:
+    raw = get_setting("scout_interval_minutes", "60")
     try:
-        scout_once()
-    except Exception as e:
-        LOG.exception("Scout failed: %s", e)
-        sys.exit(1)
+        return int(float(raw or "60"))
+    except Exception:
+        return 20
+
+
+def _scout_loop() -> None:
+    interval_min = _parse_interval_minutes()
+    sleep_s = max(30, interval_min * 60)
+
+    LOG.info("Scout loop started. Will run every %s minutes.", interval_min)
+
+    while True:
+        try:
+            scout_once()
+        except Exception as e:
+            LOG.exception("Scout loop error: %s", e)
+
+        time.sleep(sleep_s)
+
+
+def main() -> None:
+    setup_logging()
+    init_db()
+    _scout_loop()
 
 
 if __name__ == "__main__":

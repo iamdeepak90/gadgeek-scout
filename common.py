@@ -21,7 +21,7 @@ from config import REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSW
 LOG = logging.getLogger("technews")
 
 # Default fallback category UUID when no keyword match is found.
-DEFAULT_CATEGORY_UUID = "3229ec20-3076-4a32-9fa2-88b65dacfedf"
+DEFAULT_CATEGORY_UUID = "672a1355-5d73-447f-aed3-f21895db9818"
 
 # Static configuration constants
 HTTP_TIMEOUT = 60  # seconds

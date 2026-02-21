@@ -18,6 +18,7 @@ from common import (
     set_model_route,
     verify_slack_signature,
     update_lead_status,
+    update_lead_category,
     slack_ephemeral,
     delete_slack_message,
     get_lead,
@@ -313,6 +314,21 @@ def _urgent_worker_loop() -> None:
         except Exception:
             LOG.exception("Urgent worker loop error")
 
+def _extract_selected_category(payload: Dict[str, Any]) -> str:
+    """Extract the selected category UUID from Slack's block state.
+
+    When a user clicks Approve/Urgent, Slack sends the current state of all
+    interactive elements in the message inside payload.state.values.
+    The category dropdown lives in block_id="category_select_block",
+    action_id="select_category".
+    """
+    state_values = (payload.get("state") or {}).get("values") or {}
+    cat_block = state_values.get("category_select_block") or {}
+    cat_action = cat_block.get("select_category") or {}
+    selected = cat_action.get("selected_option") or {}
+    return (selected.get("value") or "").strip()
+
+
 @app.post("/slack/interactions")
 def slack_interactions():
     raw = request.get_data() or b""
@@ -330,15 +346,25 @@ def slack_interactions():
             return jsonify({"ok": True})
         action = actions[0]
         action_id = action.get("action_id")
-        lead_id = str(action.get("value") or "").strip()
         response_url = payload.get("response_url") or ""
 
         channel_id = (payload.get("channel") or {}).get("id") or ""
         message_ts = (payload.get("message") or {}).get("ts") or ""
         title = ((payload.get("message") or {}).get("text") or "").strip()
 
+        # When the user picks a category from the dropdown, Slack fires
+        # an action with action_id="select_category". Just acknowledge it —
+        # the actual value is read from state when Approve/Urgent is clicked.
+        if action_id == "select_category":
+            return jsonify({"ok": True})
+
+        # For button actions, lead_id is in the button value
+        lead_id = str(action.get("value") or "").strip()
         if not lead_id:
             return jsonify({"ok": True})
+
+        # Extract selected category from the dropdown state
+        selected_category_id = _extract_selected_category(payload)
 
         try:
             lead = get_lead(lead_id)
@@ -346,14 +372,21 @@ def slack_interactions():
             real_title = (lead.get("title") or title or lead_id).strip()
 
             if action_id == "approve":
+                # Require category selection for approve
+                if not selected_category_id:
+                    if response_url:
+                        slack_ephemeral(response_url, "⚠️ Please select a category first, then click Approve.")
+                    return jsonify({"ok": True})
+
+                update_lead_category(lead_id, selected_category_id)
                 update_lead_status(lead_id, "approved")
-                # optional ephemeral ack
                 if response_url:
                     slack_ephemeral(response_url, f"✅ Approved: *{real_title}*")
                 delete_slack_message(channel_id, message_ts)
                 return jsonify({"ok": True})
 
             if action_id == "reject":
+                # No category needed for reject
                 update_lead_status(lead_id, "rejected")
                 if response_url:
                     slack_ephemeral(response_url, f"❌ Rejected: *{real_title}*")
@@ -361,19 +394,24 @@ def slack_interactions():
                 return jsonify({"ok": True})
 
             if action_id == "urgent":
-                # Queue urgent publish (Option B): publish sequentially in background worker
+                # Require category selection for urgent
+                if not selected_category_id:
+                    if response_url:
+                        slack_ephemeral(response_url, "⚠️ Please select a category first, then click Urgent.")
+                    return jsonify({"ok": True})
+
                 if status == "processed":
                     if response_url:
                         slack_ephemeral(response_url, f"ℹ️ Already published: *{real_title}*")
                     return jsonify({"ok": True})
 
+                update_lead_category(lead_id, selected_category_id)
                 update_lead_status(lead_id, "approved_high")
                 slack_ctx = {"channel": channel_id, "ts": message_ts, "title": real_title}
                 _enqueue_urgent(lead_id, slack_ctx=slack_ctx, response_url=response_url)
                 _start_urgent_worker()
                 if response_url:
                     slack_ephemeral(response_url, f"🚀 Urgent queued: *{real_title}*")
-
                 delete_slack_message(channel_id, message_ts)
                 return jsonify({"ok": True})
 

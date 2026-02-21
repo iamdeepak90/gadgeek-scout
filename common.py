@@ -557,6 +557,11 @@ def update_lead_status(lead_id: str, status: str) -> None:
     col = leads_collection()
     directus_patch(f"/items/{col}/{lead_id}", {"status": status})
 
+def update_lead_category(lead_id: str, category_id: str) -> None:
+    """Update the category of a lead in Directus."""
+    col = leads_collection()
+    directus_patch(f"/items/{col}/{lead_id}", {"category": category_id})
+
 def list_one_approved_lead_newest(status: str = "approved") -> Optional[Dict[str, Any]]:
     """Fetch one lead (newest) for a given status.
 
@@ -600,24 +605,65 @@ def verify_slack_signature(headers: Dict[str, str], body: bytes) -> bool:
     expected = "v0=" + hmac.new(secret.encode(), base.encode(), hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig, expected)
 
-def slack_post_lead(title: str, category_name: str, lead_id: str) -> Dict[str, Any]:
+def slack_post_lead(title: str, source_url: str, lead_id: str, categories: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Post a new lead to Slack with a category dropdown and action buttons.
+
+    The category dropdown lets the user pick the correct category before approving.
+    """
     token = slack_token()
     channel = slack_channel()
     if not token or not channel:
         raise RuntimeError("Slack bot token or channel ID not configured")
-    
+
+    # Build category dropdown options from Directus categories
+    cat_options = []
+    if categories:
+        for c in categories:
+            cat_name = (c.get("name") or "").strip()
+            cat_id = str(c.get("id") or "").strip()
+            if cat_name and cat_id:
+                cat_options.append({
+                    "text": {"type": "plain_text", "text": cat_name[:75]},
+                    "value": cat_id,
+                })
+
     blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*\n_{category_name}_"}},
+        # Title + source URL
         {
-            "type": "actions",
-            "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": "✅ Approve"}, "style": "primary", "action_id": "approve", "value": str(lead_id)},
-                {"type": "button", "text": {"type": "plain_text", "text": "🚀 Urgent"}, "style": "danger", "action_id": "urgent", "value": str(lead_id)},
-                {"type": "button", "text": {"type": "plain_text", "text": "❌ Reject"}, "action_id": "reject", "value": str(lead_id)},
-            ],
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*{title}*\n<{source_url}|{source_url[:60]}>" if source_url else f"*{title}*",
+            },
         },
     ]
-    
+
+    # Category dropdown (only if we have categories)
+    if cat_options:
+        blocks.append({
+            "type": "actions",
+            "block_id": "category_select_block",
+            "elements": [
+                {
+                    "type": "static_select",
+                    "action_id": "select_category",
+                    "placeholder": {"type": "plain_text", "text": "Choose category..."},
+                    "options": cat_options,
+                },
+            ],
+        })
+
+    # Action buttons — lead_id is stored in button values
+    blocks.append({
+        "type": "actions",
+        "block_id": "lead_actions_block",
+        "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "✅ Approve"}, "style": "primary", "action_id": "approve", "value": str(lead_id)},
+            {"type": "button", "text": {"type": "plain_text", "text": "🚀 Urgent"}, "style": "danger", "action_id": "urgent", "value": str(lead_id)},
+            {"type": "button", "text": {"type": "plain_text", "text": "❌ Reject"}, "action_id": "reject", "value": str(lead_id)},
+        ],
+    })
+
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {"channel": channel, "text": title, "blocks": blocks}
     resp = request_with_retry("POST", "https://slack.com/api/chat.postMessage", headers=headers, json_body=payload)
@@ -625,6 +671,19 @@ def slack_post_lead(title: str, category_name: str, lead_id: str) -> Dict[str, A
     if not data.get("ok"):
         raise RuntimeError(f"Slack post failed: {data.get('error')}")
     return data
+
+def slack_update_published(channel: str, ts: str, title: str) -> None:
+    token = slack_token()
+    if not token:
+        return
+    
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"✅ *Published:* {title}"}},
+    ]
+    
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {"channel": channel, "ts": ts, "text": f"Published: {title}", "blocks": blocks}
+    request_with_retry("POST", "https://slack.com/api/chat.update", headers=headers, json_body=payload)
 
 def slack_update_published(channel: str, ts: str, title: str) -> None:
     token = slack_token()

@@ -633,7 +633,7 @@ def slack_post_lead(title: str, source_url: str, lead_id: str, categories: Optio
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*{title}*\n<{source_url}|{source_url[:60]}>" if source_url else f"*{title}*",
+                "text": f"*{title}*\n{source_url[:65]}" if source_url else f"*{title}*",
             },
         },
     ]

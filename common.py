@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urlparse
@@ -1659,8 +1660,9 @@ def publish_article_to_directus(article: Dict[str, Any], category_id: str) -> Di
     col = articles_collection()
     payload = dict(article)
     payload["category"] = category_id
+    payload["author"] = random.choice([1, 2, 3])
     
-    required = {"title", "slug", "status", "category", "content"}
+    required = {"title", "slug", "status", "category", "content", "author"}
     clean = {}
     for k, v in payload.items():
         if k in required:

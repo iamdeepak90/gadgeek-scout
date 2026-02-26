@@ -1660,7 +1660,7 @@ def publish_article_to_directus(article: Dict[str, Any], category_id: str) -> Di
     col = articles_collection()
     payload = dict(article)
     payload["category"] = category_id
-    payload["author"] = random.choice([1, 2, 3])
+    payload["author"] = random.choice([1, 2, 3, 4])
     
     required = {"title", "slug", "status", "category", "content", "author"}
     clean = {}

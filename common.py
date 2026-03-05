@@ -101,7 +101,8 @@ DEFAULT_MODEL_ROUTES = {
 }
 
 def _now_iso() -> str:
-    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    ist = _dt.datetime.utcnow() + _dt.timedelta(hours=5, minutes=30)
+    return ist.replace(microsecond=0).isoformat()
 
 def init_db() -> None:
     """Initialize Redis with default settings and model routes"""

@@ -1473,6 +1473,7 @@ def inject_interlinks(html: str, related: List[Dict[str, str]]) -> str:
         for article in related:
             phrase = (article.get("matched_phrase") or "").strip()
             url = (article.get("url") or "").strip()
+            LOG.info("interlink attempt: phrase='%s' url='%s' found_in_html=%s", phrase, url, bool(re.search(re.escape(phrase), result, re.IGNORECASE)))
             title = (article.get("title") or "").strip()
 
             if not phrase or not url:
@@ -1780,8 +1781,10 @@ def create_article_from_lead(
         # ── Step 4b: Interlinking ─────────────────────────────────────────────────
     try:
         _keywords = _extract_keywords_spacy(human_html, max_phrases=12)
+        LOG.info("interlink keywords: %s", _keywords)
         if _keywords:
             _related = find_related_articles(_keywords, exclude_title=title, max_results=6)
+            LOG.info("interlink related found: %d — %s", len(_related), [r['title'] for r in _related])
             if _related:
                 human_html = inject_interlinks(human_html, _related)
                 LOG.info("interlink: injected %d interlinks.", len(_related))

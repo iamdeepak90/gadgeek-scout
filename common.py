@@ -1321,36 +1321,82 @@ def _resolve_article_title(seo: dict, raw_title: str) -> str:
 
 
 
-def _rake_extract_keywords(text: str, max_phrases: int = 6) -> List[str]:
-    """Extract key phrases from text using RAKE (no API, no LLM)."""
+def _extract_keywords_spacy(text: str, max_phrases: int = 12) -> List[str]:
+    """Extract named entities from article HTML using spaCy NER.
+
+    Targets PRODUCT, ORG, WORK_OF_ART entities — ideal for tech news.
+    Falls back to regex capitalized phrase extraction if spaCy unavailable.
+    """
+    # Strip HTML tags
     clean = re.sub(r"<[^>]+>", " ", text)
     clean = re.sub(r"\s+", " ", clean).strip()
 
-    try:
-        from rake_nltk import Rake
-        import nltk
-        for resource in ("stopwords", "punkt_tab"):
-            try:
-                nltk.data.find(f"corpora/{resource}" if resource == "stopwords" else f"tokenizers/{resource}")
-            except LookupError:
-                nltk.download(resource, quiet=True)
+    USEFUL_LABELS = {"PRODUCT", "ORG", "WORK_OF_ART"}
+    # Generic words that are useless as search terms
+    SKIP_TOKENS = {
+        "india", "us", "usa", "uk", "global", "android", "ios",
+        "google", "internet", "online", "app", "apps", "update",
+    }
 
-        r = Rake(min_length=2, max_length=4)
-        r.extract_keywords_from_text(clean[:3000])
-        phrases = [p for p in r.get_ranked_phrases() if len(p) > 5 and len(p.split()) >= 2]
-        return phrases[:max_phrases]
-    except Exception as e:
-        LOG.warning("RAKE extraction failed: %s", e)
-        # Fallback: capitalized bigrams
-        words = re.findall(r"\b[A-Z][a-zA-Z0-9]+\b", clean[:500])
-        bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words) - 1)]
+    def _score(ent_text: str, label: str) -> int:
+        s = 0
+        if label == "PRODUCT":     s += 30
+        if label == "ORG":         s += 20
+        if label == "WORK_OF_ART": s += 15
+        if re.search(r'\d', ent_text): s += 20   # model numbers = more specific
+        s += len(ent_text.split()) * 5            # longer phrase = more specific
+        return s
+
+    try:
+        import spacy
+        # Load model — downloaded once via requirements, cached automatically
+        try:
+            nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            LOG.warning("spaCy model en_core_web_sm not found. Run: python -m spacy download en_core_web_sm")
+            raise
+
+        doc = nlp(clean[:5000])  # cap for speed
+
         seen: set = set()
-        unique = []
-        for b in bigrams:
-            if b not in seen:
-                seen.add(b)
-                unique.append(b)
-        return unique[:max_phrases]
+        scored: List[tuple] = []
+
+        for ent in doc.ents:
+            label = ent.label_
+            ent_text = ent.text.strip()
+
+            if label not in USEFUL_LABELS:
+                continue
+            if ent_text.lower() in SKIP_TOKENS:
+                continue
+            if len(ent_text) < 3:
+                continue
+
+            key = ent_text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            scored.append((_score(ent_text, label), ent_text))
+
+        scored.sort(reverse=True)
+        return [phrase for _, phrase in scored[:max_phrases]]
+
+    except ImportError:
+        LOG.warning("spaCy not installed — falling back to regex extraction.")
+    except Exception as e:
+        LOG.warning("spaCy extraction failed: %s — falling back.", e)
+
+    # Fallback: regex-based capitalized phrase extraction
+    pattern = r'\b[A-Z][a-zA-Z0-9]*(?:\s(?:[A-Z][a-zA-Z0-9]*|\d+(?:\.\d+)?))+\b'
+    matches = re.findall(pattern, clean[:3000])
+    seen_fb: set = set()
+    unique = []
+    for m in matches:
+        key = m.lower()
+        if key not in seen_fb and len(m) > 4:
+            seen_fb.add(key)
+            unique.append(m)
+    return unique[:max_phrases]
 
 
 def find_related_articles(
@@ -1381,7 +1427,7 @@ def find_related_articles(
                 "search": phrase,
                 "filter[status][_eq]": "published",
                 "fields": "id,title,slug,category.slug",
-                "limit": "4",
+                "limit": "6",
             })
             data = directus_get(f"/items/{col}?{params}")
             items = data.get("data") or []
@@ -1733,9 +1779,9 @@ def create_article_from_lead(
 
         # ── Step 4b: Interlinking ─────────────────────────────────────────────────
     try:
-        _keywords = _rake_extract_keywords(human_html, max_phrases=6)
+        _keywords = _extract_keywords_spacy(human_html, max_phrases=12)
         if _keywords:
-            _related = find_related_articles(_keywords, exclude_title=title, max_results=5)
+            _related = find_related_articles(_keywords, exclude_title=title, max_results=6)
             if _related:
                 human_html = inject_interlinks(human_html, _related)
                 LOG.info("interlink: injected %d interlinks.", len(_related))

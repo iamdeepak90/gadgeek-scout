@@ -1320,6 +1320,135 @@ def _resolve_article_title(seo: dict, raw_title: str) -> str:
     return candidate if len(candidate) >= 10 else raw_title
 
 
+
+def _rake_extract_keywords(text: str, max_phrases: int = 6) -> List[str]:
+    """Extract key phrases from text using RAKE (no API, no LLM)."""
+    clean = re.sub(r"<[^>]+>", " ", text)
+    clean = re.sub(r"\s+", " ", clean).strip()
+
+    try:
+        from rake_nltk import Rake
+        import nltk
+        for resource in ("stopwords", "punkt_tab"):
+            try:
+                nltk.data.find(f"corpora/{resource}" if resource == "stopwords" else f"tokenizers/{resource}")
+            except LookupError:
+                nltk.download(resource, quiet=True)
+
+        r = Rake(min_length=2, max_length=4)
+        r.extract_keywords_from_text(clean[:3000])
+        phrases = [p for p in r.get_ranked_phrases() if len(p) > 5 and len(p.split()) >= 2]
+        return phrases[:max_phrases]
+    except Exception as e:
+        LOG.warning("RAKE extraction failed: %s", e)
+        # Fallback: capitalized bigrams
+        words = re.findall(r"\b[A-Z][a-zA-Z0-9]+\b", clean[:500])
+        bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words) - 1)]
+        seen: set = set()
+        unique = []
+        for b in bigrams:
+            if b not in seen:
+                seen.add(b)
+                unique.append(b)
+        return unique[:max_phrases]
+
+
+def find_related_articles(
+    keywords: List[str],
+    exclude_title: str = "",
+    max_results: int = 5,
+) -> List[Dict[str, str]]:
+    """Query Directus Postgres FTS for published articles matching keywords."""
+    col = articles_collection()
+
+    if not directus_url() or not directus_token():
+        LOG.warning("interlink: Directus not configured, skipping.")
+        return []
+
+    seen_ids: set = set()
+    results: List[Dict[str, str]] = []
+
+    for phrase in keywords:
+        if len(results) >= max_results:
+            break
+
+        phrase = phrase.strip()
+        if not phrase:
+            continue
+
+        try:
+            params = urlencode({
+                "search": phrase,
+                "filter[status][_eq]": "published",
+                "fields": "id,title,slug,category.slug",
+                "limit": "4",
+            })
+            data = directus_get(f"/items/{col}?{params}")
+            items = data.get("data") or []
+        except Exception as e:
+            LOG.warning("interlink: search failed for '%s': %s", phrase, e)
+            continue
+
+        for item in items:
+            item_id = str(item.get("id") or "")
+            item_title = (item.get("title") or "").strip()
+            item_slug = (item.get("slug") or "").strip()
+            cat = item.get("category") or {}
+            category_slug = (cat.get("slug") if isinstance(cat, dict) else "").strip()
+
+            if item_id in seen_ids:
+                continue
+            if exclude_title and item_title.lower() == exclude_title.lower():
+                continue
+            if not item_slug or not category_slug:
+                continue
+
+            seen_ids.add(item_id)
+            results.append({
+                "title": item_title,
+                "url": f"/{category_slug}/{item_slug}",
+                "matched_phrase": phrase,
+            })
+
+            if len(results) >= max_results:
+                break
+
+    LOG.info("interlink: found %d related articles.", len(results))
+    return results
+
+
+def inject_interlinks(html: str, related: List[Dict[str, str]]) -> str:
+    """Inject <a> tags into article HTML. First occurrence only, never inside existing <a>."""
+    if not related or not html:
+        return html
+
+    try:
+        result = html
+        for article in related:
+            phrase = (article.get("matched_phrase") or "").strip()
+            url = (article.get("url") or "").strip()
+            title = (article.get("title") or "").strip()
+
+            if not phrase or not url:
+                continue
+
+            # Skip if phrase already linked
+            if re.search(rf'<a[^>]*>[^<]*{re.escape(phrase)}[^<]*</a>', result, re.IGNORECASE):
+                continue
+
+            result = re.sub(
+                re.escape(phrase),
+                lambda m: f'<a href="{url}" target="_blank" title="{title}">{m.group(0)}</a>',
+                result,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+
+        return result
+    except Exception as e:
+        LOG.warning("inject_interlinks failed: %s — returning original HTML.", e)
+        return html
+
 # ---------------------------------------------------------------------------
 # HUMANIZE PROMPT
 # This is the most critical prompt for passing AI-detection tools.
@@ -1601,6 +1730,17 @@ def create_article_from_lead(
             draft_words,
         )
         human_html = draft_html
+
+        # ── Step 4b: Interlinking ─────────────────────────────────────────────────
+    try:
+        _keywords = _rake_extract_keywords(human_html, max_phrases=6)
+        if _keywords:
+            _related = find_related_articles(_keywords, exclude_title=title, max_results=5)
+            if _related:
+                human_html = inject_interlinks(human_html, _related)
+                LOG.info("interlink: injected %d interlinks.", len(_related))
+    except Exception as _ilink_err:
+        LOG.warning("interlink: failed (non-fatal): %s", _ilink_err)
 
     # ── Step 5: SEO metadata + article title ─────────────────────────────────
     seo_out = chat_stage("seo", seo_prompt(title, category_name, human_html))

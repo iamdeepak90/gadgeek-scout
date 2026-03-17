@@ -1423,7 +1423,7 @@ def find_related_articles(
             break
 
         phrase = phrase.strip()
-        if not phrase or len(phrase) < 4:
+        if not phrase or len(phrase.split()) < 2:
             continue
 
         # Skip generic/short anchors that will match too broadly

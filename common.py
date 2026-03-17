@@ -1402,7 +1402,7 @@ def _extract_keywords_spacy(text: str, max_phrases: int = 12) -> List[str]:
 def find_related_articles(
     keywords: List[str],
     exclude_title: str = "",
-    max_results: int = 5,
+    max_results: int = 6,
 ) -> List[Dict[str, str]]:
     """Query Directus Postgres FTS for published articles matching keywords."""
     col = articles_collection()
@@ -1449,11 +1449,19 @@ def find_related_articles(
             if not item_slug or not category_slug:
                 continue
 
+            # Derive anchor text from the MATCHED ARTICLE'S TITLE
+            # Pick the longest word (2+ chars) from the title that
+            # also appears in the current article body (the search phrase context).
+            # This ensures each article gets a unique, meaningful anchor.
+            anchor = _pick_anchor_from_title(item_title, phrase)
+            if not anchor:
+                continue
+
             seen_ids.add(item_id)
             results.append({
                 "title": item_title,
                 "url": f"/{category_slug}/{item_slug}",
-                "matched_phrase": phrase,
+                "matched_phrase": anchor,
             })
 
             if len(results) >= max_results:
@@ -1461,6 +1469,40 @@ def find_related_articles(
 
     LOG.info("interlink: found %d related articles.", len(results))
     return results
+
+
+def _pick_anchor_from_title(article_title: str, search_phrase: str) -> str:
+    """Pick the best anchor text from the matched article's title.
+
+    Strategy: find the longest meaningful word/phrase from the article title
+    that is likely to appear in the current article's body text.
+    Prefers multi-word sequences, avoids stopwords.
+    """
+    STOPWORDS = {
+        "a", "an", "the", "and", "or", "but", "in", "on", "at", "to",
+        "for", "of", "with", "is", "it", "its", "be", "are", "was",
+        "were", "has", "have", "by", "as", "from", "this", "that",
+        "how", "why", "what", "best", "new", "top", "vs", "review",
+        "confirmed", "launches", "launching", "unveiled", "announced",
+        "rumors", "leaked", "leaks", "ahead", "soon", "next", "gen",
+    }
+
+    words = [w.strip(",:;\"'()[]") for w in article_title.split()]
+    words = [w for w in words if w.lower() not in STOPWORDS and len(w) > 2]
+
+    if not words:
+        return ""
+
+    # Try to find a 2-3 word sequence from title that overlaps with search phrase
+    search_lower = search_phrase.lower()
+    for size in (3, 2):
+        for i in range(len(words) - size + 1):
+            chunk = " ".join(words[i:i + size])
+            if any(w.lower() in search_lower for w in words[i:i + size]):
+                return chunk
+
+    # Fallback: return the single longest meaningful word from the title
+    return max(words, key=len)
 
 
 def inject_interlinks(html: str, related: List[Dict[str, str]]) -> str:

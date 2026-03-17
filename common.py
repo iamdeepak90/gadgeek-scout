@@ -1404,7 +1404,10 @@ def find_related_articles(
     exclude_title: str = "",
     max_results: int = 6,
 ) -> List[Dict[str, str]]:
-    """Query Directus Postgres FTS for published articles matching keywords."""
+    """Query Directus Postgres FTS for published articles matching keywords.
+
+    One article per keyword maximum — ensures unique anchor text per link.
+    """
     col = articles_collection()
 
     if not directus_url() or not directus_token():
@@ -1412,6 +1415,7 @@ def find_related_articles(
         return []
 
     seen_ids: set = set()
+    seen_phrases: set = set()
     results: List[Dict[str, str]] = []
 
     for phrase in keywords:
@@ -1419,7 +1423,20 @@ def find_related_articles(
             break
 
         phrase = phrase.strip()
-        if not phrase:
+        if not phrase or len(phrase) < 4:
+            continue
+
+        # Skip generic/short anchors that will match too broadly
+        if phrase.lower() in {"ram", "lcd", "5g", "4g", "ai", "os", "pc", "tv"}:
+            continue
+
+        # Skip if we already have a result with an overlapping phrase
+        phrase_lower = phrase.lower()
+        overlap = any(
+            phrase_lower in s or s in phrase_lower
+            for s in seen_phrases
+        )
+        if overlap:
             continue
 
         try:
@@ -1427,7 +1444,7 @@ def find_related_articles(
                 "search": phrase,
                 "filter[status][_eq]": "published",
                 "fields": "id,title,slug,category.slug",
-                "limit": "6",
+                "limit": "3",
             })
             data = directus_get(f"/items/{col}?{params}")
             items = data.get("data") or []
@@ -1449,60 +1466,17 @@ def find_related_articles(
             if not item_slug or not category_slug:
                 continue
 
-            # Derive anchor text from the MATCHED ARTICLE'S TITLE
-            # Pick the longest word (2+ chars) from the title that
-            # also appears in the current article body (the search phrase context).
-            # This ensures each article gets a unique, meaningful anchor.
-            anchor = _pick_anchor_from_title(item_title, phrase)
-            if not anchor:
-                continue
-
             seen_ids.add(item_id)
+            seen_phrases.add(phrase_lower)
             results.append({
                 "title": item_title,
                 "url": f"/{category_slug}/{item_slug}",
-                "matched_phrase": anchor,
+                "matched_phrase": phrase,  # use the keyword as anchor — guaranteed in body
             })
-
-            if len(results) >= max_results:
-                break
+            break  # one article per keyword only
 
     LOG.info("interlink: found %d related articles.", len(results))
     return results
-
-
-def _pick_anchor_from_title(article_title: str, search_phrase: str) -> str:
-    """Pick the best anchor text from the matched article's title.
-
-    Strategy: find the longest meaningful word/phrase from the article title
-    that is likely to appear in the current article's body text.
-    Prefers multi-word sequences, avoids stopwords.
-    """
-    STOPWORDS = {
-        "a", "an", "the", "and", "or", "but", "in", "on", "at", "to",
-        "for", "of", "with", "is", "it", "its", "be", "are", "was",
-        "were", "has", "have", "by", "as", "from", "this", "that",
-        "how", "why", "what", "best", "new", "top", "vs", "review",
-        "confirmed", "launches", "launching", "unveiled", "announced",
-        "rumors", "leaked", "leaks", "ahead", "soon", "next", "gen",
-    }
-
-    words = [w.strip(",:;\"'()[]") for w in article_title.split()]
-    words = [w for w in words if w.lower() not in STOPWORDS and len(w) > 2]
-
-    if not words:
-        return ""
-
-    # Try to find a 2-3 word sequence from title that overlaps with search phrase
-    search_lower = search_phrase.lower()
-    for size in (3, 2):
-        for i in range(len(words) - size + 1):
-            chunk = " ".join(words[i:i + size])
-            if any(w.lower() in search_lower for w in words[i:i + size]):
-                return chunk
-
-    # Fallback: return the single longest meaningful word from the title
-    return max(words, key=len)
 
 
 def inject_interlinks(html: str, related: List[Dict[str, str]]) -> str:
@@ -1512,28 +1486,47 @@ def inject_interlinks(html: str, related: List[Dict[str, str]]) -> str:
 
     try:
         result = html
+        injected = 0
+
         for article in related:
             phrase = (article.get("matched_phrase") or "").strip()
             url = (article.get("url") or "").strip()
-            LOG.info("interlink attempt: phrase='%s' url='%s' found_in_html=%s", phrase, url, bool(re.search(re.escape(phrase), result, re.IGNORECASE)))
             title = (article.get("title") or "").strip()
 
             if not phrase or not url:
                 continue
 
-            # Skip if phrase already linked
-            if re.search(rf'<a[^>]*>[^<]*{re.escape(phrase)}[^<]*</a>', result, re.IGNORECASE):
+            escaped = re.escape(phrase)
+            pattern = rf'\b{escaped}\b'
+
+            # Skip if phrase not found in HTML
+            if not re.search(pattern, result, re.IGNORECASE):
+                LOG.debug("interlink: '%s' not found in HTML, skipping.", phrase)
                 continue
 
-            result = re.sub(
-                re.escape(phrase),
-                lambda m: f'<a href="{url}" target="_blank" title="{title}">{m.group(0)}</a>',
+            # Skip if already inside an <a> tag
+            if re.search(rf'<a[^>]*>[^<]*{escaped}[^<]*</a>', result, re.IGNORECASE):
+                LOG.debug("interlink: '%s' already linked, skipping.", phrase)
+                continue
+
+            # u= and t= in lambda signature fixes the closure bug where all
+            # lambdas would capture the last loop value of url/title
+            new_result = re.sub(
+                pattern,
+                lambda m, u=url, t=title: f'<a href="{u}" target="_blank" title="{t}">{m.group(0)}</a>',
                 result,
                 count=1,
                 flags=re.IGNORECASE,
             )
 
+            if new_result != result:
+                result = new_result
+                injected += 1
+                LOG.info("interlink: linked '%s' → %s", phrase, url)
+
+        LOG.info("interlink: successfully injected %d out of %d.", injected, len(related))
         return result
+
     except Exception as e:
         LOG.warning("inject_interlinks failed: %s — returning original HTML.", e)
         return html

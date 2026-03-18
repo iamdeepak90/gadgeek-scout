@@ -1333,10 +1333,13 @@ def _extract_keywords_llm(text: str) -> List[str]:
 
     try:
         prompt = (
-            "Read this article and give me 10 phrases (2-4 words each) that exist "
-            "verbatim in the text and would make good search queries to find related "
-            "tech articles. Return only a JSON array, nothing else.\n\n"
-            f"{clean[:5000]}"
+            "Read this article and give me 10 search phrases (2-4 words each) that:\n"
+            "1. Exist verbatim in the article text\n"
+            "2. Are brand names or product names only (e.g. 'Samsung Galaxy S25', 'Snapdragon 8 Elite')\n"
+            "3. Avoid specs like screen sizes, battery capacity, megapixels, or prices\n"
+            "4. Would likely match titles of other tech articles\n"
+            "Return only a JSON array, nothing else.\n\n"
+            f"{clean[:6000]}"
         )
         headers = {
             "Authorization": f"Bearer {openrouter_key}",
@@ -1347,8 +1350,8 @@ def _extract_keywords_llm(text: str) -> List[str]:
         payload = {
             "model": "meta-llama/llama-3.1-8b-instruct",
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 2000,
-            "temperature": 0.3,
+            "max_tokens": 2500,
+            "temperature": 0.25,
         }
         resp = request_with_retry(
             "POST", OPENROUTER_CHAT_URL,

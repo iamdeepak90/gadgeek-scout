@@ -1321,133 +1321,63 @@ def _resolve_article_title(seo: dict, raw_title: str) -> str:
 
 
 
-def _extract_keywords_spacy(text: str, max_phrases: int = 12) -> List[str]:
-    """Extract search keywords from article HTML using OpenRouter LLM.
-
-    Uses google/gemini-flash-lite (cheapest reliable model ~$0.25/1M tokens).
-    Falls back to spaCy NER if OpenRouter key not configured or call fails.
-    """
-    # Strip HTML tags
+def _extract_keywords_llm(text: str) -> List[str]:
+    """Extract verbatim keywords from article using OpenRouter LLM."""
     clean = re.sub(r"<[^>]+>", " ", text)
     clean = re.sub(r"\s+", " ", clean).strip()
 
-    # ── OpenRouter LLM extraction (primary) ──────────────────────────────────
     openrouter_key = get_setting("openrouter_api_key")
-    if openrouter_key:
-        try:
-            prompt = (
-                "Extract 10 to 15 specific multi-word search keywords from this tech article. "
-                "Focus on: product names, model numbers, brand+model combos, tech features. "
-                "Rules:\n"
-                "- Each keyword must be 2 to 4 words minimum\n"
-                "- No single words\n"
-                "- No generic phrases like 'new features', 'latest update', 'best performance'\n"
-                "- Prefer specific terms like 'Samsung Galaxy S25', 'MediaTek Dimensity 7050', 'AMOLED display'\n"
-                "- Output ONLY a JSON array of strings, nothing else\n"
-                "Example: [\"Samsung Galaxy S25\", \"MediaTek Dimensity 7050\", \"120Hz AMOLED\"]\n\n"
-                f"Article:\n{clean[:3000]}"
-            )
-
-            headers = {
-                "Authorization": f"Bearer {openrouter_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://bot.gadgeek.in",
-                "X-Title": "Gadgeek Tech News",
-            }
-            payload = {
-                "model": "google/gemini-flash-lite-2.5",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 300,
-                "temperature": 0.1,
-            }
-            resp = request_with_retry(
-                "POST", OPENROUTER_CHAT_URL,
-                headers=headers, json_body=payload,
-                timeout=30, max_attempts=2,
-            )
-            data = resp.json()
-            content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-            content = content.strip()
-
-            # Parse JSON array from response
-            match = re.search(r'\[.*?\]', content, re.DOTALL)
-            if match:
-                keywords = json.loads(match.group(0))
-                # Filter: must be 2+ words, not too long
-                keywords = [
-                    k.strip() for k in keywords
-                    if isinstance(k, str)
-                    and len(k.split()) >= 2
-                    and len(k.split()) <= 5
-                    and len(k.strip()) > 4
-                ]
-                LOG.info("interlink: OpenRouter extracted %d keywords.", len(keywords))
-                return keywords[:max_phrases]
-
-        except Exception as e:
-            LOG.warning("interlink: OpenRouter keyword extraction failed: %s — falling back to spaCy.", e)
-
-    # ── spaCy fallback ───────────────────────────────────────────────────────
-    USEFUL_LABELS = {"PRODUCT", "ORG", "WORK_OF_ART"}
-    SKIP_TOKENS = {
-        "india", "us", "usa", "uk", "global", "android", "ios",
-        "google", "internet", "online", "app", "apps", "update",
-        "ram", "lcd", "led", "ssd", "hdd", "cpu", "gpu",
-    }
-
-    def _score(ent_text: str, label: str) -> int:
-        s = 0
-        if label == "PRODUCT":     s += 30
-        if label == "ORG":         s += 20
-        if label == "WORK_OF_ART": s += 15
-        if re.search(r'\d', ent_text): s += 20
-        s += len(ent_text.split()) * 5
-        return s
+    if not openrouter_key:
+        LOG.warning("interlink: OpenRouter key not set, skipping.")
+        return []
 
     try:
-        import spacy
-        try:
-            nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            LOG.warning("spaCy model not found.")
-            raise
+        prompt = (
+            "Read this article and give me 10 phrases (2-4 words each) that exist "
+            "verbatim in the text and would make good search queries to find related "
+            "tech articles. Return only a JSON array, nothing else.\n\n"
+            f"{clean[:3000]}"
+        )
+        headers = {
+            "Authorization": f"Bearer {openrouter_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://bot.gadgeek.in",
+            "X-Title": "Gadgeek Tech News",
+        }
+        payload = {
+            "model": "google/gemini-flash-lite-2.5",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 300,
+            "temperature": 0.1,
+        }
+        resp = request_with_retry(
+            "POST", OPENROUTER_CHAT_URL,
+            headers=headers, json_body=payload,
+            timeout=30, max_attempts=2,
+        )
+        content = (
+            ((resp.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        ).strip()
 
-        doc = nlp(clean[:5000])
-        seen: set = set()
-        scored: List[tuple] = []
-
-        for ent in doc.ents:
-            label = ent.label_
-            ent_text = ent.text.strip()
-            if label not in USEFUL_LABELS:
-                continue
-            if ent_text.lower() in SKIP_TOKENS:
-                continue
-            if len(ent_text.split()) < 2:  # skip single words
-                continue
-            key = ent_text.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            scored.append((_score(ent_text, label), ent_text))
-
-        scored.sort(reverse=True)
-        return [phrase for _, phrase in scored[:max_phrases]]
+        match = re.search(r'\[.*?\]', content, re.DOTALL)
+        if match:
+            keywords = json.loads(match.group(0))
+            keywords = [k.strip() for k in keywords if isinstance(k, str) and len(k.split()) >= 2]
+            LOG.info("interlink: LLM extracted %d keywords: %s", len(keywords), keywords)
+            return keywords[:10]
 
     except Exception as e:
-        LOG.warning("spaCy extraction failed: %s", e)
-        return []
+        LOG.warning("interlink: LLM extraction failed: %s", e)
+
+    return []
 
 
 def find_related_articles(
     keywords: List[str],
     exclude_title: str = "",
-    max_results: int = 6,
+    max_results: int = 5,
 ) -> List[Dict[str, str]]:
-    """Query Directus Postgres FTS for published articles matching keywords.
-
-    One article per keyword maximum — ensures unique anchor text per link.
-    """
+    """Search Directus one keyword at a time, stop at max_results."""
     col = articles_collection()
 
     if not directus_url() or not directus_token():
@@ -1455,7 +1385,6 @@ def find_related_articles(
         return []
 
     seen_ids: set = set()
-    seen_phrases: set = set()
     results: List[Dict[str, str]] = []
 
     for phrase in keywords:
@@ -1463,20 +1392,7 @@ def find_related_articles(
             break
 
         phrase = phrase.strip()
-        if not phrase or len(phrase.split()) < 2:
-            continue
-
-        # Skip generic/short anchors that will match too broadly
-        if phrase.lower() in {"ram", "lcd", "5g", "4g", "ai", "os", "pc", "tv"}:
-            continue
-
-        # Skip if we already have a result with an overlapping phrase
-        phrase_lower = phrase.lower()
-        overlap = any(
-            phrase_lower in s or s in phrase_lower
-            for s in seen_phrases
-        )
-        if overlap:
+        if not phrase:
             continue
 
         try:
@@ -1507,13 +1423,12 @@ def find_related_articles(
                 continue
 
             seen_ids.add(item_id)
-            seen_phrases.add(phrase_lower)
             results.append({
                 "title": item_title,
                 "url": f"/{category_slug}/{item_slug}",
-                "matched_phrase": phrase,  # use the keyword as anchor — guaranteed in body
+                "matched_phrase": phrase,
             })
-            break  # one article per keyword only
+            break  # one article per keyword
 
     LOG.info("interlink: found %d related articles.", len(results))
     return results
@@ -1539,18 +1454,14 @@ def inject_interlinks(html: str, related: List[Dict[str, str]]) -> str:
             escaped = re.escape(phrase)
             pattern = rf'\b{escaped}\b'
 
-            # Skip if phrase not found in HTML
             if not re.search(pattern, result, re.IGNORECASE):
                 LOG.debug("interlink: '%s' not found in HTML, skipping.", phrase)
                 continue
 
-            # Skip if already inside an <a> tag
             if re.search(rf'<a[^>]*>[^<]*{escaped}[^<]*</a>', result, re.IGNORECASE):
                 LOG.debug("interlink: '%s' already linked, skipping.", phrase)
                 continue
 
-            # u= and t= in lambda signature fixes the closure bug where all
-            # lambdas would capture the last loop value of url/title
             new_result = re.sub(
                 pattern,
                 lambda m, u=url, t=title: f'<a href="{u}" target="_blank" title="{t}">{m.group(0)}</a>',
@@ -1564,12 +1475,14 @@ def inject_interlinks(html: str, related: List[Dict[str, str]]) -> str:
                 injected += 1
                 LOG.info("interlink: linked '%s' → %s", phrase, url)
 
-        LOG.info("interlink: successfully injected %d out of %d.", injected, len(related))
+        LOG.info("interlink: injected %d out of %d.", injected, len(related))
         return result
 
     except Exception as e:
         LOG.warning("inject_interlinks failed: %s — returning original HTML.", e)
         return html
+
+
 
 # ---------------------------------------------------------------------------
 # HUMANIZE PROMPT
@@ -1853,16 +1766,13 @@ def create_article_from_lead(
         )
         human_html = draft_html
 
-        # ── Step 4b: Interlinking ─────────────────────────────────────────────────
+    # ── Step 4b: Interlinking ─────────────────────────────────────────────────
     try:
-        _keywords = _extract_keywords_spacy(human_html, max_phrases=12)
-        LOG.info("interlink keywords: %s", _keywords)
+        _keywords = _extract_keywords_llm(human_html)
         if _keywords:
-            _related = find_related_articles(_keywords, exclude_title=title, max_results=6)
-            LOG.info("interlink related found: %d — %s", len(_related), [r['title'] for r in _related])
+            _related = find_related_articles(_keywords, exclude_title=title, max_results=5)
             if _related:
                 human_html = inject_interlinks(human_html, _related)
-                LOG.info("interlink: injected %d interlinks.", len(_related))
     except Exception as _ilink_err:
         LOG.warning("interlink: failed (non-fatal): %s", _ilink_err)
 

@@ -1336,7 +1336,7 @@ def _extract_keywords_llm(text: str) -> List[str]:
             "Read this article and give me 10 phrases (2-4 words each) that exist "
             "verbatim in the text and would make good search queries to find related "
             "tech articles. Return only a JSON array, nothing else.\n\n"
-            f"{clean[:3000]}"
+            f"{clean[:5000]}"
         )
         headers = {
             "Authorization": f"Bearer {openrouter_key}",
@@ -1345,10 +1345,10 @@ def _extract_keywords_llm(text: str) -> List[str]:
             "X-Title": "Gadgeek Tech News",
         }
         payload = {
-            "model": "google/gemini-flash-lite-2.5",
+            "model": "meta-llama/llama-3.1-8b-instruct",
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 300,
-            "temperature": 0.1,
+            "max_tokens": 2000,
+            "temperature": 0.3,
         }
         resp = request_with_retry(
             "POST", OPENROUTER_CHAT_URL,
@@ -1768,6 +1768,7 @@ def create_article_from_lead(
 
     # ── Step 4b: Interlinking ─────────────────────────────────────────────────
     try:
+        LOG.info("interlink: starting keyword extraction...")  # ADD THIS
         _keywords = _extract_keywords_llm(human_html)
         if _keywords:
             _related = find_related_articles(_keywords, exclude_title=title, max_results=5)

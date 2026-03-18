@@ -1322,20 +1322,77 @@ def _resolve_article_title(seo: dict, raw_title: str) -> str:
 
 
 def _extract_keywords_spacy(text: str, max_phrases: int = 12) -> List[str]:
-    """Extract named entities from article HTML using spaCy NER.
+    """Extract search keywords from article HTML using OpenRouter LLM.
 
-    Targets PRODUCT, ORG, WORK_OF_ART entities — ideal for tech news.
-    Falls back to regex capitalized phrase extraction if spaCy unavailable.
+    Uses google/gemini-flash-lite (cheapest reliable model ~$0.25/1M tokens).
+    Falls back to spaCy NER if OpenRouter key not configured or call fails.
     """
     # Strip HTML tags
     clean = re.sub(r"<[^>]+>", " ", text)
     clean = re.sub(r"\s+", " ", clean).strip()
 
+    # ── OpenRouter LLM extraction (primary) ──────────────────────────────────
+    openrouter_key = get_setting("openrouter_api_key")
+    if openrouter_key:
+        try:
+            prompt = (
+                "Extract 10 to 15 specific multi-word search keywords from this tech article. "
+                "Focus on: product names, model numbers, brand+model combos, tech features. "
+                "Rules:\n"
+                "- Each keyword must be 2 to 4 words minimum\n"
+                "- No single words\n"
+                "- No generic phrases like 'new features', 'latest update', 'best performance'\n"
+                "- Prefer specific terms like 'Samsung Galaxy S25', 'MediaTek Dimensity 7050', 'AMOLED display'\n"
+                "- Output ONLY a JSON array of strings, nothing else\n"
+                "Example: [\"Samsung Galaxy S25\", \"MediaTek Dimensity 7050\", \"120Hz AMOLED\"]\n\n"
+                f"Article:\n{clean[:3000]}"
+            )
+
+            headers = {
+                "Authorization": f"Bearer {openrouter_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://bot.gadgeek.in",
+                "X-Title": "Gadgeek Tech News",
+            }
+            payload = {
+                "model": "google/gemini-flash-lite-2.5",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 300,
+                "temperature": 0.1,
+            }
+            resp = request_with_retry(
+                "POST", OPENROUTER_CHAT_URL,
+                headers=headers, json_body=payload,
+                timeout=30, max_attempts=2,
+            )
+            data = resp.json()
+            content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            content = content.strip()
+
+            # Parse JSON array from response
+            match = re.search(r'\[.*?\]', content, re.DOTALL)
+            if match:
+                keywords = json.loads(match.group(0))
+                # Filter: must be 2+ words, not too long
+                keywords = [
+                    k.strip() for k in keywords
+                    if isinstance(k, str)
+                    and len(k.split()) >= 2
+                    and len(k.split()) <= 5
+                    and len(k.strip()) > 4
+                ]
+                LOG.info("interlink: OpenRouter extracted %d keywords.", len(keywords))
+                return keywords[:max_phrases]
+
+        except Exception as e:
+            LOG.warning("interlink: OpenRouter keyword extraction failed: %s — falling back to spaCy.", e)
+
+    # ── spaCy fallback ───────────────────────────────────────────────────────
     USEFUL_LABELS = {"PRODUCT", "ORG", "WORK_OF_ART"}
-    # Generic words that are useless as search terms
     SKIP_TOKENS = {
         "india", "us", "usa", "uk", "global", "android", "ios",
         "google", "internet", "online", "app", "apps", "update",
+        "ram", "lcd", "led", "ssd", "hdd", "cpu", "gpu",
     }
 
     def _score(ent_text: str, label: str) -> int:
@@ -1343,35 +1400,31 @@ def _extract_keywords_spacy(text: str, max_phrases: int = 12) -> List[str]:
         if label == "PRODUCT":     s += 30
         if label == "ORG":         s += 20
         if label == "WORK_OF_ART": s += 15
-        if re.search(r'\d', ent_text): s += 20   # model numbers = more specific
-        s += len(ent_text.split()) * 5            # longer phrase = more specific
+        if re.search(r'\d', ent_text): s += 20
+        s += len(ent_text.split()) * 5
         return s
 
     try:
         import spacy
-        # Load model — downloaded once via requirements, cached automatically
         try:
             nlp = spacy.load("en_core_web_sm")
         except OSError:
-            LOG.warning("spaCy model en_core_web_sm not found. Run: python -m spacy download en_core_web_sm")
+            LOG.warning("spaCy model not found.")
             raise
 
-        doc = nlp(clean[:5000])  # cap for speed
-
+        doc = nlp(clean[:5000])
         seen: set = set()
         scored: List[tuple] = []
 
         for ent in doc.ents:
             label = ent.label_
             ent_text = ent.text.strip()
-
             if label not in USEFUL_LABELS:
                 continue
             if ent_text.lower() in SKIP_TOKENS:
                 continue
-            if len(ent_text) < 3:
+            if len(ent_text.split()) < 2:  # skip single words
                 continue
-
             key = ent_text.lower()
             if key in seen:
                 continue
@@ -1381,22 +1434,9 @@ def _extract_keywords_spacy(text: str, max_phrases: int = 12) -> List[str]:
         scored.sort(reverse=True)
         return [phrase for _, phrase in scored[:max_phrases]]
 
-    except ImportError:
-        LOG.warning("spaCy not installed — falling back to regex extraction.")
     except Exception as e:
-        LOG.warning("spaCy extraction failed: %s — falling back.", e)
-
-    # Fallback: regex-based capitalized phrase extraction
-    pattern = r'\b[A-Z][a-zA-Z0-9]*(?:\s(?:[A-Z][a-zA-Z0-9]*|\d+(?:\.\d+)?))+\b'
-    matches = re.findall(pattern, clean[:3000])
-    seen_fb: set = set()
-    unique = []
-    for m in matches:
-        key = m.lower()
-        if key not in seen_fb and len(m) > 4:
-            seen_fb.add(key)
-            unique.append(m)
-    return unique[:max_phrases]
+        LOG.warning("spaCy extraction failed: %s", e)
+        return []
 
 
 def find_related_articles(

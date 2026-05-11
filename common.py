@@ -84,6 +84,7 @@ DEFAULTS_SETTINGS: Dict[str, str] = {
     "slack_channel_id": "",
     # api keys
     "tavily_api_key": "",
+    "brave_api_key": "BSA16ZYi2hOH9UE3FxBF3513iB0yGAt",
     "together_api_key": "",
     "openrouter_api_key": "",
     # runtime
@@ -903,6 +904,139 @@ def pick_extracted_image(pack: Dict[str, Any]) -> Optional[Dict[str, str]]:
         return {"url": images[0], "credit": "Web", "caption": "Featured image"}
     
     return None
+
+
+# -------------------------
+# Brave Image Search
+# -------------------------
+
+BRAVE_IMAGE_SEARCH_URL = "https://api.search.brave.com/res/v1/images/search"
+
+# Domains known to block hotlinking — skip their image URLs
+_BRAVE_BLOCKED_HOSTS = {
+    "encrypted-tbn0.gstatic.com",
+    "encrypted-tbn1.gstatic.com",
+    "encrypted-tbn2.gstatic.com",
+    "encrypted-tbn3.gstatic.com",
+}
+
+
+def brave_image_search(
+    query: str,
+    count: int = 10,
+    safesearch: str = "strict",
+) -> Optional[Dict[str, str]]:
+    """Search Brave Image Search API and return the best usable real image.
+
+    Returns a dict with keys: url, credit, caption  — same shape as
+    pick_extracted_image() so callers can treat both results identically.
+    Returns None when no suitable image is found or the key is not set.
+
+    Priority order inside results:
+      1. Thumbnail URL that ends with a known image extension (.jpg/.png/.webp…)
+         AND whose host is not on the blocked list.
+      2. Any other thumbnail URL that at least starts with https and passes a
+         quick HEAD validation (content-type starts with image/).
+    """
+    key = get_setting("brave_api_key")
+    if not key:
+        LOG.warning("brave_api_key not set — skipping Brave image search.")
+        return None
+
+    params = urlencode({
+        "q": query,
+        "count": min(count, 20),
+        "safesearch": safesearch,
+        "search_lang": "en",
+    })
+
+    try:
+        resp = request_with_retry(
+            "GET",
+            f"{BRAVE_IMAGE_SEARCH_URL}?{params}",
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "X-Subscription-Token": key,
+            },
+            timeout=30,
+            max_attempts=2,
+        )
+    except Exception as exc:
+        LOG.warning("Brave image search request failed: %s", exc)
+        return None
+
+    if resp.status_code == 401:
+        LOG.error("Brave image search: invalid API key (401).")
+        return None
+    if resp.status_code == 429:
+        LOG.warning("Brave image search: rate limited (429). Skipping.")
+        return None
+    if resp.status_code >= 400:
+        LOG.warning("Brave image search: HTTP %d — %s", resp.status_code, resp.text[:300])
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        LOG.warning("Brave image search: failed to parse JSON response.")
+        return None
+
+    # Brave returns: {"results": [{"title": "...", "url": "...", "thumbnail": {"src": "..."}, "source": "..."}, ...]}
+    results = data.get("results") or []
+    if not results:
+        LOG.info("Brave image search: no results for query: %s", query)
+        return None
+
+    image_exts = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+
+    for item in results:
+        # The proxied thumbnail Brave serves — reliable to hotlink
+        thumbnail = (item.get("thumbnail") or {}).get("src") or ""
+        # The original page source URL (used as credit)
+        source_url = item.get("url") or item.get("source") or "Web"
+        title = (item.get("title") or "").strip()
+
+        if not thumbnail or not thumbnail.startswith("https"):
+            continue
+
+        # Skip known blocked hosts
+        try:
+            host = urlparse(thumbnail).netloc
+        except Exception:
+            continue
+        if host in _BRAVE_BLOCKED_HOSTS:
+            continue
+
+        # Brave serves thumbnails through its own proxy — trust them directly
+        # if the URL contains a known image extension, otherwise do a HEAD check
+        url_lower = thumbnail.lower().split("?")[0]
+        if any(url_lower.endswith(ext) for ext in image_exts):
+            LOG.info("Brave image search: found image via extension match — %s", thumbnail[:80])
+            return {
+                "url": thumbnail,
+                "credit": source_url,
+                "caption": title or "Featured image",
+            }
+
+        # HEAD-check: verify the thumbnail actually serves image bytes
+        try:
+            head_resp = requests.head(thumbnail, timeout=8, allow_redirects=True,
+                                      headers={"User-Agent": USER_AGENT})
+            content_type = head_resp.headers.get("Content-Type", "")
+            if head_resp.status_code == 200 and content_type.startswith("image/"):
+                LOG.info("Brave image search: found image via HEAD check — %s", thumbnail[:80])
+                return {
+                    "url": thumbnail,
+                    "credit": source_url,
+                    "caption": title or "Featured image",
+                }
+        except Exception:
+            continue  # HEAD failed — try next result
+
+    LOG.info("Brave image search: no valid image found for query: %s", query)
+    return None
+
 
 # -------------------------
 # Image generation (routing-based)
@@ -1806,6 +1940,7 @@ def create_article_from_lead(
     caption              = ""
     credit               = ""
 
+    # 6a. Try Tavily-extracted image first (existing behaviour, unchanged)
     if extracted_img and extracted_img.get("url"):
         LOG.info("Attempting to import extracted image: %s", extracted_img["url"][:80])
         file_uuid = import_image_to_directus(extracted_img["url"], title=article_title)
@@ -1816,6 +1951,22 @@ def create_article_from_lead(
             LOG.info("Extracted image imported successfully: %s", file_uuid)
         else:
             LOG.warning("Extracted image failed to import.")
+
+    # 6b. Tavily gave nothing → try Brave Image Search for a real photo
+    if not featured_image:
+        LOG.info("No Tavily image — trying Brave image search for: %s", article_title[:80])
+        brave_img = brave_image_search(article_title)
+        if brave_img and brave_img.get("url"):
+            file_uuid = import_image_to_directus(brave_img["url"], title=article_title)
+            if file_uuid:
+                featured_image = file_uuid
+                caption        = brave_img.get("caption") or "Featured image"
+                credit         = brave_img.get("credit") or "Brave Search"
+                LOG.info("Brave image imported successfully: %s", file_uuid)
+            else:
+                LOG.warning("Brave image failed to import into Directus.")
+        else:
+            LOG.info("Brave image search returned no result — will fall back to AI generation downstream.")
 
     featured_image_credit = f"{caption} | Credit: {credit}".strip(" |")
 

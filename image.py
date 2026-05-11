@@ -16,6 +16,7 @@ from common import (
     generate_image,
     build_image_prompt,
     import_image_to_directus,
+    brave_image_search,
 )
 from urllib.parse import urlencode
 
@@ -103,7 +104,7 @@ def backfill_images() -> None:
             category_name or "uncategorized",
         )
 
-        # Step 1: Build prompt
+        # Step 1: Build prompt (used if Brave search finds nothing)
         try:
             prompt = build_image_prompt(title, category_name)
             LOG.debug("Prompt: %s", prompt)
@@ -112,48 +113,66 @@ def backfill_images() -> None:
             failed += 1
             continue
 
-        # Step 2: Generate image (OpenRouter → Together fallback, handled by common.py)
-        try:
-            gen = generate_image(prompt)
-        except Exception as exc:
-            LOG.error("generate_image exception: %s", exc)
-            LOG.debug(traceback.format_exc())
-            failed += 1
-            time.sleep(2)
-            continue
+        # Step 2: Try Brave Image Search for a real photo first
+        file_id = None
+        brave_img = brave_image_search(title)
+        if brave_img and brave_img.get("url"):
+            LOG.info("Brave image found — importing to Directus.")
+            try:
+                file_id = import_image_to_directus(brave_img["url"], title=title)
+                if file_id:
+                    LOG.info("Brave image imported successfully: %s", file_id)
+                else:
+                    LOG.warning("Brave image import returned no file_id — will fall back to AI generation.")
+            except Exception as exc:
+                LOG.warning("Brave image import exception: %s — falling back to AI generation.", exc)
+                file_id = None
+        else:
+            LOG.info("Brave image search found nothing — will use AI generation.")
 
-        if not gen:
-            LOG.warning("Image generation returned nothing. Skipping.")
-            failed += 1
-            time.sleep(2)
-            continue
-
-        image_url = gen.get("url") or gen.get("b64_json") or gen.get("data")
-        if not image_url:
-            LOG.warning("No usable image data. Response keys: %s", list(gen.keys()))
-            failed += 1
-            time.sleep(2)
-            continue
-
-        LOG.info("Image generated successfully.")
-
-        # Step 3: Import to Directus
-        try:
-            file_id = import_image_to_directus(image_url, title=title)
-        except Exception as exc:
-            LOG.error("import_image_to_directus exception: %s", exc)
-            LOG.debug(traceback.format_exc())
-            failed += 1
-            time.sleep(2)
-            continue
-
+        # Step 3: AI generation fallback (OpenRouter → Together, handled by common.py)
         if not file_id:
-            LOG.warning("Directus import returned no file_id. Skipping.")
-            failed += 1
-            time.sleep(2)
-            continue
+            try:
+                gen = generate_image(prompt)
+            except Exception as exc:
+                LOG.error("generate_image exception: %s", exc)
+                LOG.debug(traceback.format_exc())
+                failed += 1
+                time.sleep(2)
+                continue
 
-        LOG.info("Uploaded to Directus — file_id: %s", file_id)
+            if not gen:
+                LOG.warning("Image generation returned nothing. Skipping.")
+                failed += 1
+                time.sleep(2)
+                continue
+
+            image_url = gen.get("url") or gen.get("b64_json") or gen.get("data")
+            if not image_url:
+                LOG.warning("No usable image data. Response keys: %s", list(gen.keys()))
+                failed += 1
+                time.sleep(2)
+                continue
+
+            LOG.info("Image generated successfully.")
+
+            # Step 3: Import AI-generated image to Directus
+            try:
+                file_id = import_image_to_directus(image_url, title=title)
+            except Exception as exc:
+                LOG.error("import_image_to_directus exception: %s", exc)
+                LOG.debug(traceback.format_exc())
+                failed += 1
+                time.sleep(2)
+                continue
+
+            if not file_id:
+                LOG.warning("Directus import returned no file_id. Skipping.")
+                failed += 1
+                time.sleep(2)
+                continue
+
+            LOG.info("Uploaded to Directus — file_id: %s", file_id)
 
         # Step 4: Patch article
         alt_text = f"{title} featured image"

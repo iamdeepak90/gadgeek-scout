@@ -93,7 +93,7 @@ def publish_lead_by_id(lead_id: str, slack_ctx: Optional[Dict[str, str]] = None)
 
 
 def _publish_loop() -> None:
-    interval_min = int(float(get_setting("publish_interval_minutes", "20") or "20"))
+    interval_min = int(float(get_setting("publish_interval_minutes", "90") or "90"))
     sleep_s = max(30, interval_min * 60)
     LOG.info("Publisher loop started. Will publish 1 approved lead every %s minutes.", interval_min)
 

@@ -88,8 +88,8 @@ DEFAULTS_SETTINGS: Dict[str, str] = {
     "together_api_key": "",
     "openrouter_api_key": "",
     # runtime
-    "publish_interval_minutes": "20",
-    "scout_interval_minutes": "30",
+    "publish_interval_minutes": "90",
+    "scout_interval_minutes": "180",
     # pipeline options
     "prefer_extracted_image": "1",  # 1=true
 }

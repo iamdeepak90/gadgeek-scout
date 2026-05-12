@@ -995,9 +995,9 @@ def brave_image_search(
         LOG.info("Brave image search: no results for query: %s", query)
         return None
 
-        image_exts = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+    image_exts = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 
-        for item in results:
+    for item in results:
         # Use properties.url — direct original image URL (e.g. actual .jpg on the source server)
         # Fall back to thumbnail.src (Brave-proxied) if properties.url is missing
         props_url = (item.get("properties") or {}).get("url") or ""

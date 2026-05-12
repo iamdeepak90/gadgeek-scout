@@ -406,6 +406,13 @@ def directus_patch(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError(f"Directus PATCH {path} failed: {resp.status_code} {resp.text}")
     return resp.json()
 
+def directus_delete(path: str) -> None:
+    url = f"{directus_url()}{path}"
+    headers = {"Authorization": f"Bearer {directus_token()}"}
+    resp = request_with_retry("DELETE", url, headers=headers)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Directus DELETE {path} failed: {resp.status_code} {resp.text}")
+
 
 def import_image_to_directus(image_url: str, title: str = "") -> Optional[str]:
     """Import an image into Directus files and return the file UUID.

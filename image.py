@@ -13,6 +13,7 @@ from common import (
     articles_collection,
     directus_get,
     directus_patch,
+    directus_delete,
     generate_image,
     build_image_prompt,
     import_image_to_directus,
@@ -27,22 +28,65 @@ RUN_INTERVAL = 3600  # 1 hour
 
 
 def fetch_articles_without_image(limit: int = BATCH_SIZE) -> list:
-    """Fetch articles where featured_image is null, including category name."""
+    """Fetch articles where featured_image is null OR has unsupported mime type."""
     col = articles_collection()
-    params = urlencode({
+    
+    # Fetch articles with no image
+    params_null = urlencode({
         "filter[featured_image][_null]": "true",
         "fields": "id,title,category.name",
         "limit": limit,
         "sort": "-date_created",
     })
+    
+    # Fetch articles with image but wrong mime type
+    params_invalid = urlencode({
+        "filter[featured_image][_nnull]": "true",
+        "fields": "id,title,category.name,featured_image.id,featured_image.type",
+        "limit": limit,
+        "sort": "-date_created",
+    })
+    
     try:
-        data = directus_get(f"/items/{col}?{params}")
-        if data is None:
-            LOG.error("directus_get returned None — check directus_url and directus_token.")
-            return []
-        articles = data.get("data") or []
-        LOG.info("Found %d article(s) without featured_image.", len(articles))
-        return articles
+        articles = []
+        
+        # Null images
+        data = directus_get(f"/items/{col}?{params_null}")
+        articles += data.get("data") or []
+        
+        # Invalid mime type images — clear bad file then treat as missing
+        data = directus_get(f"/items/{col}?{params_invalid}")
+        for article in (data.get("data") or []):
+            img = article.get("featured_image")
+            if isinstance(img, dict) and not (img.get("type") or "").startswith("image/"):
+                bad_file_id = img.get("id")
+                LOG.warning("Article %s has unsupported image type '%s' — clearing it.",
+                            article.get("id"), img.get("type"))
+                # Delete bad file and clear the reference so backfill refills it
+                try:
+                    directus_delete(f"/files/{bad_file_id}")
+                except Exception as exc:
+                    LOG.warning("Could not delete bad file %s: %s", bad_file_id, exc)
+                try:
+                    directus_patch(f"/items/{col}/{article['id']}", {"featured_image": None})
+                except Exception as exc:
+                    LOG.error("Could not clear featured_image on %s: %s", article["id"], exc)
+                    continue
+                # Remove the nested dict so downstream code treats it like a normal null article
+                article.pop("featured_image", None)
+                articles.append(article)
+        
+        # Deduplicate by id
+        seen = set()
+        unique = []
+        for a in articles:
+            if a["id"] not in seen:
+                seen.add(a["id"])
+                unique.append(a)
+        
+        LOG.info("Found %d article(s) needing an image (null + invalid).", len(unique))
+        return unique[:limit]
+    
     except Exception as exc:
         LOG.error("Failed to fetch articles: %s", exc)
         LOG.debug(traceback.format_exc())

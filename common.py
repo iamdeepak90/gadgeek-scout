@@ -995,51 +995,34 @@ def brave_image_search(
         LOG.info("Brave image search: no results for query: %s", query)
         return None
 
-    image_exts = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+        image_exts = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 
-    for item in results:
-        # The proxied thumbnail Brave serves — reliable to hotlink
+        for item in results:
+        # Use properties.url — direct original image URL (e.g. actual .jpg on the source server)
+        # Fall back to thumbnail.src (Brave-proxied) if properties.url is missing
+        props_url = (item.get("properties") or {}).get("url") or ""
         thumbnail = (item.get("thumbnail") or {}).get("src") or ""
-        # The original page source URL (used as credit)
+        image_url = props_url or thumbnail
+
         source_url = item.get("url") or item.get("source") or "Web"
         title = (item.get("title") or "").strip()
 
-        if not thumbnail or not thumbnail.startswith("https"):
+        if not image_url or not image_url.startswith("https"):
             continue
 
-        # Skip known blocked hosts
         try:
-            host = urlparse(thumbnail).netloc
+            host = urlparse(image_url).netloc
         except Exception:
             continue
         if host in _BRAVE_BLOCKED_HOSTS:
             continue
 
-        # Brave serves thumbnails through its own proxy — trust them directly
-        # if the URL contains a known image extension, otherwise do a HEAD check
-        url_lower = thumbnail.lower().split("?")[0]
-        if any(url_lower.endswith(ext) for ext in image_exts):
-            LOG.info("Brave image search: found image via extension match — %s", thumbnail[:80])
-            return {
-                "url": thumbnail,
-                "credit": source_url,
-                "caption": title or "Featured image",
-            }
-
-        # HEAD-check: verify the thumbnail actually serves image bytes
-        try:
-            head_resp = requests.head(thumbnail, timeout=8, allow_redirects=True,
-                                      headers={"User-Agent": USER_AGENT})
-            content_type = head_resp.headers.get("Content-Type", "")
-            if head_resp.status_code == 200 and content_type.startswith("image/"):
-                LOG.info("Brave image search: found image via HEAD check — %s", thumbnail[:80])
-                return {
-                    "url": thumbnail,
-                    "credit": source_url,
-                    "caption": title or "Featured image",
-                }
-        except Exception:
-            continue  # HEAD failed — try next result
+        LOG.info("Brave image search: found image — %s", image_url[:80])
+        return {
+            "url": image_url,
+            "credit": source_url,
+            "caption": title or "Featured image",
+        }
 
     LOG.info("Brave image search: no valid image found for query: %s", query)
     return None
